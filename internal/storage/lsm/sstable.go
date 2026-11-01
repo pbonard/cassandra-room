@@ -156,9 +156,10 @@ func openTable(fs vfs.FS, dir string, num uint64, ro sstable.ReaderOptions) (*ta
 
 func (t *tableReader) close() error { return t.r.Close() }
 
-// get returns the table's entry for key, after checking the Bloom filter.
-// The returned value is a copy.
-func (t *tableReader) get(key []byte) (value []byte, found bool, err error) {
+// getMerged merges the table's entry for key, if any, into acc (see
+// mergeInto), after checking the Bloom filter. The entry is merged while the
+// iterator still pins its block, so the result never aliases cache memory.
+func (t *tableReader) getMerged(merger Merger, key, acc []byte) (_ []byte, found bool, err error) {
 	it, err := t.r.NewPointIter(context.Background(), sstable.IterOptions{
 		FilterBlockSizeLimit: sstable.AlwaysUseFilterBlock,
 		Env:                  sstable.NoReadEnv,
@@ -169,10 +170,13 @@ func (t *tableReader) get(key []byte) (value []byte, found bool, err error) {
 	}
 	if kv := it.SeekPrefixGE(key, key, 0); kv != nil && bytes.Equal(kv.K.UserKey, key) {
 		v, _, verr := kv.Value(nil)
+		if verr == nil {
+			acc, verr = mergeInto(merger, acc, v)
+		}
 		if verr != nil {
 			err = verr
 		} else {
-			value, found = append([]byte(nil), v...), true
+			found = true
 		}
 	}
 	if err == nil {
@@ -182,7 +186,10 @@ func (t *tableReader) get(key []byte) (value []byte, found bool, err error) {
 	if cerr := it.Close(); err == nil {
 		err = cerr
 	}
-	return value, found, err
+	if err != nil {
+		return nil, false, err
+	}
+	return acc, found, nil
 }
 
 // mayContain reports whether key is inside the table's key range.

@@ -274,7 +274,12 @@ func TestQuietTableDoesNotPinWAL(t *testing.T) {
 	busy, _ := e.Table(1)
 	require.NoError(t, busy.Flush())
 	require.Equal(t, 1, tableFiles(e, 2), "the quiet table must have been flushed to free the WAL")
-	require.LessOrEqual(t, walFiles(t, fs), 2)
+	e.mu.Lock()
+	live := len(e.mu.walSegs)
+	e.mu.Unlock()
+	require.LessOrEqual(t, live, 2)
+	// Obsolete segments are deleted or kept for reuse.
+	require.LessOrEqual(t, walFiles(t, fs), live+walRecycleLimit)
 	mustGet(t, quiet, "quiet", "1")
 }
 
@@ -589,4 +594,110 @@ func TestPeriodicSync(t *testing.T) {
 	defer e3.Close()
 	tbl3, _ := e3.Table(1)
 	mustGet(t, tbl3, "c", "3")
+}
+
+// TestWALRecycleReplay checks that a recycled WAL segment replays only the
+// records written to it after reuse: the old records past the new end carry
+// the old segment number and end the replay, whether the new segment was
+// closed or the machine crashed while it was open.
+func TestWALRecycleReplay(t *testing.T) {
+	for _, closeIt := range []bool{false, true} {
+		t.Run(fmt.Sprintf("close=%t", closeIt), func(t *testing.T) {
+			fs := vfs.NewCrashableMem()
+			require.NoError(t, fs.MkdirAll("db", 0755))
+			require.NoError(t, syncDir(fs, ""))
+			old, err := createWAL(fs, "db", 1, 0)
+			require.NoError(t, err)
+			require.NoError(t, syncDir(fs, "db"))
+			for i := 0; i < 2000; i++ {
+				require.NoError(t, old.add([]byte(fmt.Sprintf("old-%04d", i)), nil))
+			}
+			require.NoError(t, old.close())
+
+			w, err := createWAL(fs, "db", 5, 1)
+			require.NoError(t, err)
+			require.NoError(t, syncDir(fs, "db"))
+			var ps pendingSync
+			for i := 0; i < 3; i++ {
+				p := &ps
+				if i < 2 {
+					p = nil
+				}
+				require.NoError(t, w.add([]byte(fmt.Sprintf("new-%d", i)), p))
+			}
+			require.NoError(t, ps.wait())
+			replayFS := vfs.FS(fs)
+			if closeIt {
+				require.NoError(t, w.close())
+			} else {
+				replayFS = fs.CrashClone(vfs.CrashCloneCfg{UnsyncedDataPercent: 0})
+				require.NoError(t, w.close())
+			}
+			_, err = replayFS.Stat("db/" + walFileName(1))
+			require.Error(t, err, "the old segment was renamed")
+
+			var got []string
+			require.NoError(t, replayWAL(replayFS, "db/"+walFileName(5), 5, func(data []byte) error {
+				got = append(got, string(data))
+				return nil
+			}))
+			require.Equal(t, []string{"new-0", "new-1", "new-2"}, got)
+		})
+	}
+}
+
+// TestWALRecycling checks that obsolete segments are reused and that reused
+// segments survive crashes like new ones: every synced write is recovered,
+// and nothing newer than the crash point appears.
+func TestWALRecycling(t *testing.T) {
+	fs := vfs.NewCrashableMem()
+	opts := func(fs vfs.FS) *Options {
+		return &Options{FS: fs, MemTableBudget: 32 << 10, WALSegmentSize: 4 << 10, WALSyncPeriod: -1}
+	}
+	e, err := Open("db", opts(fs))
+	require.NoError(t, err)
+	_, err = e.CreateTable(1)
+	require.NoError(t, err)
+	rng := rand.New(rand.NewPCG(3, 3))
+	recycled := false
+	for round := 0; round < 20; round++ {
+		written := map[string]string{}
+		synced := map[string]string{}
+		for i := 0; i < 300; i++ {
+			k, v := fmt.Sprintf("r%02d-k%03d", round, i), fmt.Sprintf("v%d-%d", round, i)
+			sync := rng.IntN(8) == 0
+			wo := NoSync
+			if sync {
+				wo = Sync
+			}
+			set(t, e, 1, k, v, wo)
+			written[k] = v
+			if sync {
+				for k, v := range written {
+					synced[k] = v
+				}
+			}
+			e.mu.Lock()
+			recycled = recycled || len(e.mu.recycledWAL) > 0
+			e.mu.Unlock()
+		}
+		crashed := fs.CrashClone(vfs.CrashCloneCfg{UnsyncedDataPercent: rng.IntN(100), RNG: rng})
+		require.NoError(t, e.Close())
+		fs = crashed
+		e, err = Open("db", opts(fs))
+		require.NoError(t, err)
+		tbl, err := e.Table(1)
+		require.NoError(t, err)
+		for k, v := range written {
+			got, ok := getVal(t, tbl, k)
+			if _, must := synced[k]; must {
+				require.True(t, ok, "round %d: synced key %s lost", round, k)
+			}
+			if ok {
+				require.Equal(t, v, got)
+			}
+		}
+	}
+	require.True(t, recycled, "no WAL segment was recycled")
+	require.NoError(t, e.Close())
 }

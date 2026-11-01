@@ -10,6 +10,7 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/vfs"
 )
 
@@ -321,16 +322,26 @@ func (e *Engine) compact(t *Table, inputs []*fileMeta) error {
 }
 
 func (e *Engine) writeCompactionOutput(t *Table, num uint64, inputs []*fileMeta) (*fileMeta, error) {
+	// The buffer pool is released after the iterators that use it close
+	// (deferred calls run last-in, first-out).
+	var bp block.BufferPool
+	bp.Init(2*len(inputs)+4, block.ForCompaction)
+	defer bp.Release()
 	mi := mergingIter{merger: e.merger}
+	defer mi.close()
+	// The output's timestamp range is the union of the inputs': merging only
+	// keeps or drops existing cells and deletions, so the union bounds the
+	// output's range. A wider range is safe: reads stop early only below a
+	// file's maxTS, and purging (M5) treats minTS as possibly-older data.
+	minTS, maxTS := int64(math.MaxInt64), int64(math.MinInt64)
 	for _, f := range inputs {
-		src, err := newTableSource(f.reader, nil, nil, false)
+		src, err := newCompactionSource(f.reader, &bp)
 		if err != nil {
-			mi.close()
 			return nil, err
 		}
 		mi.sources = append(mi.sources, src)
+		minTS, maxTS = min(minTS, f.minTS), max(maxTS, f.maxTS)
 	}
-	defer mi.close()
 
 	path := e.fs.PathJoin(t.dir, tableFileName(num))
 	file, err := e.fs.Create(path, vfs.WriteCategoryUnspecified)
@@ -338,19 +349,12 @@ func (e *Engine) writeCompactionOutput(t *Table, num uint64, inputs []*fileMeta)
 		return nil, err
 	}
 	w := sstable.NewRawWriter(objstorageprovider.NewFileWritable(file), e.writerOpts)
-	minTS, maxTS := int64(math.MaxInt64), int64(math.MinInt64)
 	n := 0
 	for ok := mi.first(); ok; ok = mi.next() {
 		if n++; n%1024 == 0 && (e.unusable.Load() || t.dropped.Load()) {
 			w.Close()
 			_ = e.fs.Remove(path)
 			return nil, errCompactionAborted
-		}
-		if lo, hi, has, err := e.merger.Timestamps(mi.value); err != nil {
-			w.Close()
-			return nil, err
-		} else if has {
-			minTS, maxTS = min(minTS, lo), max(maxTS, hi)
 		}
 		k := pebble.InternalKey{
 			UserKey: mi.key,

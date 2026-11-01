@@ -62,7 +62,10 @@ type Engine struct {
 		wal    *walWriter
 		// walSegs are the live WAL segments, oldest first; the last one is
 		// being written.
-		walSegs     []walSegment
+		walSegs []walSegment
+		// recycledWAL holds obsolete WAL segments kept for reuse, oldest
+		// first (at most walRecycleLimit).
+		recycledWAL []uint64
 		manifest    *manifestWriter
 		nextFileNum uint64
 		// flushQueue holds rotated memtables in rotation order.
@@ -279,7 +282,7 @@ func (e *Engine) recover() error {
 
 	walNum := nextFileNum
 	nextFileNum++
-	wal, err := createWAL(e.fs, e.dir, walNum)
+	wal, err := createWAL(e.fs, e.dir, walNum, 0)
 	if err != nil {
 		return err
 	}
@@ -751,7 +754,17 @@ func (e *Engine) walBytesLocked() int64 {
 func (e *Engine) rotateWALLocked() error {
 	num := e.mu.nextFileNum
 	e.mu.nextFileNum++
-	wal, err := createWAL(e.fs, e.dir, num)
+	var recycle uint64
+	if len(e.mu.recycledWAL) > 0 {
+		recycle = e.mu.recycledWAL[0]
+		e.mu.recycledWAL = e.mu.recycledWAL[1:]
+	}
+	wal, err := createWAL(e.fs, e.dir, num, recycle)
+	if err != nil && recycle != 0 {
+		// Fall back to a new file; the old one is no longer needed.
+		_ = e.fs.Remove(e.fs.PathJoin(e.dir, walFileName(recycle)))
+		wal, err = createWAL(e.fs, e.dir, num, 0)
+	}
 	if err == nil {
 		err = syncDir(e.fs, e.dir)
 	}
@@ -920,11 +933,22 @@ func (e *Engine) finishFlushLocked(job flushJob) {
 	e.mu.cond.Broadcast()
 }
 
-// deleteObsoleteWALLocked deletes WAL segments below minWAL. The manifest
-// already records that every table has flushed past them.
+// walRecycleLimit is the number of obsolete WAL segments kept for reuse.
+// Segments become obsolete about as fast as new ones are needed, so a small
+// pool suffices; more would only hold disk space.
+const walRecycleLimit = 2
+
+// deleteObsoleteWALLocked deletes WAL segments below minWAL, or keeps them
+// for reuse. The manifest already records, durably, that every table has
+// flushed past them, so recovery never replays them (it starts at minWAL)
+// and deletes any left over.
 func (e *Engine) deleteObsoleteWALLocked(minWAL uint64) {
 	for len(e.mu.walSegs) > 1 && e.mu.walSegs[0].num < minWAL {
-		_ = e.fs.Remove(e.fs.PathJoin(e.dir, walFileName(e.mu.walSegs[0].num)))
+		if len(e.mu.recycledWAL) < walRecycleLimit {
+			e.mu.recycledWAL = append(e.mu.recycledWAL, e.mu.walSegs[0].num)
+		} else {
+			_ = e.fs.Remove(e.fs.PathJoin(e.dir, walFileName(e.mu.walSegs[0].num)))
+		}
 		e.closedWALBytes.Add(-e.mu.walSegs[0].size)
 		e.mu.walSegs = e.mu.walSegs[1:]
 	}

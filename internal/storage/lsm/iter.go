@@ -6,6 +6,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/block"
 )
 
 // source is a sorted stream of (key, fragment) pairs with at most one entry
@@ -70,7 +71,8 @@ type tableSource struct {
 	e  error
 }
 
-func newTableSource(r *tableReader, lower, upper []byte, useFilter bool) (*tableSource, error) {
+// init opens an iterator over the sstable within [lower, upper).
+func (s *tableSource) init(r *tableReader, lower, upper []byte, useFilter bool) error {
 	limit := sstable.NeverUseFilterBlock
 	if useFilter {
 		limit = sstable.AlwaysUseFilterBlock
@@ -82,6 +84,20 @@ func newTableSource(r *tableReader, lower, upper []byte, useFilter bool) (*table
 		Env:                  sstable.NoReadEnv,
 		ReaderProvider:       sstable.MakeTrivialReaderProvider(r.r),
 	})
+	if err != nil {
+		return err
+	}
+	*s = tableSource{it: it}
+	return nil
+}
+
+// newCompactionSource iterates a whole sstable for a compaction. Blocks are
+// read into bp rather than the block cache, so a compaction does not evict
+// the blocks reads use, and with sequential readahead.
+func newCompactionSource(r *tableReader, bp *block.BufferPool) (*tableSource, error) {
+	it, err := r.r.NewCompactionIter(context.Background(), sstable.IterTransforms{},
+		sstable.ReadEnv{Block: block.ReadEnv{BufferPool: bp}},
+		sstable.MakeTrivialReaderProvider(r.r), sstable.TableBlobContext{})
 	if err != nil {
 		return nil, err
 	}
@@ -132,16 +148,24 @@ func (s *tableSource) close() error { return s.it.Close() }
 // mergingIter merges sources by key, combining every source's fragment of a
 // key with the Merger. Key and value are valid until the next positioning
 // call.
+//
+// Sources that hold the current key are advanced lazily, at the next
+// positioning call, so a key held by one source is returned without copying
+// its key or value.
 type mergingIter struct {
 	merger  Merger
 	sources []source
 	h       srcHeap
+	// cur holds the entries of the current key, out of the heap; they are
+	// advanced and pushed back by the next step.
+	cur []*srcEntry
+	// entries backs the heap's entries, one per source, reused by every
+	// seek. Allocated on first use if the caller did not supply it.
+	entries []srcEntry
 	upper   []byte
 
 	key, value []byte
 	trailer    uint64
-	keyBuf     []byte
-	valBuf     []byte
 	e          error
 }
 
@@ -166,9 +190,14 @@ func (h *srcHeap) Pop() any {
 
 func (m *mergingIter) reset(position func(source) ([]byte, []byte, uint64, bool)) bool {
 	m.h = m.h[:0]
-	for _, s := range m.sources {
+	m.cur = m.cur[:0]
+	if len(m.entries) != len(m.sources) {
+		m.entries = make([]srcEntry, len(m.sources))
+	}
+	for i, s := range m.sources {
 		if k, v, tr, ok := position(s); ok {
-			m.h = append(m.h, &srcEntry{src: s, key: k, value: v, trailer: tr})
+			m.entries[i] = srcEntry{src: s, key: k, value: v, trailer: tr}
+			m.h = append(m.h, &m.entries[i])
 		} else if err := s.err(); err != nil {
 			m.e = err
 			return false
@@ -178,9 +207,18 @@ func (m *mergingIter) reset(position func(source) ([]byte, []byte, uint64, bool)
 	return m.step()
 }
 
-// step assembles the smallest key from the heap, merging all sources'
-// fragments for it, and advances those sources.
+// step advances the sources of the previous key, then assembles the smallest
+// key from the heap, merging all sources' fragments for it.
 func (m *mergingIter) step() bool {
+	for _, e := range m.cur {
+		if k, v, tr, ok := e.src.next(); ok {
+			e.key, e.value, e.trailer = k, v, tr
+			heap.Push(&m.h, e)
+		} else if err := e.src.err(); err != nil {
+			m.e = err
+		}
+	}
+	m.cur = m.cur[:0]
 	if m.e != nil || len(m.h) == 0 {
 		return false
 	}
@@ -188,36 +226,21 @@ func (m *mergingIter) step() bool {
 	if m.upper != nil && bytes.Compare(top.key, m.upper) >= 0 {
 		return false
 	}
-	m.keyBuf = append(m.keyBuf[:0], top.key...)
-	m.valBuf = append(m.valBuf[:0], top.value...)
-	m.trailer = top.trailer
-	m.advance(top)
-	for len(m.h) > 0 && bytes.Equal(m.h[0].key, m.keyBuf) {
-		e := m.h[0]
-		merged, err := m.merger.Merge(nil, m.valBuf, e.value)
+	heap.Pop(&m.h)
+	m.cur = append(m.cur, top)
+	m.key, m.value, m.trailer = top.key, top.value, top.trailer
+	for len(m.h) > 0 && bytes.Equal(m.h[0].key, top.key) {
+		e := heap.Pop(&m.h).(*srcEntry)
+		m.cur = append(m.cur, e)
+		merged, err := m.merger.Merge(nil, m.value, e.value)
 		if err != nil {
 			m.e = err
 			return false
 		}
-		m.valBuf = merged
+		m.value = merged
 		m.trailer = max(m.trailer, e.trailer)
-		m.advance(e)
 	}
-	m.key, m.value = m.keyBuf, m.valBuf
-	return m.e == nil
-}
-
-// advance moves the source at the top of the heap to its next key.
-func (m *mergingIter) advance(e *srcEntry) {
-	if k, v, tr, ok := e.src.next(); ok {
-		e.key, e.value, e.trailer = k, v, tr
-		heap.Fix(&m.h, 0)
-		return
-	}
-	if err := e.src.err(); err != nil {
-		m.e = err
-	}
-	heap.Pop(&m.h)
+	return true
 }
 
 func (m *mergingIter) first() bool {
@@ -238,5 +261,6 @@ func (m *mergingIter) close() error {
 		}
 	}
 	m.sources = nil
+	m.h, m.cur, m.entries = nil, nil, nil
 	return err
 }

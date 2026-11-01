@@ -292,15 +292,63 @@ comparable with the table above. Each figure is the median of 6 runs
 `WriteSustained` runs with `-benchtime=1000000x`. The engine's read and
 write benchmarks run with `DisableCompactions`, like Pebble's.
 
-| Benchmark | M3 | Pebble | Notes |
-|---|---|---|---|
-| `Put`, one writer, periodic sync | 1149 ns | 1272 ns | |
-| `Put`, 4 writers, periodic sync | 1232 ns | 1288 ns | |
-| `Put`, 4 writers, synced | 3135 ns | **2954 ns** | |
-| `Get` from sstables | **1708 ns** | 2525 ns | |
-| `Scan100` (seek, then 100 rows) | **8.9 µs** | 10.6 µs | |
-| `WriteSustained` (with compactions) | 2289 ns | **1659 ns** | |
-| `WriteSustained` write amplification | **2.50** | 2.93 | UCS T4 against Pebble's leveled |
+Each run of the suite measures the engine and Pebble side by side, so the
+ratio to Pebble from the same run (engine ÷ Pebble, below 1 is faster) is
+the more reliable comparison between milestones; absolute figures drift with
+the VM's load (Pebble's own `Put` varied by 22% between the M3 and M3.1
+runs).
+
+| Benchmark | M3 | M3 ÷ Pebble | M3.1 | M3.1 ÷ Pebble | Pebble (M3.1 run) |
+|---|---|---|---|---|---|
+| `Put`, one writer, periodic sync | 1149 ns | 0.90 | 1446 ns | 0.93 | 1558 ns |
+| `Put`, 4 writers, periodic sync | 1232 ns | 0.96 | 1240 ns | 0.88 | 1413 ns |
+| `Put`, 4 writers, synced | 3135 ns | 1.06 | 3249 ns | 1.18 | 2750 ns |
+| `Get` from sstables | 1708 ns | 0.68 | 1686 ns | **0.65** | 2593 ns |
+| `Scan100` (seek, then 100 rows) | 8.9 µs | 0.84 | 8.4 µs | **0.76** | 10.9 µs |
+| `WriteSustained` (with compactions) | 2289 ns | 1.38 | 1877 ns | **1.06** | 1775 ns |
+| `WriteSustained` write amplification | 2.50 | 0.85 | 2.81 | 0.96 | 2.93 |
+| Allocations per `Get` / `Scan100` | 4 / 11 | | 3 / 3 | | 2 / 2 |
+
+(The benchmark's own key formatting accounts for 2 allocations per
+operation in every column.)
+
+What changed in M3.1, from CPU, allocation and blocking profiles of
+`WriteSustained` (writers were never stalled; the gap was CPU spent in
+compaction and in growing files):
+
+- **Compaction reads bypass the block cache.** Inputs are read with
+  Pebble's compaction iterator into a private buffer pool, with sequential
+  readahead, as Pebble's own compactions do, so compactions no longer
+  insert every block they read into the cache (and evict blocks that reads
+  use).
+- **The merging iterator no longer copies.** Sources holding the current
+  key are advanced at the next positioning call, so a row held by one source
+  is passed on without copying its key and value; only rows with fragments
+  in several sources are merged into a new buffer.
+- **Compaction output timestamps come from the inputs.** The output's
+  minimum and maximum timestamps are the union of the inputs' instead of
+  being decoded from every row. Merging only keeps or drops existing cells
+  and deletions, so the union bounds the output; a wider range only makes
+  reads stop early less often, and purging (M5) more conservative.
+- Together these cut `WriteSustained` by 18–23% (1.38× Pebble to 1.06×).
+  Write amplification rose from 2.50 to 2.81, still below Pebble's 2.93:
+  with compactions keeping up, more of them run before the benchmark ends.
+- **WAL segments are recycled**, as Pebble and older Cassandra versions do:
+  up to two obsolete segments are renamed and overwritten instead of
+  creating new files. On a real disk this avoids allocating blocks and
+  updating the file size on every fsync. Records carry their segment
+  number, so the old segment's records past the new end are recognised on
+  replay and end it (`TestWALRecycleReplay`, `TestWALRecycling`). Recovery
+  deletes recycled segments, which lie below the manifest's minimum WAL
+  segment. The in-memory benchmarks barely show it: the `Put` benchmarks
+  never flush, so no segment becomes obsolete.
+- **Reads allocate less.** `Get` merges an sstable's entry while the
+  iterator still pins the block, instead of copying it first (one copy per
+  hit instead of two). `Iterator` keeps its sources, heap entries and a few
+  memtable and sstable sources inline, so a scan over a few files costs one
+  allocation; empty memtables are skipped.
+- **Synced writes are still slower than Pebble's** (see the M2 notes above); this
+  milestone did not change the commit path.
 
 ## 11. Milestones
 
@@ -310,6 +358,7 @@ write benchmarks run with `DisableCompactions`, like Pebble's.
 | **M1.5** (done) | Cassandra's architecture: one WAL with segments and a memory budget, per-table memtables, sstables and directories, create and drop table. |
 | **M2** (done) | Cassandra's timestamp semantics (row codec, merge on read and flush, timestamp-ordered reads); periodic and group commit log sync; the speed fixes in section 10. |
 | **M3** (done) | Merging iterator, UCS for one shard per table, model test, reference-counted read states. |
+| **M3.1** (done) | Speed: compaction reads outside the block cache, copy-free merging iterator, WAL segment recycling, fewer read allocations. |
 | M4 | UCS sharding, parallel compactions, time-window mode. |
 | M5 | Purge rule, collector summaries, due-file picking. |
 | M6 | Snapshots, streaming and repair support, benchmarks against the Pebble fork. |

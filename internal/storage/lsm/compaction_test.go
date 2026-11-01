@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand/v2"
+	"os"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -224,8 +226,14 @@ func TestReadsDuringCompaction(t *testing.T) {
 // and row deletions, interleaved with flushes, compactions, reopens and
 // crashes. Every row read back must equal, byte for byte, the merge of all
 // fragments the model knows were written (and, after a crash, synced).
+//
+// LSM_MODEL_SEEDS=n runs n seeds instead of 10.
 func TestModel(t *testing.T) {
-	for seed := uint64(0); seed < 10; seed++ {
+	seeds := uint64(10)
+	if v, err := strconv.ParseUint(os.Getenv("LSM_MODEL_SEEDS"), 10, 64); err == nil && v > 0 {
+		seeds = v
+	}
+	for seed := uint64(0); seed < seeds; seed++ {
 		t.Run(fmt.Sprint(seed), func(t *testing.T) { runModel(t, seed) })
 	}
 }
