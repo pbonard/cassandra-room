@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cassandra-room/cassandra-room/internal/storage/row"
+	"github.com/cespare/xxhash/v2"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/sstable/tablefilters/bloom"
 	"github.com/cockroachdb/pebble/vfs"
@@ -235,6 +236,27 @@ func BenchmarkScan100(b *testing.B) {
 // (flushed + compacted) / flushed bytes. Run with a fixed count, for
 // example -benchtime=1000000x.
 func BenchmarkWriteSustained(b *testing.B) {
+	benchWriteSustained(b, benchKey, []string{"lsm", "pebble"})
+}
+
+// tokenBenchKey prefixes the key with a hash of it, as the schema layer
+// prefixes keys with the partition's Murmur3 token, so keys spread over the
+// token space and UCS can shard.
+func tokenBenchKey(i int) []byte {
+	k := benchKey(i)
+	return append(tokenKey(xxhash.Sum64(k)), k...)
+}
+
+// BenchmarkWriteSustainedTokens is BenchmarkWriteSustained with keys spread
+// over the token space. "lsm" uses the default sharding (which, at this data
+// size, does not shard: min_sstable_size is 100 MiB); "lsm-sharded" scales
+// the shard targets down to the benchmark (4 base shards, 4 MiB target, no
+// minimum) so flushes and compactions split and run in parallel.
+func BenchmarkWriteSustainedTokens(b *testing.B) {
+	benchWriteSustained(b, tokenBenchKey, []string{"lsm", "lsm-sharded", "pebble"})
+}
+
+func benchWriteSustained(b *testing.B, key func(int) []byte, engines []string) {
 	val := benchValue()
 	for _, eng := range engines {
 		b.Run(eng, func(b *testing.B) {
@@ -243,8 +265,14 @@ func BenchmarkWriteSustained(b *testing.B) {
 			var wa func() float64
 			var closeFn func() error
 			switch eng {
-			case "lsm":
-				e, err := Open("db", &Options{FS: vfs.NewMem(), MemTableBudget: 12 << 20})
+			case "lsm", "lsm-sharded":
+				opts := &Options{FS: vfs.NewMem(), MemTableBudget: 12 << 20}
+				if eng == "lsm-sharded" {
+					opts.TableOptions = func(TableID) TableOptions {
+						return TableOptions{BaseShardCount: 4, TargetSSTableSize: 4 << 20, MinSSTableSize: -1}
+					}
+				}
+				e, err := Open("db", opts)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -279,13 +307,34 @@ func BenchmarkWriteSustained(b *testing.B) {
 						b.Fatal(err)
 					}
 					// Wait until Pebble has no compaction running or owed, so
-					// both engines are measured after the same work.
+					// both engines are measured after the same work. With
+					// keys spread over the key space Pebble can report a
+					// debt it never schedules a compaction for, so it is
+					// also done once it has started none for 500 ms.
+					// The timer is paused while Pebble is idle, so that
+					// wait is not measured.
+					idleSince, lastCount, paused := time.Now(), int64(-1), false
 					for {
 						m := db.Metrics()
 						if m.Compact.NumInProgress == 0 && m.Compact.EstimatedDebt == 0 {
 							break
 						}
+						if m.Compact.NumInProgress > 0 || m.Compact.Count != lastCount {
+							idleSince, lastCount = time.Now(), m.Compact.Count
+							if paused {
+								b.StartTimer()
+								paused = false
+							}
+						} else if !paused {
+							b.StopTimer()
+							paused = true
+						} else if time.Since(idleSince) > 500*time.Millisecond {
+							break
+						}
 						time.Sleep(time.Millisecond)
+					}
+					if paused {
+						b.StartTimer()
 					}
 				}
 				wa = func() float64 {
@@ -308,7 +357,7 @@ func BenchmarkWriteSustained(b *testing.B) {
 			defer closeFn()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if err := put(benchKey((i * 7919) % 200000)); err != nil {
+				if err := put(key((i * 7919) % 200000)); err != nil {
 					b.Fatal(err)
 				}
 			}

@@ -47,7 +47,10 @@ Cassandra sstable importer if that becomes necessary.
 | Compaction strategy and settings | | ✓ | per-table compaction options |
 
 Keys inside a table are `token | partition key | clustering key`, with no
-table ID: the table is the directory.
+table ID: the table is the directory. The token is 8 bytes, big-endian, so
+byte order is ring order (the schema layer maps Murmur3's signed tokens by
+flipping the sign bit). Sharding (section 8) reads it; nothing else in the
+engine interprets keys.
 
 Per-table operations:
 
@@ -183,7 +186,7 @@ are deleted.
 - **Snapshots (*planned*):** a sequence number plus a reference to a table's
   file set.
 
-## 8. Compaction: UCS per table (M3; sharding M4)
+## 8. Compaction: UCS per table (M3, M4)
 
 The rules follow Cassandra 5's Unified Compaction Strategy, checked against
 the cassandra-5.0 branch (commit 3e6d5ca):
@@ -201,15 +204,39 @@ and `unified/Controller.java`.
   `cassandra_latest.yaml`. This engine defaults every table to UCS T4,
   which behaves like STCS.
 - **Density and levels:** an sstable's density is its size divided by the
-  fraction of the token range it covers; level `n` starts at density
-  `m·F^n`, where `m` is the flush size.
-- **Trigger:** within a level, sstables are grouped into overlapping sets; a
-  set with `T` or more sstables is compacted.
-- **Sharding** (*planned*, M4): output is cut at token boundaries, so a
-  partition is never split, and compactions in different shards run in
-  parallel. In M3 every table has one shard, so density is file size and a
-  table runs at most one compaction at a time (`MaxConcurrentCompactions`
-  bounds compactions across tables).
+  fraction of the token space it covers, from its first key's token to its
+  last's (`ShardManager.density`); a span under 2⁻⁴⁸ (one partition, or a
+  test's narrow keys) counts as the whole space, as
+  `MINIMUM_TOKEN_COVERAGE` does. Level `n` starts at density `m·F^n`, where
+  `m` is the flush size. The engine is one node owning the whole ring, so
+  there are no local ranges to discount.
+- **Trigger and buckets (M4):** within a level, sstables form overlap sets
+  (`Overlaps.constructOverlapSets`: for every key, some set holds every
+  sstable covering it). A set with `T` or more sstables triggers a
+  compaction; it is extended transitively with neighbouring sets that share
+  an sstable (`assignOverlapsIntoBuckets`, `TRANSITIVE`), forming a bucket.
+  The bucket with the highest overlap wins, across levels too, ties going to
+  the lower level. A late bucket is cut to its oldest sstables (by maximum
+  timestamp) so that no overlap set holds more than the limit
+  (`pullLastWithOverlapLimit`).
+- **Sharding (M4):** at the start of a compaction, the output's density is
+  estimated (total input size over the inputs' combined span) and turned
+  into a shard count with `Controller.getNumShards`: `base_shard_count`
+  shards, multiplied by powers of two as density grows past
+  `target_sstable_size`, damped by `sstable_growth`, and reduced to a power
+  of two below `min_sstable_size`. The token space is cut into that many
+  equal shards, and the output gets one sstable per shard it touches.
+  Boundaries are whole tokens, so a partition is never split, and since
+  every count is a power-of-two multiple of the base, a boundary at one
+  density is a boundary at every higher one. Flushes are split the same
+  way, by the memtable's size.
+- **Parallelism (M4):** each output shard is its own task (UCS's
+  `parallelize_output_shards`, on by default; `SerialOutputShards` turns it
+  off), and a table runs several compactions at once: each pick excludes
+  sstables other compactions use, and buckets share no sstable.
+  `MaxConcurrentCompactions` (Cassandra's `concurrent_compactors`) bounds
+  both the compactions and the shard tasks running at once. A compaction
+  installs all its shards in one manifest edit, or none.
 - **Installing a compaction (M3):** the output is written and synced, then
   one manifest edit adds it and deletes the inputs. Readers switch to the new
   read state; each input file is closed and deleted when its last reader
@@ -218,8 +245,13 @@ and `unified/Controller.java`.
 - **Fully expired sstables** (*planned*) are dropped without rewriting, checked every 10
   minutes (`CompactionController.getFullyExpiredSSTables`, used by every
   Cassandra strategy).
-- **Time-window mode** (*planned*): sstables grouped by maximum write
-  timestamp, for insert-only TTL tables, so whole files expire together.
+- **Time-window mode (M4, `TableOptions.TimeWindow`):** for insert-only
+  TTL tables, as Cassandra's `TimeWindowCompactionStrategy`: sstables are
+  grouped by the window of their maximum write timestamp; the newest window
+  is compacted with UCS's rules, and every older window, once it holds two
+  sstables, into one (oldest first, up to `max_sstables_to_compact`).
+  Output is not sharded, so a window ends as one file that expires as a
+  whole.
 
 ## 9. Purging (*planned*, M5)
 
@@ -350,6 +382,37 @@ compaction and in growing files):
 - **Synced writes are still slower than Pebble's** (see the M2 notes above); this
   milestone did not change the commit path.
 
+### M4 results
+
+M4 adds `WriteSustainedTokens`: the sustained-write workload with each key
+prefixed by a hash of it, as the schema layer prefixes keys with the
+partition's token. The original benchmark's keys share their first 7 bytes,
+so they span less than 2⁻⁴⁸ of the token space and never shard. `lsm` uses
+the default sharding, which does not shard at this data size
+(`min_sstable_size` is 100 MiB); `lsm-sharded` scales the targets to the
+benchmark (4 base shards, 4 MiB target, no minimum), so flushes and
+compactions split into shards that compact in parallel. Pebble's wait for
+its compactions also ends once it has started none for 500 ms, with the
+timer paused meanwhile: with these keys Pebble reports a compaction debt it
+never schedules, and the earlier wait never returned.
+
+| Benchmark | M4 | M4 ÷ Pebble | Pebble (M4 run) |
+|---|---|---|---|
+| `Put`, one writer, periodic sync | 1064 ns | 0.83 | 1275 ns |
+| `Put`, 4 writers, periodic sync | 1150 ns | 0.86 | 1333 ns |
+| `Put`, 4 writers, synced | 3168 ns | 1.10 | 2882 ns |
+| `Get` from sstables | 1650 ns | 0.60 | 2736 ns |
+| `Scan100` | 8.5 µs | 0.78 | 10.9 µs |
+| `WriteSustained` | 1715 ns | 1.06 | 1621 ns |
+| `WriteSustained` write amplification | 3.05 | 0.99 | 3.07 |
+| `WriteSustainedTokens`, `lsm` | 1775 ns | 0.93 | 1899 ns |
+| `WriteSustainedTokens`, `lsm-sharded` | **1466 ns** | **0.77** | 1899 ns |
+| `WriteSustainedTokens` write amplification, `lsm` / `lsm-sharded` | 2.88 / 2.71 | 0.85 / 0.80 | 3.39 |
+
+Write amplification of `WriteSustained` rose from 2.81 to 3.05: buckets now
+take in every sstable that transitively overlaps the triggering set, as
+Cassandra's do, so compactions are larger; it stays level with Pebble's.
+
 ## 11. Milestones
 
 | Milestone | Contents |
@@ -359,6 +422,6 @@ compaction and in growing files):
 | **M2** (done) | Cassandra's timestamp semantics (row codec, merge on read and flush, timestamp-ordered reads); periodic and group commit log sync; the speed fixes in section 10. |
 | **M3** (done) | Merging iterator, UCS for one shard per table, model test, reference-counted read states. |
 | **M3.1** (done) | Speed: compaction reads outside the block cache, copy-free merging iterator, WAL segment recycling, fewer read allocations. |
-| M4 | UCS sharding, parallel compactions, time-window mode. |
+| **M4** (done) | UCS sharding of flushes and compactions, overlap buckets, parallel output shards and concurrent compactions per table, time-window mode. |
 | M5 | Purge rule, collector summaries, due-file picking. |
 | M6 | Snapshots, streaming and repair support, benchmarks against the Pebble fork. |

@@ -70,62 +70,145 @@ func (it *memIter) next() (key, value []byte, trailer uint64, ok bool, err error
 	return key, value, trailer, true, nil
 }
 
-// writeTable writes the memtable to sstable num, one entry per key: the merge
-// of the key's versions, as a MERGE entry (other sstables may hold other
-// fragments of the row). It returns nil if the memtable is empty.
-func writeTable(fs vfs.FS, dir string, num uint64, wo sstable.WriterOptions, merger Merger, mem *memTable) (*fileMeta, error) {
-	it := memIter{merger: merger, n: mem.first()}
-	if it.n == nil {
-		return nil, nil
-	}
-	f, err := fs.Create(fs.PathJoin(dir, tableFileName(num)), vfs.WriteCategoryUnspecified)
+// sstBuilder writes one sstable.
+type sstBuilder struct {
+	fs   vfs.FS
+	path string
+	num  uint64
+	w    sstable.RawWriter
+	// With computeTS, the file's timestamp range is decoded from its rows;
+	// otherwise the caller supplies it.
+	computeTS    bool
+	merger       Merger
+	minTS, maxTS int64
+	n            int
+}
+
+func newSSTBuilder(fs vfs.FS, dir string, num uint64, wo sstable.WriterOptions, merger Merger, computeTS bool) (*sstBuilder, error) {
+	path := fs.PathJoin(dir, tableFileName(num))
+	f, err := fs.Create(path, vfs.WriteCategoryUnspecified)
 	if err != nil {
 		return nil, err
 	}
-	w := sstable.NewRawWriter(objstorageprovider.NewFileWritable(f), wo)
-	minTS, maxTS := int64(math.MaxInt64), int64(math.MinInt64)
-	for {
-		key, value, trailer, ok, err := it.next()
-		if err == nil && ok {
-			var lo, hi int64
-			var has bool
-			if lo, hi, has, err = merger.Timestamps(value); has {
-				minTS, maxTS = min(minTS, lo), max(maxTS, hi)
-			}
-		}
-		if err == nil && ok {
-			k := pebble.InternalKey{
-				UserKey: key,
-				Trailer: pebble.InternalKeyTrailer(trailer&^0xff | uint64(pebble.InternalKeyKindMerge)),
-			}
-			err = w.Add(k, value, false, sstable.KVMeta{})
-		}
+	return &sstBuilder{
+		fs: fs, path: path, num: num,
+		w:         sstable.NewRawWriter(objstorageprovider.NewFileWritable(f), wo),
+		computeTS: computeTS, merger: merger,
+		minTS: math.MaxInt64, maxTS: math.MinInt64,
+	}, nil
+}
+
+// add writes one row (all of the key's fragments merged) as a MERGE entry:
+// other sstables may hold other fragments of the row.
+func (b *sstBuilder) add(key, value []byte, trailer uint64) error {
+	if b.computeTS {
+		lo, hi, has, err := b.merger.Timestamps(value)
 		if err != nil {
-			w.Close()
-			return nil, err
+			return err
 		}
-		if !ok {
-			break
+		if has {
+			b.minTS, b.maxTS = min(b.minTS, lo), max(b.maxTS, hi)
 		}
 	}
-	// Close finishes the table: it syncs and closes the file.
-	if err := w.Close(); err != nil {
+	b.n++
+	k := pebble.InternalKey{
+		UserKey: key,
+		Trailer: pebble.InternalKeyTrailer(trailer&^0xff | uint64(pebble.InternalKeyKindMerge)),
+	}
+	return b.w.Add(k, value, false, sstable.KVMeta{})
+}
+
+// finish closes the file (which syncs it) and returns its metadata, or nil
+// (and removes the file) if no row was added.
+func (b *sstBuilder) finish() (*fileMeta, error) {
+	if err := b.w.Close(); err != nil {
+		_ = b.fs.Remove(b.path)
 		return nil, err
 	}
-	md, err := w.Metadata()
+	if b.n == 0 {
+		return nil, b.fs.Remove(b.path)
+	}
+	md, err := b.w.Metadata()
 	if err != nil {
+		_ = b.fs.Remove(b.path)
 		return nil, err
 	}
 	return &fileMeta{
-		num:      num,
+		num:      b.num,
 		size:     md.Size,
 		smallest: md.SmallestPoint.Clone(),
 		largest:  md.LargestPoint.Clone(),
 		minSeq:   uint64(md.SeqNums.Low),
 		maxSeq:   uint64(md.SeqNums.High),
-		minTS:    minTS,
-		maxTS:    maxTS,
+		minTS:    b.minTS,
+		maxTS:    b.maxTS,
 	}, nil
+}
+
+// abort closes and removes the file.
+func (b *sstBuilder) abort() {
+	_ = b.w.Close()
+	_ = b.fs.Remove(b.path)
+}
+
+// writeTable writes the memtable to sstables, one entry per key: the merge of
+// the key's versions. A new sstable starts at each shard boundary (sorted
+// keys; see shardBoundaries), so no sstable crosses one. alloc returns file
+// numbers. It returns no files if the memtable is empty; on error it removes
+// what it wrote.
+func writeTable(fs vfs.FS, dir string, alloc func() uint64, wo sstable.WriterOptions, merger Merger, mem *memTable, boundaries [][]byte) ([]*fileMeta, error) {
+	it := memIter{merger: merger, n: mem.first()}
+	var out []*fileMeta
+	var b *sstBuilder
+	fail := func(err error) ([]*fileMeta, error) {
+		if b != nil {
+			b.abort()
+		}
+		for _, f := range out {
+			_ = fs.Remove(fs.PathJoin(dir, tableFileName(f.num)))
+		}
+		return nil, err
+	}
+	next := 0 // the next boundary
+	for {
+		key, value, trailer, ok, err := it.next()
+		if err != nil {
+			return fail(err)
+		}
+		if !ok {
+			break
+		}
+		crossed := false
+		for next < len(boundaries) && bytes.Compare(key, boundaries[next]) >= 0 {
+			next++
+			crossed = true
+		}
+		if crossed && b != nil {
+			meta, err := b.finish()
+			b = nil
+			if err != nil {
+				return fail(err)
+			}
+			out = append(out, meta)
+		}
+		if b == nil {
+			if b, err = newSSTBuilder(fs, dir, alloc(), wo, merger, true); err != nil {
+				return fail(err)
+			}
+		}
+		if err := b.add(key, value, trailer); err != nil {
+			return fail(err)
+		}
+	}
+	if b != nil {
+		meta, err := b.finish()
+		b = nil
+		if err != nil {
+			return fail(err)
+		}
+		out = append(out, meta)
+	}
+	return out, nil
 }
 
 // tableReader is an open sstable.

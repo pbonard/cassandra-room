@@ -26,8 +26,7 @@ type Table struct {
 	flushedSeq uint64
 	opts       TableOptions
 	// flushSize is a moving average of flush output sizes, UCS's m.
-	flushSize  float64
-	compacting bool
+	flushSize float64
 }
 
 // immMemTable is a memtable waiting to be flushed.
@@ -37,6 +36,16 @@ type immMemTable struct {
 	// rotated: every entry of the table at or below it is in this memtable or
 	// an older one.
 	boundary uint64
+}
+
+// flushBoundaries returns the shard boundaries a flush of mem is split at:
+// UCS shards flush output like compaction output, by its density (the
+// memtable covers the whole token space).
+func (t *Table) flushBoundaries(mem *memTable) [][]byte {
+	if t.opts.TimeWindow > 0 {
+		return nil
+	}
+	return shardBoundaries(t.opts.numShards(float64(mem.approximateSize())))
 }
 
 // readState is an immutable view of a table's memtables and sstables. It is

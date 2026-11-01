@@ -9,8 +9,10 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cassandra-room/cassandra-room/internal/storage/row"
+	"github.com/cespare/xxhash/v2"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
@@ -240,6 +242,15 @@ func TestModel(t *testing.T) {
 
 func runModel(t *testing.T, seed uint64) {
 	rng := rand.New(rand.NewPCG(seed, 7))
+	// Odd seeds use keys spread over the token space, with small shards.
+	sharded := seed%2 == 1
+	modelKey := func(i int) string {
+		k := fmt.Sprintf("k%03d", i)
+		if sharded {
+			return string(tokenKey(xxhash.Sum64String(k))) + k
+		}
+		return k
+	}
 	fs := vfs.NewCrashableMem()
 	opts := func(fs vfs.FS) *Options {
 		return &Options{
@@ -248,7 +259,19 @@ func runModel(t *testing.T, seed uint64) {
 			WALSegmentSize: 8 << 10,
 			WALSyncPeriod:  -1,
 			TableOptions: func(TableID) TableOptions {
-				return TableOptions{ScalingParameters: []int{[]int{-2, 0, 2, 4}[seed%4]}}
+				o := TableOptions{ScalingParameters: []int{[]int{-2, 0, 2, 4}[seed%4]}}
+				if sharded {
+					// Small targets, so flushes and compactions split.
+					o.BaseShardCount = []int{1, 2, 4}[seed%3]
+					o.TargetSSTableSize = 4 << 10
+					o.MinSSTableSize = -1
+					o.SSTableGrowth = []float64{-1, 0.333, 0.5}[seed%3]
+					o.SerialOutputShards = seed%4 == 3
+				}
+				if seed%5 == 4 {
+					o.TimeWindow = 20 * time.Microsecond // timestamps are 0..99
+				}
+				return o
 			},
 		}
 	}
@@ -317,7 +340,7 @@ func runModel(t *testing.T, seed uint64) {
 	for op := 0; op < 3000; op++ {
 		switch p := rng.IntN(100); {
 		case p < 85:
-			f := frag{fmt.Sprintf("k%03d", rng.IntN(300)), randomFrag()}
+			f := frag{modelKey(rng.IntN(300)), randomFrag()}
 			sync := rng.IntN(20) == 0
 			wo := NoSync
 			if sync {
@@ -363,3 +386,201 @@ func runModel(t *testing.T, seed uint64) {
 }
 
 func makeKey(s string) pebble.InternalKey { return pebble.InternalKey{UserKey: []byte(s)} }
+
+// TestNumShards checks the examples in UnifiedCompactionStrategy.md.
+func TestNumShards(t *testing.T) {
+	const MiB = 1 << 20
+	// Basic scheme: b=4, t=100MiB, λ=0, no minimum.
+	o := TableOptions{BaseShardCount: 4, TargetSSTableSize: 100 * MiB, MinSSTableSize: -1, SSTableGrowth: -1}
+	o.ensureDefaults()
+	require.Equal(t, 4, o.numShards(200*MiB))   // "a 200 MiB memtable will be split in four"
+	require.Equal(t, 16, o.numShards(1200*MiB)) // "rounded to 2^2 · 4 shards"
+	require.Equal(t, 4, o.numShards(0))
+	// Minimum size: m=100MiB, b=4.
+	o.MinSSTableSize = 100 * MiB
+	require.Equal(t, 1, o.numShards(50*MiB))
+	require.Equal(t, 2, o.numShards(250*MiB))
+	require.Equal(t, 4, o.numShards(450*MiB))
+	// λ=1: always b shards above the minimum.
+	o = TableOptions{BaseShardCount: 10, MinSSTableSize: 100 * MiB, SSTableGrowth: 1}
+	o.ensureDefaults()
+	require.Equal(t, 10, o.numShards(1<<40))
+	require.Equal(t, 2, o.numShards(250*MiB)) // largest power of 2 dividing 10
+	// λ=0.5: quadrupling the density doubles the shard count.
+	o = TableOptions{BaseShardCount: 1, TargetSSTableSize: MiB, MinSSTableSize: -1, SSTableGrowth: 0.5}
+	o.ensureDefaults()
+	require.Equal(t, 2*o.numShards(64*MiB), o.numShards(256*MiB))
+}
+
+func TestShardBoundaries(t *testing.T) {
+	require.Empty(t, shardBoundaries(1))
+	b := shardBoundaries(4)
+	require.Equal(t, [][]byte{tokenKey(1 << 62), tokenKey(1 << 63), tokenKey(3 << 62)}, b)
+	// Boundaries of n shards are boundaries of 2n shards.
+	b8 := shardBoundaries(8)
+	for i, k := range b {
+		require.Equal(t, k, b8[2*i+1])
+	}
+	// Spans and densities.
+	require.Equal(t, 1.0, tokenSpan([]byte("abcdefg1"), []byte("abcdefg2"))) // too narrow: whole space
+	require.Equal(t, 1.0/256, tokenSpan([]byte("a"), []byte("a\xff\xff\xff\xff\xff\xff\xff")))
+	require.InDelta(t, 0.25, tokenSpan(tokenKey(0), tokenKey(1<<62-1)), 1e-12)
+}
+
+// TestOverlapSets checks the example in UnifiedCompactionStrategy.md: A, B,
+// C and D cover 0-3, 2-7, 6-9 and 1-8; the overlap sets are ABD and BCD.
+func TestOverlapSets(t *testing.T) {
+	f := func(a, b string) *fileMeta { return &fileMeta{smallest: makeKey(a), largest: makeKey(b)} }
+	A, B, C, D := f("0", "3"), f("2", "7"), f("6", "9"), f("1", "8")
+	sets := overlapSets([]*fileMeta{A, B, C, D})
+	require.Len(t, sets, 2)
+	require.ElementsMatch(t, []*fileMeta{A, B, D}, sets[0])
+	require.ElementsMatch(t, []*fileMeta{B, C, D}, sets[1])
+	// The sets share files, so a transitive bucket holds all four.
+	buckets := assignBuckets(3, sets)
+	require.Len(t, buckets, 1)
+	require.Len(t, buckets[0].files(), 4)
+	require.Equal(t, 3, buckets[0].maxOverlap)
+	// Below the threshold nothing is picked.
+	require.Empty(t, assignBuckets(4, sets))
+	// Disjoint groups form separate buckets.
+	E, F := f("a", "b"), f("a", "c")
+	buckets = assignBuckets(2, overlapSets([]*fileMeta{A, B, E, F}))
+	require.Len(t, buckets, 2)
+}
+
+// TestPicksAreDisjoint checks that one table can run several compactions:
+// a pick excludes files other compactions use, and picks never share files.
+func TestPicksAreDisjoint(t *testing.T) {
+	tbl := &Table{opts: TableOptions{ScalingParameters: []int{0}}}
+	tbl.opts.ensureDefaults()
+	f := func(a, b string, ts int64) *fileMeta {
+		return &fileMeta{smallest: makeKey(a), largest: makeKey(b), size: 1000, maxTS: ts}
+	}
+	tbl.files = []*fileMeta{f("a", "c", 1), f("b", "d", 2), f("m", "o", 3), f("n", "p", 4)}
+	p1 := tbl.pickCompactionLocked()
+	require.Len(t, p1, 2)
+	for _, x := range p1 {
+		x.compacting = true
+	}
+	p2 := tbl.pickCompactionLocked()
+	require.Len(t, p2, 2)
+	for _, x := range p2 {
+		require.False(t, slices.Contains(p1, x))
+		x.compacting = true
+	}
+	require.Nil(t, tbl.pickCompactionLocked())
+}
+
+// TestShardedCompaction writes rows spread over the token space with small
+// shard targets and checks that flushes and compactions split their output
+// at shard boundaries (no sstable crosses a base shard, and every
+// partition's rows stay in one sstable of a compaction's output), that
+// compactions run, and that every row reads back.
+func TestShardedCompaction(t *testing.T) {
+	const base = 4
+	e, err := Open("db", &Options{
+		FS:                       vfs.NewMem(),
+		MemTableBudget:           256 << 10,
+		MaxConcurrentCompactions: 4,
+		TableOptions: func(TableID) TableOptions {
+			return TableOptions{BaseShardCount: base, TargetSSTableSize: 32 << 10, MinSSTableSize: -1}
+		},
+	})
+	require.NoError(t, err)
+	defer e.Close()
+	tbl, _ := e.CreateTable(1)
+	key := func(p, c int) string {
+		pk := fmt.Sprintf("p%04d", p)
+		return string(tokenKey(xxhash.Sum64String(pk))) + pk + fmt.Sprintf("/c%02d", c)
+	}
+	want := map[string]string{}
+	for round := 0; round < 30; round++ {
+		for i := 0; i < 400; i++ {
+			p, c := (round*400+i)%2000, round%5
+			k, v := key(p, c), fmt.Sprintf("v%d-%d", round, i)
+			set(t, e, 1, k, v, NoSync)
+			want[k] = v
+		}
+		require.NoError(t, tbl.Flush())
+	}
+	require.NoError(t, e.WaitForCompactions())
+	require.Positive(t, e.Metrics().Compactions)
+
+	bounds := shardBoundaries(base)
+	shardOf := func(k []byte) int {
+		i := 0
+		for i < len(bounds) && bytes.Compare(k, bounds[i]) >= 0 {
+			i++
+		}
+		return i
+	}
+	e.mu.Lock()
+	files := slices.Clone(e.mu.tables[1].files)
+	e.mu.Unlock()
+	require.Greater(t, len(files), base)
+	for _, f := range files {
+		require.Equal(t, shardOf(f.smallest.UserKey), shardOf(f.largest.UserKey),
+			"file %d crosses a shard boundary", f.num)
+	}
+	// Boundaries are whole tokens (8-byte keys), so a file within one shard
+	// never splits a partition with its neighbour in another shard.
+	for _, b := range bounds {
+		require.Len(t, b, tokenLen)
+	}
+	got := scanAll(t, tbl, nil, nil)
+	require.Equal(t, want, got)
+	for k, v := range want {
+		mustGet(t, tbl, k, v)
+	}
+}
+
+// TestTimeWindowCompaction writes rows into three time windows, several
+// flushes each, and checks that every older window ends as one sstable and
+// that no compaction mixes windows.
+func TestTimeWindowCompaction(t *testing.T) {
+	window := time.Hour
+	e, err := Open("db", &Options{
+		FS: vfs.NewMem(),
+		TableOptions: func(TableID) TableOptions {
+			return TableOptions{TimeWindow: window}
+		},
+	})
+	require.NoError(t, err)
+	defer e.Close()
+	tbl, _ := e.CreateTable(1)
+	hour := window.Microseconds()
+	want := map[string]string{}
+	for w := int64(0); w < 3; w++ {
+		for f := 0; f < 6; f++ {
+			for i := 0; i < 20; i++ {
+				// Each flush of a window rewrites the window's keys, so its
+				// sstables overlap.
+				k := fmt.Sprintf("w%d-%02d", w, i)
+				val := fmt.Sprintf("f%d", f)
+				ts := w*hour + int64(f*100+i)
+				v := row.Append(nil, &row.Row{
+					Deletion: row.Deletion{MarkedForDeleteAt: row.NoTimestamp},
+					Cells:    []row.Cell{{Column: 1, Timestamp: ts, LocalDeletionTime: row.NoDeletionTime, Value: []byte(val)}},
+				})
+				require.NoError(t, e.Put(1, []byte(k), v, NoSync))
+				want[k] = val
+			}
+			require.NoError(t, tbl.Flush())
+		}
+		require.NoError(t, e.WaitForCompactions())
+	}
+	require.NoError(t, e.WaitForCompactions())
+	perWindow := map[int64]int{}
+	e.mu.Lock()
+	for _, f := range e.mu.tables[1].files {
+		require.Equal(t, f.minTS/hour, f.maxTS/hour, "file %d mixes windows", f.num)
+		perWindow[f.maxTS/hour]++
+	}
+	e.mu.Unlock()
+	require.Equal(t, 1, perWindow[0])
+	require.Equal(t, 1, perWindow[1])
+	// The newest window follows UCS (T4): 6 flushes leave fewer than 4.
+	require.Less(t, perWindow[2], 4)
+	require.Equal(t, want, scanAll(t, tbl, nil, nil))
+}

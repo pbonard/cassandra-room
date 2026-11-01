@@ -77,7 +77,10 @@ type Engine struct {
 	}
 	flushWG   sync.WaitGroup
 	compactWG sync.WaitGroup
-	metrics   struct {
+	// compactionSem bounds the compaction tasks (output shards) running at
+	// once, across compactions (Cassandra: concurrent_compactors).
+	compactionSem chan struct{}
+	metrics       struct {
 		bytesFlushed, bytesCompacted atomic.Int64
 		flushes, compactions         atomic.Int64
 	}
@@ -112,6 +115,7 @@ func Open(dir string, opts *Options) (*Engine, error) {
 		readerOpts: makeReaderOptions(),
 		merger:     o.Merger,
 	}
+	e.compactionSem = make(chan struct{}, o.MaxConcurrentCompactions)
 	// One block cache and handle per engine; blocks are keyed by file number.
 	c := pebble.NewCache(o.CacheSize)
 	e.readerOpts.CacheOpts.CacheHandle = c.NewHandle()
@@ -263,21 +267,20 @@ func (e *Engine) recover() error {
 	// lastSeq, so the old WAL segments are no longer needed.
 	for id, m := range recovered {
 		t := e.mu.tables[id]
-		meta, err := writeTable(e.fs, t.dir, nextFileNum, e.writerOpts, e.merger, m)
+		alloc := func() uint64 { nextFileNum++; return nextFileNum - 1 }
+		metas, err := writeTable(e.fs, t.dir, alloc, e.writerOpts, e.merger, m, t.flushBoundaries(m))
 		if err != nil {
 			return err
 		}
-		nextFileNum++
-		if meta == nil {
-			continue
-		}
-		if err := e.openFile(t, meta); err != nil {
-			return err
+		for _, meta := range metas {
+			if err := e.openFile(t, meta); err != nil {
+				return err
+			}
 		}
 		if err := syncDir(e.fs, t.dir); err != nil {
 			return err
 		}
-		t.files = append([]*fileMeta{meta}, t.files...)
+		t.files = append(slices.Clone(metas), t.files...)
 	}
 
 	walNum := nextFileNum
@@ -858,18 +861,32 @@ func (e *Engine) flushOne() error {
 	}
 	job := e.mu.flushQueue[0]
 	t, im := job.t, job.imm
-	num := e.mu.nextFileNum
-	e.mu.nextFileNum++
 	e.mu.Unlock()
 
-	meta, err := writeTable(e.fs, t.dir, num, e.writerOpts, e.merger, im.mem)
-	if err == nil && meta != nil {
-		err = e.openFile(t, meta)
+	alloc := func() uint64 {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.mu.nextFileNum++
+		return e.mu.nextFileNum - 1
+	}
+	metas, err := writeTable(e.fs, t.dir, alloc, e.writerOpts, e.merger, im.mem, t.flushBoundaries(im.mem))
+	closeAll := func() {
+		for _, m := range metas {
+			if m.reader != nil {
+				m.reader.close()
+			}
+		}
+	}
+	for _, meta := range metas {
+		if err == nil {
+			err = e.openFile(t, meta)
+		}
 	}
 	if err == nil {
 		err = syncDir(e.fs, t.dir)
 	}
 	if err != nil {
+		closeAll()
 		if t.dropped.Load() {
 			// The table's directory may already be gone.
 			err = nil
@@ -884,33 +901,29 @@ func (e *Engine) flushOne() error {
 	dropped := t.dropped.Load()
 	edit := &versionEdit{nextFileNum: e.mu.nextFileNum, minWAL: e.minNeededWALLocked(im)}
 	if !dropped {
-		te := &tableEdit{id: t.id, flushedSeq: im.boundary}
-		if meta != nil {
-			te.added = []*fileMeta{meta}
-		}
-		edit.tables = []*tableEdit{te}
+		edit.tables = []*tableEdit{{id: t.id, flushedSeq: im.boundary, added: metas}}
 	}
 	manifest := e.mu.manifest
 	e.mu.Unlock()
 
 	if err := manifest.write(edit); err != nil {
-		if meta != nil {
-			meta.reader.close()
-		}
+		closeAll()
 		return err
 	}
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if t.dropped.Load() {
-		if meta != nil {
-			meta.reader.close()
-		}
+		closeAll()
 	} else {
-		if meta != nil {
-			t.files = append([]*fileMeta{meta}, t.files...)
-			t.observeFlushLocked(meta.size)
-			e.metrics.bytesFlushed.Add(int64(meta.size))
+		if len(metas) > 0 {
+			var size uint64
+			for _, m := range metas {
+				size += m.size
+			}
+			t.files = append(slices.Clone(metas), t.files...)
+			t.observeFlushLocked(size)
+			e.metrics.bytesFlushed.Add(int64(size))
 			e.metrics.flushes.Add(1)
 		}
 		t.flushedSeq = im.boundary
