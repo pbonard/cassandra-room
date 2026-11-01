@@ -317,3 +317,112 @@ func TestMajorCompaction(t *testing.T) {
 	require.Equal(t, want, scanAll(t, tbl, nil, nil))
 	require.NoError(t, e.WaitForCompactions())
 }
+
+// TestSTCSBuckets checks the port of SizeTieredCompactionStrategy.getBuckets
+// and mostInterestingBucket.
+func TestSTCSBuckets(t *testing.T) {
+	o := TableOptions{STCSMinSSTableSize: 10}
+	o.ensureDefaults()
+	o.STCSMinSSTableSize = 10
+	f := func(size uint64) *fileMeta { return &fileMeta{size: size} }
+	files := []*fileMeta{f(100), f(110), f(1000), f(90), f(5), f(3), f(1100), f(105), f(95)}
+	buckets := stcsBuckets(files, &o)
+	sizes := func(b []*fileMeta) []uint64 {
+		var out []uint64
+		for _, x := range b {
+			out = append(out, x.size)
+		}
+		return out
+	}
+	require.Len(t, buckets, 3)
+	require.Equal(t, []uint64{3, 5}, sizes(buckets[0]))                  // both below the minimum size
+	require.Equal(t, []uint64{90, 95, 100, 105, 110}, sizes(buckets[1])) // within 0.5-1.5x of the average
+	require.Equal(t, []uint64{1000, 1100}, sizes(buckets[2]))
+	// Needs min_threshold sstables; among eligible buckets the largest
+	// average size wins (Collections.max over the comparator).
+	require.Equal(t, []uint64{90, 95, 100, 105, 110}, sizes(mostInterestingBucket(buckets, 4, 32)))
+	require.Equal(t, []uint64{1000, 1100}, sizes(mostInterestingBucket(buckets, 2, 32)))
+	require.Equal(t, []uint64{90, 95}, sizes(mostInterestingBucket(buckets[1:2], 2, 2)))
+	require.Nil(t, mostInterestingBucket(buckets, 6, 32))
+}
+
+// TestTimeWindowCurrentWindow checks TWCS's rules: the newest window ever
+// seen needs min_threshold sstables (size-tiered), an older one only two,
+// and the current window does not move back when newer files disappear.
+func TestTimeWindowCurrentWindow(t *testing.T) {
+	hour := time.Hour
+	tbl := &Table{opts: TableOptions{TimeWindow: hour}}
+	tbl.opts.ensureDefaults()
+	h := hour.Microseconds()
+	f := func(window int64, size uint64) *fileMeta {
+		return &fileMeta{maxTS: window*h + 1, size: size, smallest: makeKey("a"), largest: makeKey("z")}
+	}
+	// Window 5 is current with 3 files: below min_threshold, nothing.
+	tbl.files = []*fileMeta{f(5, 100), f(5, 100), f(5, 100)}
+	require.Nil(t, tbl.pickCompactionLocked())
+	// A fourth file of similar size: size-tiered compaction of all four.
+	tbl.files = append(tbl.files, f(5, 110))
+	require.Len(t, tbl.pickCompactionLocked(), 4)
+	// Only window 4 left, with 2 files: still older than the highest window
+	// seen (5), so they are compacted.
+	tbl.files = []*fileMeta{f(4, 100), f(4, 300)}
+	require.Len(t, tbl.pickCompactionLocked(), 2)
+	// Older windows are compacted up to max_threshold smallest sstables.
+	tbl.files = nil
+	for i := 0; i < 40; i++ {
+		tbl.files = append(tbl.files, f(1, uint64(1000-i)))
+	}
+	p := tbl.pickCompactionLocked()
+	require.Len(t, p, 32)
+	require.EqualValues(t, 961, p[0].size)
+}
+
+// TestWorthDroppingTombstones checks the overlap check of
+// worthDroppingTombstones.
+func TestWorthDroppingTombstones(t *testing.T) {
+	var clock atomic.Int64
+	clock.Store(1_000_000)
+	e, tbl := purgeEngine(t, vfs.NewMem(), &clock, TableOptions{GCGraceSeconds: 10, TombstoneCompactionInterval: time.Hour})
+	defer e.Close()
+	key := func(tok uint64, s string) string { return string(tokenKey(tok)) + s }
+	// File A: tombstones over tokens [0, 1<<62].
+	for i := uint64(0); i <= 4; i++ {
+		putCell(t, e, key(i<<60, "a"), tombCell(5, clock.Load()))
+	}
+	require.NoError(t, tbl.Flush())
+	a := tableFileList(e, tbl)[0]
+	clock.Add(7200)
+	now, gc := clock.Load(), tbl.opts.gcBefore(clock.Load())
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	_, ok := tbl.worthDroppingTombstonesLocked(a, now, gc)
+	require.True(t, ok, "no overlap")
+
+	// B overlaps all of A's token span with live data: not worth it.
+	b := &fileMeta{smallest: makeKey(key(0, "")), largest: makeKey(key(1<<62, "z")), minTS: 1, maxTS: 1,
+		stats: fileStats{valid: true, maxLDT: row.NoDeletionTime}}
+	tbl.files = append(tbl.files, b)
+	_, ok = tbl.worthDroppingTombstonesLocked(a, now, gc)
+	require.False(t, ok, "fully overlapped, data older than the tombstones")
+	tbl.opts.UncheckedTombstoneCompaction = true
+	_, ok = tbl.worthDroppingTombstonesLocked(a, now, gc)
+	require.True(t, ok, "unchecked")
+	tbl.opts.UncheckedTombstoneCompaction = false
+	// B covering only the first quarter leaves 3/4 of A: 0.75·1 > 0.2.
+	b.largest = makeKey(key(1<<60-1, ""))
+	_, ok = tbl.worthDroppingTombstonesLocked(a, now, gc)
+	require.True(t, ok, "mostly outside the overlap")
+	tbl.files = tbl.files[:1]
+}
+
+func TestUncoveredTokenShare(t *testing.T) {
+	f := func(lo, hi uint64) *fileMeta {
+		return &fileMeta{smallest: makeKey(string(tokenKey(lo))), largest: makeKey(string(tokenKey(hi)))}
+	}
+	x := f(0, 99)
+	require.InDelta(t, 1, uncoveredTokenShare(x, nil), 1e-9)
+	require.InDelta(t, 0.5, uncoveredTokenShare(x, []*fileMeta{f(0, 49)}), 1e-9)
+	require.InDelta(t, 0.5, uncoveredTokenShare(x, []*fileMeta{f(0, 29), f(20, 49)}), 1e-9)
+	require.InDelta(t, 0, uncoveredTokenShare(x, []*fileMeta{f(0, 200)}), 1e-9)
+	require.InDelta(t, 0.25, uncoveredTokenShare(x, []*fileMeta{f(25, 99)}), 1e-9)
+}

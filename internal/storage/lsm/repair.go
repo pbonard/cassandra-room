@@ -1,14 +1,13 @@
 package lsm
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
 	"math/big"
 	"math/bits"
-
-	"github.com/cespare/xxhash/v2"
 )
 
 // TokenRange is a range of tokens, both ends inclusive, so the whole ring
@@ -34,15 +33,28 @@ func (r TokenRange) Bounds() (lower, upper []byte) {
 	return lower, upper
 }
 
+// Hash is a 256-bit digest.
+type Hash [32]byte
+
+func (h *Hash) xor(o *Hash) {
+	for i := range h {
+		h[i] ^= o[i]
+	}
+}
+
 // MerkleTree is a hash tree of a table's rows over a token range, split into
-// 2^Depth equal leaves (Cassandra's validation compaction and MerkleTree).
-// Two replicas compare trees and stream only the ranges whose leaves
-// differ.
+// 2^Depth equal leaves: the perfect tree of Cassandra's MerkleTree, which
+// Cassandra's trees of the same depth can always be compared against. As in
+// Cassandra, every row (Cassandra: partition) is hashed with a 256-bit
+// digest (Cassandra concatenates two murmur3_128; the engine uses
+// SHA-256), a leaf is the XOR of its rows' digests, and an inner node the
+// XOR of its children. Two replicas compare trees and stream only the
+// ranges whose leaves differ.
 type MerkleTree struct {
 	Range TokenRange
 	Depth int
 	// Leaves hold one hash per leaf, of the rows whose token falls in it.
-	Leaves []uint64
+	Leaves []Hash
 }
 
 // maxMerkleDepth bounds a tree to a million leaves.
@@ -72,19 +84,12 @@ func (t *Table) MerkleTree(r TokenRange, depth int) (*MerkleTree, error) {
 	defer it.Close()
 
 	n := uint64(1) << depth
-	m := &MerkleTree{Range: r, Depth: depth, Leaves: make([]uint64, n)}
+	m := &MerkleTree{Range: r, Depth: depth, Leaves: make([]Hash, n)}
 	purger, _ := t.e.merger.(Purger)
 	nowSec := t.e.opts.Now().Unix()
 	gcBefore := t.opts.gcBefore(nowSec)
 	noOther := func(int64, int64) (int64, error) { return math.MaxInt64, nil }
-	var buf []byte
-	var h *xxhash.Digest
-	leaf := -1
-	flush := func() {
-		if leaf >= 0 {
-			m.Leaves[leaf] = h.Sum64()
-		}
-	}
+	var buf, msg []byte
 	for ok := it.First(); ok; ok = it.Next() {
 		v := it.Value()
 		if purger != nil {
@@ -97,20 +102,18 @@ func (t *Table) MerkleTree(r TokenRange, depth int) (*MerkleTree, error) {
 			}
 			buf, v = out, out
 		}
-		if i := int(m.leafOf(keyToken(it.Key()))); i != leaf {
-			flush()
-			leaf, h = i, xxhash.New()
-		}
-		var hdr [binary.MaxVarintLen64]byte
-		_, _ = h.Write(hdr[:binary.PutUvarint(hdr[:], uint64(len(it.Key())))])
-		_, _ = h.Write(it.Key())
-		_, _ = h.Write(hdr[:binary.PutUvarint(hdr[:], uint64(len(v)))])
-		_, _ = h.Write(v)
+		// The row's digest covers its key and its (purged) value, each
+		// length-prefixed.
+		msg = binary.AppendUvarint(msg[:0], uint64(len(it.Key())))
+		msg = append(msg, it.Key()...)
+		msg = binary.AppendUvarint(msg, uint64(len(v)))
+		msg = append(msg, v...)
+		d := Hash(sha256.Sum256(msg))
+		m.Leaves[m.leafOf(keyToken(it.Key()))].xor(&d)
 	}
 	if err := it.Error(); err != nil {
 		return nil, err
 	}
-	flush()
 	return m, nil
 }
 
@@ -142,19 +145,14 @@ func (m *MerkleTree) leafRange(i int) TokenRange {
 	return TokenRange{First: first.Uint64(), Last: next.Sub(next, big.NewInt(1)).Uint64()}
 }
 
-// Root returns the tree's root hash: leaves combined pairwise up to one.
-func (m *MerkleTree) Root() uint64 {
-	level := append([]uint64(nil), m.Leaves...)
-	var b [16]byte
-	for len(level) > 1 {
-		for i := 0; i < len(level)/2; i++ {
-			binary.LittleEndian.PutUint64(b[:8], level[2*i])
-			binary.LittleEndian.PutUint64(b[8:], level[2*i+1])
-			level[i] = xxhash.Sum64(b[:])
-		}
-		level = level[:len(level)/2]
+// Root returns the tree's root hash. Inner nodes are the XOR of their
+// children, as in Cassandra, so the root is the XOR of all leaves.
+func (m *MerkleTree) Root() Hash {
+	var root Hash
+	for i := range m.Leaves {
+		root.xor(&m.Leaves[i])
 	}
-	return level[0]
+	return root
 }
 
 // Diff returns the token ranges where the trees differ, adjacent leaves

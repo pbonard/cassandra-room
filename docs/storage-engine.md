@@ -201,32 +201,47 @@ cluster layer (choosing ranges, peers and transfers) is out of scope.
 
 - **On-disk snapshots (`Table.SnapshotToDisk`, `nodetool snapshot`):** the
   table is flushed and its sstables hard-linked into
-  `snapshots/<name>/<table>/`, with a list file written last, so an
-  incomplete snapshot is recognisable. Links share space with the live
+  `snapshots/<name>/<table>/`, then `manifest.json` (the data files and
+  creation time, as Cassandra's `SnapshotManifest`) is written last, so an
+  incomplete snapshot is recognisable; this follows `TakeSnapshotTask`
+  (flush unless skipped, link, manifest). Not ported: `schema.cql` (no
+  schema layer yet), snapshot TTLs and ephemeral snapshots. Links share space with the live
   table until compaction replaces its files. Recovery ignores the snapshots
   directory. `Engine.ClearSnapshot` deletes one; `Table.SnapshotFiles` lists
   one for restoring with `Import`.
-- **Streaming out (`Table.ExportRange`):** the rows of a key range, from a
-  read snapshot, merged into sstables of about 64 MiB in a directory the
-  caller ships to the receiver. Rows exported from unsynced writes become
-  durable once imported; Cassandra flushes before streaming for the same
-  reason.
+- **Streaming out (`Table.ExportRange`):** the table is flushed first, as
+  `StreamSession.addTransferRanges` flushes ("always flush on stream
+  request"), so what is sent is durable at the sender; then the rows of a
+  key range, from a read snapshot, are merged into sstables of about 64 MiB
+  in a directory the caller ships to the receiver. Cassandra streams
+  sections of existing sstables instead of rewriting them.
 - **Streaming in (`Table.Import`, also `nodetool import`):** every file is
-  read in full and validated first: keys strictly increasing (one entry per
+  read in full and validated first (the equivalent of
+  `SSTableImporter`'s `extendedVerify`, which Cassandra leaves off by
+  default; the engine always does it, since the scan also yields the
+  summary, and it keeps corrupt files out): keys strictly increasing (one entry per
   key, as the engine's reads require), only `SET` and `MERGE` entries, rows
   the Merger decodes; the same pass computes the file's summary. Files on
   the engine's file system with sequence numbers below 2⁴⁸ are then
   hard-linked in unchanged, as Cassandra's zero-copy streaming of entire
-  sstables (CASSANDRA-14556); the others are merged and rewritten, split at
+  sstables (CASSANDRA-14556) and `SSTableImporter`'s move without
+  `copyData` do (the engine links, leaving the source in place); the others
+  are merged and rewritten, split at
   shard boundaries. All files are installed in one manifest edit or none,
   and a rejected file installs nothing (`TestImportRejectsBadFiles`).
   Imported rows reconcile by timestamp like any fragment, so importing the
   same data twice changes nothing.
 - **Repair (`Table.MerkleTree`, `MerkleTree.Diff`):** a hash tree of the
-  rows of a token range, split into `2^depth` equal leaves (Cassandra's
-  validation compaction and `MerkleTree`). Rows are hashed as reads see them
-  after purging what gc grace allows (as validation compaction does), so a
+  rows of a token range, split into `2^depth` equal leaves: the perfect tree
+  of Cassandra's `MerkleTree`. As in `Validator` and `MerkleTree`, each row
+  (Cassandra: each partition) gets a 256-bit digest (SHA-256 of its
+  length-prefixed key and value; Cassandra concatenates two murmur3_128), a
+  leaf is the XOR of its rows' digests and an inner node the XOR of its
+  children. Rows are hashed after purging everything past gc grace, as
+  `CassandraValidationIterator`'s controller does ("we always purge"), so a
   replica that has already purged a deletion matches one that has not.
+  Cassandra also splits leaves unevenly by sampled keys; the engine uses
+  the perfect tree only.
   `Diff` returns the differing token ranges, adjacent ones merged;
   `TokenRange.Bounds` turns one into key bounds for `ExportRange`.
   `TestRepair` runs a full repair between two diverged engines: after
@@ -294,19 +309,40 @@ and `unified/Controller.java`.
   every `ExpiredCheckInterval` (10 minutes, `expired_sstable_check_frequency_seconds`;
   `CompactionController.getFullyExpiredSSTables`, used by every Cassandra
   strategy). See section 9.
-- **Time-window mode (M4, `TableOptions.TimeWindow`):** for insert-only
-  TTL tables, as Cassandra's `TimeWindowCompactionStrategy`: sstables are
-  grouped by the window of their maximum write timestamp; the newest window
-  is compacted with UCS's rules, and every older window, once it holds two
-  sstables, into one (oldest first, up to `max_sstables_to_compact`).
-  Output is not sharded, so a window ends as one file that expires as a
-  whole.
+- **Time-window mode (`TableOptions.TimeWindow`):** a port of
+  `TimeWindowCompactionStrategy.getNextBackgroundSSTables` and
+  `newestBucket`: sstables are grouped by the window of their maximum write
+  timestamp. The current window is the newest one ever seen
+  (`highestWindowSeen`, which never moves back, not the wall clock); it is
+  compacted with size-tiered rules (`SizeTieredCompactionStrategy.getBuckets`
+  and `mostInterestingBucket`, `bucket_low` 0.5, `bucket_high` 1.5,
+  `min_sstable_size` 50 MiB) once it holds `min_threshold` (4) sstables. Any
+  older window with two or more sstables is compacted, its `max_threshold`
+  (32) smallest at a time (`trimToThreshold`). Windows are visited newest
+  first; the first eligible wins. Output is not sharded, so a window ends
+  as one file that expires as a whole. STCS ranks buckets by read hotness;
+  the engine has no read meters, so every hotness is 0 (as for Cassandra's
+  unread sstables) and the tie-break decides: `Collections.max` over it
+  picks the bucket with the largest average size (the code's comment says
+  the smallest; the code is followed).
+- **Choosing among buckets:** within a level, UCS picks uniformly at random
+  among the buckets with the highest overlap (reservoir sampling), as
+  `Level.getCompactionPick` does. One deliberate difference: Cassandra
+  compares levels by their maximum overlap even when it is below the
+  level's threshold, which with per-level scaling parameters can discard a
+  lower level's valid pick; the engine compares only levels with a pick.
 
 ## 9. Purging (M5)
 
-Checked against cassandra-5.0's `AbstractCell.purge`,
-`DeletionPurger`, `CompactionController.getPurgeEvaluator` and
-`getFullyExpiredSSTables`.
+Compared with cassandra-5.0's `AbstractCell.purge`, `DeletionPurger`,
+`CompactionController.getPurgeEvaluator` and `getFullyExpiredSSTables`,
+`AbstractCompactionStrategy.worthDroppingTombstones` and
+`StatsMetadata.getEstimatedDroppableTombstoneRatio`. (An earlier version
+of this document said these were checked when only `AbstractCell.purge`
+had been read; the comparison below was done afterwards, and the
+differences it found were fixed or are listed.) Cell reconciliation
+(section 4) matches `CellLivenessInfo.resolve` and
+`resolveSameTimestampTie` exactly.
 
 - **Purge rule.** A compaction drops a cell tombstone, an expired cell or a
   row deletion when its local deletion time (the expiry time, for expiring
@@ -315,7 +351,12 @@ Checked against cassandra-5.0's `AbstractCell.purge`,
   the row's data outside the compaction, in every memtable (including
   entries not yet visible to readers) and in every sstable of the table's
   current state that may hold the key (key range, then a point lookup that
-  starts with the Bloom filter). Such a deletion cannot shadow anything
+  starts with the Bloom filter). Cassandra's evaluator is coarser: after a
+  Bloom filter check it takes the whole sstable's minimum timestamp, and a
+  memtable's minimum if it holds the partition, because it must also
+  cover partition and range deletions. Rows here are independent keys, so
+  the row's own minimum is the exact bound, and the engine purges at least
+  as often. Such a deletion cannot shadow anything
   still stored, so dropping it never changes what reads return, now or
   later (`row.TestPurgeInvisible` checks this on random rows; changing the
   strict `<` to `<=` already fails it). A row left with nothing is dropped.
@@ -334,24 +375,37 @@ Checked against cassandra-5.0's `AbstractCell.purge`,
   shadowed by it: `gc_grace_seconds` bounds how late writes (hints, repair)
   may arrive. The model test generates writes accordingly.
 - **Summaries.** Every sstable records, in the manifest, its creation time,
-  row count, number of droppable parts (tombstones, expiring cells, row
+  row and cell counts, number of droppable parts (tombstones, expiring cells, row
   deletions), the smallest and largest local deletion times (the largest
   is "never" if any cell is live), and a 32-bin streaming histogram of drop
-  times (as Cassandra's `TombstoneHistogram`). Flushes and purging
+  times (Cassandra's `TombstoneHistogram` has 100 bins and rounds times to
+  60 s). Flushes and purging
   compactions compute them exactly; compactions that copy rows undecoded
   combine the inputs' (upper bounds on counts, safe bounds on times). Files
   from before M5 have none and are never dropped or picked for tombstones.
-- **Fully expired sstables.** An sstable whose largest local deletion time
-  is before `gcBefore`, and whose newest data is older than all data
-  overlapping it in other sstables and memtables, is deleted without being
-  read. Memtables are checked by scanning the overlapping range, up to 4096
-  entries (beyond that the sstable is kept).
-- **Due sstables.** When UCS (or the time-window mode) picks nothing, an
-  sstable older than `TombstoneCompactionInterval` (one day) whose estimated
-  ratio of droppable parts exceeds `TombstoneThreshold` (0.2) is compacted
-  on its own (`worthDroppingTombstones`). A file written in the current
-  second is never due, so a file whose tombstones cannot be dropped yet is
-  not rewritten in a loop.
+- **Fully expired sstables.** As `getFullyExpiredSSTables`: an sstable whose
+  largest local deletion time is before `gcBefore`, and whose newest data
+  is older than the smallest timestamp of the overlapping sstables that
+  still hold data (those that are themselves fully expired do not count)
+  and of the memtables, is deleted without being read. Cassandra takes each
+  memtable's minimum timestamp; the engine scans the memtables over the
+  sstable's key range, up to 4096 entries (beyond that the sstable is
+  kept).
+- **Single-sstable tombstone compactions.** A port of
+  `worthDroppingTombstones`: an sstable older than
+  `tombstone_compaction_interval` (one day) whose droppable tombstones over
+  its cell count exceed `tombstone_threshold` (0.2) qualifies if nothing
+  overlaps it, or it is fully expired, or, unless
+  `unchecked_tombstone_compaction`, the share of its keys outside the
+  overlapping sstables' token ranges times that ratio still exceeds the
+  threshold (Cassandra estimates the share from index samples, the engine
+  from token spans, assuming keys spread evenly; BTI sstables, like these,
+  always count as informative). The time-window mode picks the smallest
+  qualifying sstable, as TWCS does; UCS tables pick the largest, as STCS
+  does. Cassandra 5.0's UCS has no such compactions: for UCS tables they
+  are this design's due-file picking, an extension. A file written in the
+  current second never qualifies, so with an interval of 0 a file whose
+  tombstones cannot be dropped yet is not rewritten in a loop.
 - **Row existence.** The row codec has no primary-key liveness (Cassandra's
   row marker): a row with no cells and no deletion is empty and may be
   dropped. The schema layer must represent `INSERT` of a key alone with a

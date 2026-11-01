@@ -235,7 +235,7 @@ func TestRepair(t *testing.T) {
 func TestMerkleLeafRanges(t *testing.T) {
 	for _, r := range []TokenRange{FullRing, {100, 1099}, {math.MaxUint64 - 9, math.MaxUint64}, {7, 7}} {
 		for _, depth := range []int{0, 1, 3, 5} {
-			m := &MerkleTree{Range: r, Depth: depth, Leaves: make([]uint64, 1<<depth)}
+			m := &MerkleTree{Range: r, Depth: depth, Leaves: make([]Hash, 1<<depth)}
 			next := r.First
 			for i := range m.Leaves {
 				lr := m.leafRange(i)
@@ -250,4 +250,47 @@ func TestMerkleLeafRanges(t *testing.T) {
 			require.Equal(t, r.Last+1, next)
 		}
 	}
+}
+
+// TestMerkleTreeOrderIndependent checks that a leaf is the XOR of its rows'
+// digests: the same rows give the same tree whatever sstables hold them,
+// and one changed row changes exactly its leaf.
+func TestMerkleTreeOrderIndependent(t *testing.T) {
+	open := func() (*Engine, *Table) {
+		e, err := Open("db", &Options{FS: vfs.NewMem(), MemTableBudget: 32 << 10})
+		require.NoError(t, err)
+		tbl, _ := e.CreateTable(1)
+		return e, tbl
+	}
+	a, ta := open()
+	defer a.Close()
+	b, tb := open()
+	defer b.Close()
+	key := func(i int) string {
+		k := fmt.Sprintf("p%04d", i)
+		return string(tokenKey(xxhash.Sum64String(k))) + k
+	}
+	for i := 0; i < 1000; i++ {
+		putCell(t, a, key(i), liveCell(1, "v"))
+	}
+	for i := 999; i >= 0; i-- { // different flush layout
+		putCell(t, b, key(i), liveCell(1, "v"))
+		if i%97 == 0 {
+			require.NoError(t, tb.Flush())
+		}
+	}
+	ma, err := ta.MerkleTree(FullRing, 6)
+	require.NoError(t, err)
+	mb, err := tb.MerkleTree(FullRing, 6)
+	require.NoError(t, err)
+	require.Equal(t, ma.Root(), mb.Root())
+	putCell(t, b, key(7), liveCell(2, "changed"))
+	mb, err = tb.MerkleTree(FullRing, 6)
+	require.NoError(t, err)
+	diff, err := ma.Diff(mb)
+	require.NoError(t, err)
+	require.Len(t, diff, 1)
+	tok := keyToken([]byte(key(7)))
+	require.True(t, diff[0].First <= tok && tok <= diff[0].Last)
+	require.NotEqual(t, ma.Root(), mb.Root())
 }

@@ -29,6 +29,8 @@ type fileStats struct {
 	// created is when the file was written, in Unix seconds.
 	created int64
 	entries uint64
+	// cells counts cells, live or not.
+	cells uint64
 	// tombstones counts tombstones, expiring cells and row deletions.
 	tombstones uint64
 	// maxLDT is the largest local deletion time (row.NoDeletionTime if any
@@ -50,6 +52,7 @@ func newFileStats(created int64) fileStats {
 // add accounts for one row.
 func (s *fileStats) add(r *row.Stats) {
 	s.entries++
+	s.cells += uint64(r.Cells)
 	s.tombstones += uint64(r.Tombstones)
 	s.maxLDT = max(s.maxLDT, r.MaxLDT)
 	s.minLDT = min(s.minLDT, r.MinLDT)
@@ -66,6 +69,7 @@ func unionStats(created int64, files []*fileMeta) fileStats {
 			return fileStats{}
 		}
 		s.entries += f.stats.entries
+		s.cells += f.stats.cells
 		s.tombstones += f.stats.tombstones
 		s.maxLDT = max(s.maxLDT, f.stats.maxLDT)
 		s.minLDT = min(s.minLDT, f.stats.minLDT)
@@ -74,14 +78,14 @@ func unionStats(created int64, files []*fileMeta) fileStats {
 	return s
 }
 
-// droppableRatio estimates the fraction of entries with tombstones that are
-// droppable by time at gcBefore (Cassandra's
-// getEstimatedDroppableTombstoneRatio).
+// droppableRatio is StatsMetadata.getEstimatedDroppableTombstoneRatio: the
+// tombstones droppable by time at gcBefore over the number of cells (0 if
+// there are no cells).
 func (s *fileStats) droppableRatio(gcBefore int64) float64 {
-	if !s.valid || s.entries == 0 {
+	if !s.valid || s.cells == 0 {
 		return 0
 	}
-	return s.hist.countBefore(gcBefore) / float64(s.entries)
+	return s.hist.countBefore(gcBefore) / float64(s.cells)
 }
 
 // ldtHistogram is a streaming histogram (Ben-Haim and Tom-Tov, as
@@ -141,6 +145,7 @@ func (h *ldtHistogram) countBefore(v int64) float64 {
 func appendFileStats(b []byte, s *fileStats) []byte {
 	b = binary.AppendVarint(b, s.created)
 	b = binary.AppendUvarint(b, s.entries)
+	b = binary.AppendUvarint(b, s.cells)
 	b = binary.AppendUvarint(b, s.tombstones)
 	b = binary.AppendVarint(b, s.maxLDT)
 	b = binary.AppendVarint(b, s.minLDT)

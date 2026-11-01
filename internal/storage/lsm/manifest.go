@@ -101,12 +101,13 @@ const (
 	tagNextFileNum = 1
 	tagLastSeq     = 2
 	tagMinWAL      = 3
-	tagAddFile     = 4 // table, num, size, minSeq, maxSeq, minTS, maxTS, smallest, largest
-	tagDeleteFile  = 5 // table, num
-	tagCreateTable = 6 // table
-	tagDropTable   = 7 // table
-	tagFlushedSeq  = 8 // table, seq
-	tagFileStats   = 9 // table, num, fileStats; follows the file's tagAddFile
+	tagAddFile     = 4  // table, num, size, minSeq, maxSeq, minTS, maxTS, smallest, largest
+	tagDeleteFile  = 5  // table, num
+	tagCreateTable = 6  // table
+	tagDropTable   = 7  // table
+	tagFlushedSeq  = 8  // table, seq
+	tagFileStats   = 9  // table, num, fileStats without cells (M5); follows tagAddFile
+	tagFileStats2  = 10 // table, num, fileStats; follows the file's tagAddFile
 )
 
 var errCorruptManifest = errors.New("lsm: corrupt manifest")
@@ -137,7 +138,7 @@ func (e *versionEdit) encode() []byte {
 			b = appendInternalKey(b, f.smallest)
 			b = appendInternalKey(b, f.largest)
 			if f.stats.valid {
-				put(tagFileStats, id, f.num)
+				put(tagFileStats2, id, f.num)
 				b = appendFileStats(b, &f.stats)
 			}
 		}
@@ -236,11 +237,16 @@ func decodeVersionEdit(b []byte) (*versionEdit, error) {
 			f.smallest = readKey()
 			f.largest = readKey()
 			t.added = append(t.added, f)
-		case tagFileStats:
+		case tagFileStats, tagFileStats2:
 			t := tableEditFor(TableID(readNum()))
 			num := readNum()
-			s := fileStats{valid: true, created: readVarint(), entries: readNum(), tombstones: readNum(),
-				maxLDT: readVarint(), minLDT: readVarint()}
+			s := fileStats{valid: true, created: readVarint(), entries: readNum()}
+			if tag == tagFileStats2 {
+				s.cells = readNum()
+			} else {
+				s.cells = s.entries // M5 files: one cell per row assumed
+			}
+			s.tombstones, s.maxLDT, s.minLDT = readNum(), readVarint(), readVarint()
 			n := readNum()
 			if err == nil && n > uint64(len(b)) {
 				err = errCorruptManifest

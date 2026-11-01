@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"slices"
 	"sync"
 	"time"
@@ -46,14 +47,24 @@ type TableOptions struct {
 	// TimeWindow, if positive, selects the time-window mode for insert-only
 	// TTL tables (Cassandra's TimeWindowCompactionStrategy): sstables are
 	// grouped by window of their maximum write timestamp (microseconds, as
-	// Cassandra's); the newest window is compacted with UCS's rules, every
-	// older window into a single sstable, so whole files expire together.
-	// Output is not sharded.
+	// Cassandra's); the newest window seen is compacted with size-tiered
+	// rules, every older window down to one sstable, so whole files expire
+	// together. Output is not sharded. Cassandra's default window is one day.
 	TimeWindow time.Duration
+	// MinThreshold and MaxThreshold are the table's min_threshold and
+	// max_threshold (4 and 32), used by the time-window mode.
+	MinThreshold, MaxThreshold int
+	// Size-tiered options used in the newest time window (bucket_low 0.5,
+	// bucket_high 1.5, min_sstable_size 50 MiB).
+	STCSBucketLow, STCSBucketHigh float64
+	STCSMinSSTableSize            int64
 
 	// Purging (M5). GCGraceSeconds is gc_grace_seconds: zero uses the
 	// default, 864000 (10 days); negative means 0.
 	GCGraceSeconds int64
+	// UncheckedTombstoneCompaction is unchecked_tombstone_compaction: skip
+	// the overlap check before compacting an sstable for its tombstones.
+	UncheckedTombstoneCompaction bool
 	// TombstoneThreshold is tombstone_threshold: an sstable whose estimated
 	// ratio of droppable tombstones exceeds it is compacted on its own when
 	// nothing else is due. Zero uses the default, 0.2; negative disables it.
@@ -86,6 +97,21 @@ func (o *TableOptions) ensureDefaults() {
 	}
 	if o.SSTableGrowth == 0 {
 		o.SSTableGrowth = 0.333
+	}
+	if o.MinThreshold <= 0 {
+		o.MinThreshold = 4
+	}
+	if o.MaxThreshold <= 0 {
+		o.MaxThreshold = 32
+	}
+	if o.STCSBucketLow <= 0 {
+		o.STCSBucketLow = 0.5
+	}
+	if o.STCSBucketHigh <= 0 {
+		o.STCSBucketHigh = 1.5
+	}
+	if o.STCSMinSSTableSize <= 0 {
+		o.STCSMinSSTableSize = 50 << 20
 	}
 	if o.GCGraceSeconds == 0 {
 		o.GCGraceSeconds = 864000
@@ -365,19 +391,34 @@ func (t *Table) selectPickSize(index, count, maxToCompact int) int {
 }
 
 // ucsPick chooses a compaction among files with UCS's rules
-// (UnifiedCompactionStrategy.chooseCompactionPick): in each level, the
-// bucket with the highest overlap reaching the threshold; across levels, the
-// highest overlap, ties going to the lower level.
+// (UnifiedCompactionStrategy.chooseCompactionPick and
+// Level.getCompactionPick): in each level, a bucket chosen uniformly at
+// random among those with the level's highest overlap (reservoir sampling,
+// as Cassandra does); across levels, the highest overlap, ties going to the
+// lower level.
+//
+// One deliberate difference: Cassandra compares levels by their maximum
+// overlap even when it is below the level's threshold (no pick), which with
+// per-level scaling parameters can discard a valid pick from a lower level;
+// here only levels with a pick compete.
 func (t *Table) ucsPickLocked(files []*fileMeta) []*fileMeta {
 	var best []*fileMeta
 	bestOverlap := 0
 	for _, level := range t.formLevelsLocked(files) {
 		threshold := t.opts.threshold(level.index)
 		var chosen *ucsBucket
+		matching := 0
 		buckets := assignBuckets(threshold, overlapSets(level.files))
+		top := 0
 		for i := range buckets {
-			if chosen == nil || buckets[i].maxOverlap > chosen.maxOverlap {
-				chosen = &buckets[i]
+			top = max(top, buckets[i].maxOverlap)
+		}
+		for i := range buckets {
+			if buckets[i].maxOverlap == top {
+				matching++
+				if rand.IntN(matching) == 0 {
+					chosen = &buckets[i]
+				}
 			}
 		}
 		if chosen == nil || chosen.maxOverlap <= bestOverlap {
@@ -389,7 +430,9 @@ func (t *Table) ucsPickLocked(files []*fileMeta) []*fileMeta {
 	return best
 }
 
-// timeWindow returns the window of a file's newest data.
+// timeWindow returns the window of a file's newest data
+// (TimeWindowCompactionStrategy.getWindowBoundsInMillis, by maximum
+// timestamp in microseconds).
 func (o *TableOptions) timeWindow(f *fileMeta) int64 {
 	w := o.TimeWindow.Microseconds()
 	q := f.maxTS / w
@@ -399,10 +442,13 @@ func (o *TableOptions) timeWindow(f *fileMeta) int64 {
 	return q
 }
 
-// timeWindowPickLocked follows TimeWindowCompactionStrategy: windows are
-// visited newest first; the newest is compacted with UCS's rules, an older
-// one once it holds two or more sstables, all together (oldest first, up to
-// MaxSSTablesToCompact).
+// timeWindowPickLocked follows TimeWindowCompactionStrategy
+// (getCompactionCandidates, newestBucket): sstables are grouped by window;
+// the newest window ever seen (highestWindowSeen, which only moves forward)
+// is compacted with size-tiered rules once it holds MinThreshold sstables;
+// any older window with two or more sstables is compacted, its
+// MaxThreshold smallest sstables at a time. Windows are visited newest
+// first and the first eligible one wins.
 func (t *Table) timeWindowPickLocked(files []*fileMeta) []*fileMeta {
 	windows := map[int64][]*fileMeta{}
 	var keys []int64
@@ -413,22 +459,89 @@ func (t *Table) timeWindowPickLocked(files []*fileMeta) []*fileMeta {
 		}
 		windows[w] = append(windows[w], f)
 	}
+	if len(keys) == 0 {
+		return nil
+	}
 	slices.Sort(keys)
 	slices.Reverse(keys)
-	for i, w := range keys {
+	if !t.windowSeen || keys[0] > t.highestWindowSeen {
+		t.highestWindowSeen, t.windowSeen = keys[0], true
+	}
+	now := t.highestWindowSeen
+	for _, w := range keys {
 		fs := windows[w]
-		if i == 0 {
-			if p := t.ucsPickLocked(fs); p != nil {
+		switch {
+		case len(fs) >= t.opts.MinThreshold && w >= now:
+			if p := mostInterestingBucket(stcsBuckets(fs, &t.opts), t.opts.MinThreshold, t.opts.MaxThreshold); p != nil {
 				return p
 			}
-			continue
-		}
-		if len(fs) >= 2 {
-			slices.SortFunc(fs, func(a, b *fileMeta) int { return cmp.Compare(a.maxTS, b.maxTS) })
-			return fs[:min(len(fs), t.opts.MaxSSTablesToCompact)]
+		case len(fs) >= 2 && w < now:
+			// trimToThreshold: the smallest sstables, up to MaxThreshold.
+			slices.SortStableFunc(fs, func(a, b *fileMeta) int { return cmp.Compare(a.size, b.size) })
+			return fs[:min(len(fs), t.opts.MaxThreshold)]
 		}
 	}
 	return nil
+}
+
+// stcsBuckets follows SizeTieredCompactionStrategy.getBuckets: sstables
+// sorted by size join the first bucket whose average size is within
+// [bucketLow, bucketHigh] times theirs, or which, like them, is below the
+// minimum sstable size; buckets are kept in creation order (Cassandra's
+// HashMap order is unspecified).
+func stcsBuckets(files []*fileMeta, o *TableOptions) [][]*fileMeta {
+	files = slices.Clone(files)
+	slices.SortStableFunc(files, func(a, b *fileMeta) int { return cmp.Compare(a.size, b.size) })
+	type bucket struct {
+		avg   uint64
+		files []*fileMeta
+	}
+	var buckets []*bucket
+outer:
+	for _, f := range files {
+		size := f.size
+		for _, b := range buckets {
+			if (float64(size) > float64(b.avg)*o.STCSBucketLow && float64(size) < float64(b.avg)*o.STCSBucketHigh) ||
+				(int64(size) < o.STCSMinSSTableSize && int64(b.avg) < o.STCSMinSSTableSize) {
+				b.avg = (b.avg*uint64(len(b.files)) + size) / uint64(len(b.files)+1)
+				b.files = append(b.files, f)
+				continue outer
+			}
+		}
+		buckets = append(buckets, &bucket{avg: size, files: []*fileMeta{f}})
+	}
+	out := make([][]*fileMeta, len(buckets))
+	for i, b := range buckets {
+		out[i] = b.files
+	}
+	return out
+}
+
+// mostInterestingBucket follows SizeTieredCompactionStrategy's: buckets
+// trimmed to maxThreshold sstables, of at least minThreshold, compared by
+// read hotness and then by average size. The engine keeps no read meters,
+// so hotness is always 0, as for Cassandra's unread sstables, and the
+// comparator decides. Collections.max over that comparator picks the
+// largest average size (its comment says the smallest; the code is
+// followed).
+func mostInterestingBucket(buckets [][]*fileMeta, minThreshold, maxThreshold int) []*fileMeta {
+	var best []*fileMeta
+	var bestAvg uint64
+	for _, b := range buckets {
+		b = b[:min(len(b), maxThreshold)]
+		if len(b) < minThreshold {
+			continue
+		}
+		var total uint64
+		for _, f := range b {
+			total += f.size
+		}
+		avg := total / uint64(len(b))
+		if best == nil || avg > bestAvg {
+			best, bestAvg = b, avg
+		}
+	}
+	return best
 }
 
 // pickCompactionLocked chooses the next compaction for the table among the
@@ -457,7 +570,8 @@ type compactionPick struct {
 
 // nextCompactionLocked chooses the next compaction for the table: fully
 // expired sstables first (checked every ExpiredCheckInterval), then UCS's
-// (or the time-window mode's) pick, then an sstable due for its tombstones.
+// (or the time-window mode's) pick, then an sstable worth compacting for its
+// tombstones.
 func (t *Table) nextCompactionLocked() *compactionPick {
 	now := t.e.opts.Now()
 	if t.opts.ExpiredCheckInterval < 0 || now.Sub(t.lastExpiredCheck) >= t.opts.ExpiredCheckInterval {
@@ -476,24 +590,28 @@ func (t *Table) nextCompactionLocked() *compactionPick {
 }
 
 // fullyExpiredLocked follows CompactionController.getFullyExpiredSSTables:
-// sstables whose every part is deleted or expired before gcBefore (maximum
-// local deletion time) and whose newest data is older than all data
-// overlapping them elsewhere (other sstables and memtables). Their
-// deletions shadow nothing stored elsewhere and their data is invisible, so
-// they can be deleted without being read.
+// candidates are sstables whose every part is deleted or expired before
+// gcBefore (maximum local deletion time); the smallest timestamp of the
+// overlapping sstables that still hold data (maximum local deletion time at
+// or after gcBefore) and of the memtables bounds what they could shadow;
+// candidates whose newest data is older than that are dropped without being
+// read. Cassandra takes each memtable's minimum timestamp as a whole; the
+// engine scans the memtables over the candidate's key range (bounded, and
+// treated as holding the oldest data past the bound), which is never less
+// strict for the keys concerned.
 func (t *Table) fullyExpiredLocked(nowSec int64) []*fileMeta {
 	gcBefore := t.opts.gcBefore(nowSec)
-	var candidates []*fileMeta
-	for _, f := range t.files {
-		if !f.compacting && f.stats.valid && f.stats.maxLDT < gcBefore && f.stats.maxLDT <= nowSec {
-			candidates = append(candidates, f)
-		}
+	expiredBy := func(f *fileMeta) bool {
+		return f.stats.valid && f.stats.maxLDT < gcBefore && f.stats.maxLDT <= nowSec
 	}
 	var expired []*fileMeta
-	for _, c := range candidates {
+	for _, c := range t.files {
+		if c.compacting || !expiredBy(c) {
+			continue
+		}
 		minOther := t.memtableMinTSLocked(c.smallest.UserKey, c.largest.UserKey)
 		for _, f := range t.files {
-			if slices.Contains(candidates, f) ||
+			if f == c || expiredBy(f) ||
 				bytes.Compare(f.largest.UserKey, c.smallest.UserKey) < 0 ||
 				bytes.Compare(f.smallest.UserKey, c.largest.UserKey) > 0 {
 				continue
@@ -537,26 +655,114 @@ func (t *Table) memtableMinTSLocked(lo, hi []byte) int64 {
 	return minTS
 }
 
-// dueFileLocked returns the sstable with the highest estimated ratio of
-// droppable tombstones, if it exceeds TombstoneThreshold and the sstable is
-// older than TombstoneCompactionInterval (Cassandra's single-sstable
-// tombstone compactions, AbstractCompactionStrategy.worthDroppingTombstones).
+// worthDroppingTombstonesLocked follows
+// AbstractCompactionStrategy.worthDroppingTombstones: the sstable must be
+// older than TombstoneCompactionInterval and its estimated ratio of
+// droppable tombstones to cells above TombstoneThreshold; then, unless
+// UncheckedTombstoneCompaction, either nothing overlaps it, or it is fully
+// expired, or the share of its keys outside the overlapping sstables'
+// token ranges, times the ratio, is still above the threshold (Cassandra
+// estimates that share from index samples; the engine assumes keys spread
+// evenly over the sstable's token span).
+func (t *Table) worthDroppingTombstonesLocked(f *fileMeta, nowSec, gcBefore int64) (float64, bool) {
+	o := &t.opts
+	if !f.stats.valid {
+		return 0, false
+	}
+	// Cassandra: now < created + interval means not yet. The engine also
+	// never picks a file written in the current second, so a file whose
+	// tombstones cannot be dropped yet is not rewritten in a loop when the
+	// interval is 0.
+	if nowSec < f.stats.created+int64(max(o.TombstoneCompactionInterval, 0)/time.Second) || f.stats.created >= nowSec {
+		return 0, false
+	}
+	ratio := f.stats.droppableRatio(gcBefore)
+	if ratio <= o.TombstoneThreshold {
+		return 0, false
+	}
+	if o.UncheckedTombstoneCompaction {
+		return ratio, true
+	}
+	var overlaps []*fileMeta
+	for _, g := range t.files {
+		if g != f && bytes.Compare(g.largest.UserKey, f.smallest.UserKey) >= 0 &&
+			bytes.Compare(g.smallest.UserKey, f.largest.UserKey) <= 0 {
+			overlaps = append(overlaps, g)
+		}
+	}
+	if len(overlaps) == 0 {
+		return ratio, true
+	}
+	if f.stats.maxLDT < gcBefore && f.stats.maxLDT <= nowSec {
+		minOther := t.memtableMinTSLocked(f.smallest.UserKey, f.largest.UserKey)
+		for _, g := range overlaps {
+			if !(g.stats.valid && g.stats.maxLDT < gcBefore) {
+				minOther = min(minOther, g.minTS)
+			}
+		}
+		if f.maxTS < minOther {
+			return ratio, true
+		}
+	}
+	remaining := uncoveredTokenShare(f, overlaps)
+	return ratio, remaining*ratio > o.TombstoneThreshold
+}
+
+// uncoveredTokenShare returns the share of f's token span that no overlap's
+// token range covers.
+func uncoveredTokenShare(f *fileMeta, overlaps []*fileMeta) float64 {
+	lo, hi := keyToken(f.smallest.UserKey), keyToken(f.largest.UserKey)
+	type span struct{ a, b uint64 }
+	var spans []span
+	for _, g := range overlaps {
+		a, b := max(keyToken(g.smallest.UserKey), lo), min(keyToken(g.largest.UserKey), hi)
+		if a <= b {
+			spans = append(spans, span{a, b})
+		}
+	}
+	slices.SortFunc(spans, func(x, y span) int { return cmp.Compare(x.a, y.a) })
+	total := float64(hi-lo) + 1
+	covered, next := 0.0, lo
+	for _, s := range spans {
+		a := max(s.a, next)
+		if a > s.b {
+			continue
+		}
+		covered += float64(s.b-a) + 1
+		if s.b == math.MaxUint64 {
+			break
+		}
+		next = s.b + 1
+	}
+	return max(0, 1-covered/total)
+}
+
+// dueFileLocked returns an sstable worth compacting on its own for its
+// tombstones (worthDroppingTombstonesLocked): with the time-window mode the
+// smallest such sstable, as TimeWindowCompactionStrategy picks; otherwise
+// the largest, as SizeTieredCompactionStrategy picks. Cassandra 5.0's UCS
+// has no single-sstable tombstone compactions; the engine adds them to UCS
+// tables, as this design's due-file picking.
 func (t *Table) dueFileLocked(nowSec int64) *fileMeta {
 	if t.opts.TombstoneThreshold < 0 {
 		return nil
 	}
 	gcBefore := t.opts.gcBefore(nowSec)
-	maxCreated := nowSec - int64(max(t.opts.TombstoneCompactionInterval, 0)/time.Second)
 	var best *fileMeta
-	bestRatio := t.opts.TombstoneThreshold
 	for _, f := range t.files {
-		// A file written in this second is never due, so a file whose
-		// tombstones cannot be dropped yet is not rewritten in a loop.
-		if f.compacting || !f.stats.valid || f.stats.created > maxCreated || f.stats.created >= nowSec {
+		if f.compacting {
 			continue
 		}
-		if r := f.stats.droppableRatio(gcBefore); r > bestRatio {
-			best, bestRatio = f, r
+		if _, ok := t.worthDroppingTombstonesLocked(f, nowSec, gcBefore); !ok {
+			continue
+		}
+		switch {
+		case best == nil:
+			best = f
+		case t.opts.TimeWindow > 0 && f.size < best.size:
+			best = f
+		case t.opts.TimeWindow <= 0 && f.size > best.size:
+			best = f
 		}
 	}
 	return best

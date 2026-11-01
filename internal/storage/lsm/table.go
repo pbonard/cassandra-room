@@ -30,6 +30,10 @@ type Table struct {
 	flushSize float64
 	// lastExpiredCheck is when fully expired sstables were last looked for.
 	lastExpiredCheck time.Time
+	// highestWindowSeen is the time-window mode's current window: the
+	// newest seen, never moving back.
+	highestWindowSeen int64
+	windowSeen        bool
 	// majorPending pauses background compactions while Compact waits.
 	majorPending bool
 }

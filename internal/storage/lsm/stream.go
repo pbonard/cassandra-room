@@ -22,8 +22,13 @@ const exportFileSize = 64 << 20
 // paths: the sending side of Cassandra's streaming, used by repair,
 // bootstrap and decommission to move token ranges between nodes. Rows are
 // written merged, one entry per key, in files of about 64 MiB. dir must
-// exist; existing files are not overwritten.
+// exist; existing files are not overwritten. The table is flushed first, as
+// Cassandra flushes before streaming (StreamSession.addTransferRanges), so
+// what is sent is durable at the sender.
 func (t *Table) ExportRange(lower, upper []byte, fs vfs.FS, dir string) ([]string, error) {
+	if err := t.Flush(); err != nil {
+		return nil, err
+	}
 	sn, err := t.NewSnapshot()
 	if err != nil {
 		return nil, err

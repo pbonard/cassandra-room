@@ -375,6 +375,9 @@ type Stats struct {
 	// NoDeletionTime if there are none: nothing in the row can be purged
 	// before MinLDT.
 	MinLDT int64
+	// Cells counts the row's cells, live or not (Cassandra's cell count,
+	// the denominator of the droppable tombstone ratio).
+	Cells int
 }
 
 // Summarize returns the row's Stats. If ldt is not nil, it is called with
@@ -397,6 +400,7 @@ func Summarize(v []byte, ldt func(int64)) (Stats, error) {
 	}
 	var c Cell
 	for d.next(&c) {
+		s.Cells++
 		s.MinTS, s.MaxTS, s.HasTS = min(s.MinTS, c.Timestamp), max(s.MaxTS, c.Timestamp), true
 		if c.LocalDeletionTime == NoDeletionTime {
 			s.MaxLDT = NoDeletionTime

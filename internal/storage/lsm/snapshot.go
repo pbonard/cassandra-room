@@ -1,12 +1,13 @@
 package lsm
 
 import (
-	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/pebble/vfs"
 )
@@ -58,9 +59,17 @@ func (sn *Snapshot) Close() error {
 // snapshotsDirName holds on-disk snapshots: snapshots/<name>/<table dir>/.
 const snapshotsDirName = "snapshots"
 
-// snapshotListName lists the sstables of an on-disk snapshot, one file name
-// per line; it is written last, so a snapshot without it is incomplete.
-const snapshotListName = "SSTABLES"
+// snapshotManifestName is the snapshot's manifest, in the format of
+// Cassandra's SnapshotManifest (manifest.json: the data files and the
+// creation time). It is written last, so a snapshot without it is
+// incomplete.
+const snapshotManifestName = "manifest.json"
+
+type snapshotManifest struct {
+	Files     []string `json:"files"`
+	CreatedAt string   `json:"created_at"`
+	Ephemeral bool     `json:"ephemeral"`
+}
 
 // SnapshotToDisk flushes the table and hard-links its sstables into
 // <engine dir>/snapshots/<name>/<table>/, as Cassandra's nodetool snapshot
@@ -85,7 +94,7 @@ func (t *Table) SnapshotToDisk(name string) (string, error) {
 	if err := e.fs.MkdirAll(dir, 0755); err != nil {
 		return "", err
 	}
-	var list bytes.Buffer
+	m := snapshotManifest{Files: []string{}, CreatedAt: e.opts.Now().UTC().Format(time.RFC3339Nano)}
 	files := slices.Clone(s.files)
 	slices.SortFunc(files, func(a, b *fileMeta) int { return bytes.Compare(a.smallest.UserKey, b.smallest.UserKey) })
 	for _, f := range files {
@@ -93,12 +102,16 @@ func (t *Table) SnapshotToDisk(name string) (string, error) {
 		if err := e.fs.Link(f.path, e.fs.PathJoin(dir, base)); err != nil {
 			return "", err
 		}
-		fmt.Fprintln(&list, base)
+		m.Files = append(m.Files, base)
 	}
 	if err := syncDir(e.fs, dir); err != nil {
 		return "", err
 	}
-	if err := writeFileSync(e.fs, e.fs.PathJoin(dir, snapshotListName), list.Bytes()); err != nil {
+	data, err := json.Marshal(&m)
+	if err != nil {
+		return "", err
+	}
+	if err := writeFileSync(e.fs, e.fs.PathJoin(dir, snapshotManifestName), data); err != nil {
 		return "", err
 	}
 	for _, d := range []string{dir, root, e.fs.PathJoin(e.dir, snapshotsDirName), e.dir} {
@@ -114,19 +127,23 @@ func (t *Table) SnapshotToDisk(name string) (string, error) {
 func (t *Table) SnapshotFiles(name string) ([]string, error) {
 	e := t.e
 	dir := e.fs.PathJoin(e.dir, snapshotsDirName, name, t.id.dirName())
-	f, err := e.fs.Open(e.fs.PathJoin(dir, snapshotListName))
+	f, err := e.fs.Open(e.fs.PathJoin(dir, snapshotManifestName))
 	if err != nil {
 		return nil, fmt.Errorf("lsm: snapshot %q of table %d: %w", name, t.id, err)
 	}
 	defer f.Close()
-	var out []string
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		if line := strings.TrimSpace(sc.Text()); line != "" {
-			out = append(out, e.fs.PathJoin(dir, line))
-		}
+	var m snapshotManifest
+	if err := json.NewDecoder(f).Decode(&m); err != nil {
+		return nil, fmt.Errorf("lsm: snapshot %q of table %d: %w", name, t.id, err)
 	}
-	return out, sc.Err()
+	var out []string
+	for _, name := range m.Files {
+		if strings.ContainsAny(name, `/\`) {
+			return nil, fmt.Errorf("lsm: snapshot manifest names %q", name)
+		}
+		out = append(out, e.fs.PathJoin(dir, name))
+	}
+	return out, nil
 }
 
 // ClearSnapshot deletes an on-disk snapshot of every table.
