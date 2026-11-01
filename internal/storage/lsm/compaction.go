@@ -1472,6 +1472,14 @@ func (c *compaction) compactShard(s int) error {
 		return err
 	}
 	fragment := uint64(t.opts.fragmentSize())
+	// Inputs can only be released early if some shard seals a fragment
+	// before the end; below one fragment's worth of input there is nothing
+	// to release, so purged rows need not tie their inputs.
+	var inSize uint64
+	for _, f := range in {
+		inSize += f.size
+	}
+	incremental := fragment > 0 && inSize > fragment
 	var purged []byte
 	var contrib []int
 	ok := false
@@ -1505,7 +1513,7 @@ func (c *compaction) compactShard(s int) error {
 			if err != nil {
 				return fail(err)
 			}
-			if changed && fragment > 0 && len(mi.cur) > 1 {
+			if changed && incremental && len(mi.cur) > 1 {
 				// The inputs holding this row's fragments are released
 				// together: a purged deletion may have shadowed data in
 				// another of them.
