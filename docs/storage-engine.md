@@ -313,6 +313,37 @@ and `unified/Controller.java`.
   every `ExpiredCheckInterval` (10 minutes, `expired_sstable_check_frequency_seconds`;
   `CompactionController.getFullyExpiredSSTables`, used by every Cassandra
   strategy). See section 9.
+- **Incremental compaction (from ScyllaDB ICS; `FragmentSize`, 1 GiB by
+  default):** each shard's output is cut into fragments at partition
+  boundaries, and inputs are released as the compaction goes, as
+  `incremental_compaction_strategy` with `compaction.cc`'s
+  `maybe_replace_exhausted_sstables_by_sst` does: once every shard
+  covering an input has sealed output past the input's last key, the
+  sealed fragments and the exhausted inputs are swapped in one manifest
+  edit, so a compaction needs extra space for about a fragment per shard
+  instead of its whole output. The hazard is purging: if a deletion is
+  purged while an older cell it shadowed still sits in an input not yet
+  released, releasing the deletion's input first would bring the cell
+  back. Scylla keeps such deletions in side "garbage collected" sstables;
+  the engine instead releases the inputs that contributed to a purged row
+  only together (`TestIncrementalReleasePurgeTie` checks this at each
+  release and after a crash there, and fails without it). Every edit
+  leaves a complete table. Fragments of one compaction share a run
+  identifier. Not used in the time-window mode, whose windows must end as
+  one file.
+- **Cross-level jobs (from ICS), when the table has no other compaction
+  running, as there:**
+  - *Garbage collection* (`find_garbage_collection_job`): an sstable whose
+    tombstones are worth dropping by age and ratio, but whose overlap with
+    older data makes the single-sstable compaction pointless, is compacted
+    with its whole density level and the next one up (down, for the top
+    level), so the tombstones meet the data they shadow.
+  - *Space amplification goal* (`SpaceAmplificationGoal`, off by default,
+    as `space_amplification_goal`): if the two highest density levels hold
+    more than goal times the top level's size, they are compacted together.
+    Two levels holding fragments of a single run are skipped (one run's
+    last fragments are smaller, so they can fall a level lower, and
+    compacting a run with itself would repeat forever).
 - **Time-window mode (`TableOptions.TimeWindow`):** a port of
   `TimeWindowCompactionStrategy.getNextBackgroundSSTables` and
   `newestBucket`: sstables are grouped by the window of their maximum write
@@ -335,6 +366,26 @@ and `unified/Controller.java`.
   compares levels by their maximum overlap even when it is below the
   level's threshold, which with per-level scaling parameters can discard a
   lower level's valid pick; the engine compares only levels with a pick.
+
+### TWCS compared with ScyllaDB's
+
+ScyllaDB's `time_window_compaction_strategy.cc` differs from Cassandra's,
+which the engine follows:
+
+- past windows are compacted down to one sstable only while they are
+  recent (`recent_active_windows`); afterwards stray writes into them
+  (repair, streaming) get size-tiered compaction instead of rewriting the
+  whole window each time;
+- size-tiered compaction in past windows needs only 2 similar sstables;
+- flush and compaction output is split by window
+  (`make_interposer_consumer`, up to 100 windows), so out-of-order writes
+  do not mix windows in one sstable;
+- the single sstable compacted for tombstones is the one with the oldest
+  minimum timestamp; `worth_dropping_tombstones` has no overlap check;
+- a past window's whole-window compaction waits while the table has
+  another compaction running.
+
+These are not implemented yet.
 
 ## 9. Purging (M5)
 
@@ -421,6 +472,12 @@ differences it found were fixed or are listed.) Cell reconciliation
 - **Major compaction (`Table.Compact`):** Cassandra's `nodetool compact`:
   flush, wait for the table's running compactions (pausing new ones), then
   merge and purge all of its sstables into one set of shards.
+- **Recovery after purging (fix):** sequence numbers resume above every
+  table's flushed sequence number, not only above the data that remains.
+  Purging can remove the newest rows; before the fix, a restart could then
+  reuse sequence numbers the table counted as flushed, and a WAL replay
+  after a second crash skipped those writes, losing acknowledged data
+  (`TestRecoveredSeqAfterPurge`; found by the model test).
 - *Not done:* repair-aware purging (`only_purge_repaired_tombstones`) needs
   repaired-state tracking (section 11).
 

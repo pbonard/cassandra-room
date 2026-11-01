@@ -282,6 +282,11 @@ func runModel(t *testing.T, seed uint64) {
 				if seed%5 == 4 {
 					o.TimeWindow = 20 * time.Microsecond // timestamps are 0..99
 				}
+				// Incremental release with small fragments, or none.
+				o.FragmentSize = []int64{-1, 1 << 10, 4 << 10}[(seed/2)%3]
+				if seed%7 == 0 {
+					o.SpaceAmplificationGoal = 1.5
+				}
 				if purge {
 					o.GCGraceSeconds = []int64{-1, 5}[seed%2]
 					o.TombstoneCompactionInterval = 2 * time.Second
@@ -541,8 +546,8 @@ func runModel(t *testing.T, seed uint64) {
 	closeSnap()
 	check(e, written)
 	m := e.Metrics()
-	t.Logf("compactions %d, tombstone compactions %d, expired sstables dropped %d",
-		m.Compactions, m.TombstoneCompactions, m.ExpiredSSTablesDropped)
+	t.Logf("compactions %d, tombstone compactions %d, expired sstables dropped %d, early released inputs %d",
+		m.Compactions, m.TombstoneCompactions, m.ExpiredSSTablesDropped, m.EarlyReleasedInputs)
 	require.NoError(t, e.Close())
 }
 

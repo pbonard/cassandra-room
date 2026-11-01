@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -661,6 +662,135 @@ func BenchmarkPutParallelDisk(b *testing.B) {
 					}
 				}
 			})
+		})
+	}
+}
+
+// dirBytes sums the sizes of the files under dir (one level of
+// subdirectories, as the engine's tables directory has).
+func dirBytes(fs vfs.FS, dir string) int64 {
+	var n int64
+	var walk func(d string, depth int)
+	walk = func(d string, depth int) {
+		names, err := fs.List(d)
+		if err != nil {
+			return
+		}
+		for _, name := range names {
+			p := fs.PathJoin(d, name)
+			st, err := fs.Stat(p)
+			if err != nil {
+				continue
+			}
+			if st.IsDir() {
+				if depth < 2 {
+					walk(p, depth+1)
+				}
+				continue
+			}
+			if strings.HasSuffix(name, ".sst") {
+				n += st.Size()
+			}
+		}
+	}
+	walk(dir, 0)
+	return n
+}
+
+// BenchmarkMajorCompactionSpace overwrites a 200k-row token-spread table in
+// 8 rounds, one flush each, then compacts everything at once, sampling the
+// sstable bytes on disk every millisecond. It reports the peak over the
+// data before compaction: how much extra space a full compaction needs.
+// "lsm" writes each shard's output whole (the inputs go when it ends);
+// "lsm-fragments" cuts output into 1 MiB fragments and releases inputs as it
+// goes (ScyllaDB ICS's incremental compaction); Pebble compacts manually.
+func BenchmarkMajorCompactionSpace(b *testing.B) {
+	for _, eng := range []string{"lsm", "lsm-fragments", "pebble"} {
+		b.Run(eng, func(b *testing.B) {
+			for n := 0; n < b.N; n++ {
+				b.StopTimer()
+				fs := vfs.NewMem()
+				var put func(k, v []byte) error
+				var flush, compact, closeFn func() error
+				switch eng {
+				case "lsm", "lsm-fragments":
+					frag := int64(-1)
+					if eng == "lsm-fragments" {
+						frag = 1 << 20
+					}
+					e, err := Open("db", &Options{FS: fs, DisableCompactions: true,
+						TableOptions: func(TableID) TableOptions { return TableOptions{FragmentSize: frag} }})
+					if err != nil {
+						b.Fatal(err)
+					}
+					tbl, err := e.CreateTable(1)
+					if err != nil {
+						b.Fatal(err)
+					}
+					put = func(k, v []byte) error { return e.Put(1, k, v, NoSync) }
+					flush, compact, closeFn = tbl.Flush, tbl.Compact, e.Close
+				default:
+					db, err := pebble.Open("db", &pebble.Options{FS: fs, DisableAutomaticCompactions: true})
+					if err != nil {
+						b.Fatal(err)
+					}
+					put = func(k, v []byte) error { return db.Set(k, v, pebble.NoSync) }
+					flush = db.Flush
+					compact = func() error {
+						return db.Compact(context.Background(), []byte{0}, bytes.Repeat([]byte{0xff}, 32), false)
+					}
+					closeFn = db.Close
+				}
+				for round := 0; round < 8; round++ {
+					for i := 0; i < 200000; i++ {
+						v := row.Append(nil, &row.Row{
+							Deletion: row.Deletion{MarkedForDeleteAt: row.NoTimestamp},
+							Cells: []row.Cell{{Column: 1, Timestamp: int64(round*200000 + i), LocalDeletionTime: row.NoDeletionTime,
+								Value: bytes.Repeat([]byte{byte(i), byte(round)}, 50)}},
+						})
+						if err := put(tokenBenchKey(i), v); err != nil {
+							b.Fatal(err)
+						}
+					}
+					if err := flush(); err != nil {
+						b.Fatal(err)
+					}
+				}
+				before := dirBytes(fs, "db")
+				var peak atomic.Int64
+				peak.Store(before)
+				stop := make(chan struct{})
+				sampled := make(chan struct{})
+				go func() {
+					defer close(sampled)
+					for {
+						select {
+						case <-stop:
+							return
+						case <-time.After(time.Millisecond):
+							if v := dirBytes(fs, "db"); v > peak.Load() {
+								peak.Store(v)
+							}
+						}
+					}
+				}()
+				b.StartTimer()
+				if err := compact(); err != nil {
+					b.Fatal(err)
+				}
+				b.StopTimer()
+				close(stop)
+				<-sampled
+				after := dirBytes(fs, "db")
+				b.ReportMetric(float64(before)/(1<<20), "MiB-before")
+				b.ReportMetric(float64(peak.Load())/(1<<20), "MiB-peak")
+				b.ReportMetric(float64(after)/(1<<20), "MiB-after")
+				b.ReportMetric(float64(peak.Load()-before)/(1<<20), "MiB-extra")
+				if err := closeFn(); err != nil {
+					b.Fatal(err)
+				}
+				b.StartTimer()
+			}
 		})
 	}
 }

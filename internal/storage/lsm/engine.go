@@ -77,6 +77,9 @@ type Engine struct {
 	}
 	flushWG   sync.WaitGroup
 	compactWG sync.WaitGroup
+	// testAfterEarlyRelease, if set, runs after a compaction swaps out inputs
+	// before finishing (with the engine mutexes released).
+	testAfterEarlyRelease func()
 	// compactionSem bounds the compaction tasks (output shards) running at
 	// once, across compactions (Cassandra: concurrent_compactors).
 	compactionSem chan struct{}
@@ -84,6 +87,7 @@ type Engine struct {
 		bytesFlushed, bytesCompacted atomic.Int64
 		flushes, compactions         atomic.Int64
 		tombstoneCompactions         atomic.Int64
+		earlyReleases                atomic.Int64
 		expiredDropped               atomic.Int64
 	}
 
@@ -184,6 +188,11 @@ func (e *Engine) recover() error {
 	for id, tm := range state.tables {
 		t := e.newTable(id)
 		t.flushedSeq = tm.flushedSeq
+		// Sequence numbers resume above every table's flushed sequence
+		// number, not only above the data that remains: purging can remove
+		// the newest rows, and a reused sequence number at or below a
+		// table's flushed one would be skipped by a later WAL replay.
+		lastSeq = max(lastSeq, tm.flushedSeq)
 		for _, f := range tm.files {
 			if err := e.openFile(t, f); err != nil {
 				return fmt.Errorf("lsm: opening table %d file %d: %w", id, f.num, err)
@@ -648,6 +657,9 @@ type Metrics struct {
 	// droppable tombstones; ExpiredSSTablesDropped counts fully expired
 	// sstables deleted without being rewritten.
 	TombstoneCompactions, ExpiredSSTablesDropped int64
+	// EarlyReleasedInputs counts compaction inputs released before their
+	// compaction finished (FragmentSize).
+	EarlyReleasedInputs int64
 	// WriteAmplification is (flushed + compacted) / flushed bytes: how many
 	// times each flushed byte was written to sstables.
 	WriteAmplification float64
@@ -663,6 +675,7 @@ func (e *Engine) Metrics() Metrics {
 
 		TombstoneCompactions:   e.metrics.tombstoneCompactions.Load(),
 		ExpiredSSTablesDropped: e.metrics.expiredDropped.Load(),
+		EarlyReleasedInputs:    e.metrics.earlyReleases.Load(),
 	}
 	if m.BytesFlushed > 0 {
 		m.WriteAmplification = float64(m.BytesFlushed+m.BytesCompacted) / float64(m.BytesFlushed)
@@ -929,6 +942,7 @@ func (e *Engine) flushOne() error {
 			var size uint64
 			for _, m := range metas {
 				size += m.size
+				m.run = metas[0].num
 			}
 			t.files = append(slices.Clone(metas), t.files...)
 			t.observeFlushLocked(size)

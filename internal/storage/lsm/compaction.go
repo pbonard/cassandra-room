@@ -45,6 +45,12 @@ type TableOptions struct {
 	// SerialOutputShards writes a compaction's output shards one after the
 	// other instead of in parallel (parallelize_output_shards: false).
 	SerialOutputShards bool
+	// FragmentSize, if positive, cuts each shard's compaction output into
+	// fragments of about this size and releases inputs as the compaction
+	// goes, as ScyllaDB's incremental compaction strategy does
+	// (sstable_size_in_mb, 1000 MiB there). Zero uses the default, 1 GiB;
+	// negative disables it.
+	FragmentSize int64
 
 	// TimeWindow, if positive, selects the time-window mode for insert-only
 	// TTL tables (Cassandra's TimeWindowCompactionStrategy): sstables are
@@ -67,6 +73,10 @@ type TableOptions struct {
 	// UncheckedTombstoneCompaction is unchecked_tombstone_compaction: skip
 	// the overlap check before compacting an sstable for its tombstones.
 	UncheckedTombstoneCompaction bool
+	// SpaceAmplificationGoal, if above 1, is ScyllaDB ICS's
+	// space_amplification_goal (valid in (1, 2]): when the two highest
+	// density levels exceed it ((S0+S1)/S0), they are compacted together.
+	SpaceAmplificationGoal float64
 	// TombstoneThreshold is tombstone_threshold: an sstable whose estimated
 	// ratio of droppable tombstones exceeds it is compacted on its own when
 	// nothing else is due. Zero uses the default, 0.2; negative disables it.
@@ -100,6 +110,9 @@ func (o *TableOptions) ensureDefaults() {
 	if o.SSTableGrowth == 0 {
 		o.SSTableGrowth = 0.333
 	}
+	if o.FragmentSize == 0 {
+		o.FragmentSize = 1 << 30
+	}
 	if o.MinThreshold <= 0 {
 		o.MinThreshold = 4
 	}
@@ -132,6 +145,16 @@ func (o *TableOptions) ensureDefaults() {
 // gcBefore returns the local deletion time before which tombstones may be
 // purged.
 func (o *TableOptions) gcBefore(nowSec int64) int64 { return nowSec - max(o.GCGraceSeconds, 0) }
+
+// fragmentSize is the fragment size in effect: none in the time-window
+// mode, whose windows must each end as a single sstable (TWCS compacts a
+// past window until it holds one, so fragments would recompact forever).
+func (o *TableOptions) fragmentSize() int64 {
+	if o.TimeWindow > 0 {
+		return 0
+	}
+	return max(o.FragmentSize, 0)
+}
 
 func (o *TableOptions) sstableGrowth() float64 { return min(max(o.SSTableGrowth, 0), 1) }
 
@@ -588,7 +611,110 @@ func (t *Table) nextCompactionLocked() *compactionPick {
 	if f := t.dueFileLocked(now.Unix()); f != nil {
 		return &compactionPick{inputs: []*fileMeta{f}, single: true}
 	}
+	// ScyllaDB ICS's cross-tier jobs run only once the table has no other
+	// compaction, as there.
+	if t.opts.TimeWindow <= 0 && !slices.ContainsFunc(t.files, func(f *fileMeta) bool { return f.compacting }) {
+		if inputs := t.garbageCollectionJobLocked(now.Unix()); len(inputs) >= 2 {
+			return &compactionPick{inputs: inputs, single: true}
+		}
+		if inputs := t.spaceAmplificationJobLocked(); len(inputs) >= 2 {
+			return &compactionPick{inputs: inputs}
+		}
+	}
 	return nil
+}
+
+// levelsWithFiles returns UCS's density levels that hold files, lowest
+// density first.
+func (t *Table) levelsWithFiles() []*ucsLevel {
+	var out []*ucsLevel
+	for _, l := range t.formLevelsLocked(t.files) {
+		if len(l.files) > 0 {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// garbageCollectionJobLocked follows ScyllaDB ICS's
+// find_garbage_collection_job: an sstable whose tombstones are worth
+// dropping by age and ratio, but which worthDroppingTombstones rejects
+// because overlapping sstables may hold the data they shadow, is compacted
+// with its whole density level and the next one up (the next one down for
+// the top level), so the tombstones meet that data and can be purged.
+// Levels are searched from the top, as ICS searches tiers from the largest.
+func (t *Table) garbageCollectionJobLocked(nowSec int64) []*fileMeta {
+	if t.opts.TombstoneThreshold < 0 {
+		return nil
+	}
+	gcBefore := t.opts.gcBefore(nowSec)
+	levels := t.levelsWithFiles()
+	for i := len(levels) - 1; i >= 0; i-- {
+		want := false
+		for _, f := range levels[i].files {
+			if t.tombstoneCandidateLocked(f, nowSec, gcBefore) {
+				if _, ok := t.worthDroppingTombstonesLocked(f, nowSec, gcBefore); !ok {
+					want = true
+					break
+				}
+			}
+		}
+		if !want {
+			continue
+		}
+		inputs := slices.Clone(levels[i].files)
+		switch {
+		case i+1 < len(levels):
+			inputs = append(inputs, levels[i+1].files...)
+		case i > 0:
+			inputs = append(inputs, levels[i-1].files...)
+		}
+		return inputs
+	}
+	return nil
+}
+
+// spaceAmplificationJobLocked follows ScyllaDB ICS's space amplification
+// goal: with SpaceAmplificationGoal set, if the two highest density levels
+// hold more than that many times the highest level's size ((S0+S1)/S0),
+// they are compacted together, bounding the space overwritten data takes.
+func (t *Table) spaceAmplificationJobLocked() []*fileMeta {
+	goal := t.opts.SpaceAmplificationGoal
+	if goal <= 0 {
+		return nil
+	}
+	levels := t.levelsWithFiles()
+	if len(levels) < 2 {
+		return nil
+	}
+	size := func(l *ucsLevel) (n uint64) {
+		for _, f := range l.files {
+			n += f.size
+		}
+		return n
+	}
+	top, next := levels[len(levels)-1], levels[len(levels)-2]
+	// The fragments of one run can fall in different density levels (a
+	// shard's last fragment is smaller); compacting a single run with
+	// itself would only rewrite it, again and again.
+	runOf := func(f *fileMeta) uint64 {
+		if f.run != 0 {
+			return f.run
+		}
+		return f.num
+	}
+	runs := map[uint64]bool{}
+	for _, f := range append(slices.Clone(top.files), next.files...) {
+		runs[runOf(f)] = true
+	}
+	if len(runs) < 2 {
+		return nil
+	}
+	s0, s1 := size(top), size(next)
+	if s0 == 0 || float64(s0+s1)/float64(s0) <= goal {
+		return nil
+	}
+	return append(slices.Clone(top.files), next.files...)
 }
 
 // fullyExpiredLocked follows CompactionController.getFullyExpiredSSTables:
@@ -678,10 +804,10 @@ func (t *Table) worthDroppingTombstonesLocked(f *fileMeta, nowSec, gcBefore int6
 	if nowSec < f.stats.created+int64(max(o.TombstoneCompactionInterval, 0)/time.Second) || f.stats.created >= nowSec {
 		return 0, false
 	}
-	ratio := f.stats.droppableRatio(gcBefore)
-	if ratio <= o.TombstoneThreshold {
+	if !t.tombstoneCandidateLocked(f, nowSec, gcBefore) {
 		return 0, false
 	}
+	ratio := f.stats.droppableRatio(gcBefore)
 	if o.UncheckedTombstoneCompaction {
 		return ratio, true
 	}
@@ -708,6 +834,19 @@ func (t *Table) worthDroppingTombstonesLocked(f *fileMeta, nowSec, gcBefore int6
 	}
 	remaining := uncoveredTokenShare(f, overlaps)
 	return ratio, remaining*ratio > o.TombstoneThreshold
+}
+
+// tombstoneCandidateLocked is the first half of worthDroppingTombstones:
+// old enough, and enough droppable tombstones.
+func (t *Table) tombstoneCandidateLocked(f *fileMeta, nowSec, gcBefore int64) bool {
+	o := &t.opts
+	if !f.stats.valid {
+		return false
+	}
+	if nowSec < f.stats.created+int64(max(o.TombstoneCompactionInterval, 0)/time.Second) || f.stats.created >= nowSec {
+		return false
+	}
+	return f.stats.droppableRatio(gcBefore) > o.TombstoneThreshold
 }
 
 // uncoveredTokenShare returns the share of f's token span that no overlap's
@@ -913,106 +1052,66 @@ func (t *Table) outputShards(inputs []*fileMeta) [][2][]byte {
 	return append(out, [2][]byte{lower, nil})
 }
 
-// compact merges the inputs into one sstable per output shard and installs
-// them in one manifest edit. Fragments of each key are merged with the
-// Merger, and what the purge rule allows is dropped (see
-// writeCompactionShard). A drop-only pick installs no output.
+// compact merges the inputs into sstables, one run per output shard, and
+// installs them. Fragments of each key are merged with the Merger, and what
+// the purge rule allows is dropped (see compactShard). A drop-only pick
+// installs no output.
+//
+// With FragmentSize, each shard's output is cut into fragments of about that
+// size (at partition boundaries), and inputs are released as the compaction
+// goes, as ScyllaDB's incremental compaction does: once every shard covering
+// an input has sealed output past the input's last key, the sealed outputs
+// and the exhausted inputs are swapped in one manifest edit, and the
+// inputs' space can be reclaimed before the compaction ends. Inputs that
+// contributed to a row whose deletion was purged are released together
+// only, so a purged tombstone never disappears while older data it shadowed
+// is still stored in an input (Scylla keeps such tombstones in side
+// sstables instead). Every edit leaves a complete table: a crash or failure
+// keeps what was installed, and the rest of the inputs.
 func (e *Engine) compact(t *Table, p *compactionPick) error {
-	inputs := p.inputs
-	var shards [][2][]byte
+	c := &compaction{e: e, t: t, p: p, inputs: p.inputs}
 	if !p.dropOnly {
-		shards = t.outputShards(inputs)
+		c.shards = t.outputShards(p.inputs)
 	}
-	outs := make([]*fileMeta, len(shards))
-	errs := make([]error, len(shards))
-	inputNums := map[uint64]bool{}
-	for _, f := range inputs {
-		inputNums[f.num] = true
-	}
+	c.init()
+	errs := make([]error, len(c.shards))
 	run := func(i int) {
 		e.compactionSem <- struct{}{}
 		defer func() { <-e.compactionSem }()
-		outs[i], errs[i] = e.writeCompactionShard(t, inputs, inputNums, shards[i][0], shards[i][1])
+		errs[i] = c.compactShard(i)
+		c.shardFinished(i, errs[i])
 	}
-	if t.opts.SerialOutputShards || len(shards) <= 1 {
-		for i := range shards {
+	if t.opts.SerialOutputShards || len(c.shards) <= 1 {
+		for i := range c.shards {
 			if run(i); errs[i] != nil {
 				break
 			}
 		}
 	} else {
 		var wg sync.WaitGroup
-		for i := range shards {
+		for i := range c.shards {
 			wg.Add(1)
 			go func() { defer wg.Done(); run(i) }()
 		}
 		wg.Wait()
 	}
-	var out []*fileMeta
-	for _, f := range outs {
-		if f != nil {
-			out = append(out, f)
-		}
-	}
-	discard := func() {
-		for _, f := range out {
-			f.reader.close()
-			_ = e.fs.Remove(f.path)
-		}
-	}
 	if err := errors.Join(errs...); err != nil {
-		discard()
+		c.discardPending()
 		if errors.Is(err, errCompactionAborted) {
 			return nil
 		}
 		return err
 	}
-	if err := syncDir(e.fs, t.dir); err != nil {
-		discard()
+	// Install what is left: the remaining outputs and inputs.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.installLocked(true); err != nil {
+		c.discardPendingLocked()
 		return err
 	}
-
-	e.manifestMu.Lock()
-	defer e.manifestMu.Unlock()
-	e.mu.Lock()
-	if e.mu.closed || t.dropped.Load() {
-		e.mu.Unlock()
-		discard()
-		return nil
-	}
-	te := &tableEdit{id: t.id, added: out}
-	for _, f := range inputs {
-		te.deleted = append(te.deleted, f.num)
-	}
-	manifest, nextFileNum := e.mu.manifest, e.mu.nextFileNum
-	e.mu.Unlock()
-	if err := manifest.write(&versionEdit{tables: []*tableEdit{te}, nextFileNum: nextFileNum}); err != nil {
-		discard()
-		return err
-	}
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	files := slices.Clone(out)
-	var size uint64
-	for _, f := range out {
-		size += f.size
-	}
-	for _, f := range t.files {
-		if !slices.Contains(inputs, f) {
-			files = append(files, f)
-		}
-	}
-	sortFilesNewestFirst(files)
-	t.files = files
-	for _, f := range inputs {
-		f.obsolete.Store(true)
-	}
-	t.publishLocked()
-	e.metrics.bytesCompacted.Add(int64(size))
 	switch {
 	case p.dropOnly:
-		e.metrics.expiredDropped.Add(int64(len(inputs)))
+		e.metrics.expiredDropped.Add(int64(len(p.inputs)))
 	case p.single:
 		e.metrics.tombstoneCompactions.Add(1)
 	default:
@@ -1021,22 +1120,253 @@ func (e *Engine) compact(t *Table, p *compactionPick) error {
 	return nil
 }
 
-// writeCompactionShard merges the inputs' rows in [lower, upper) into one
-// sstable, or returns nil if there are none.
+// compaction is the state of one running compaction, shared by its shard
+// tasks.
+type compaction struct {
+	e      *Engine
+	t      *Table
+	p      *compactionPick
+	inputs []*fileMeta
+	shards [][2][]byte
+	nums   map[uint64]bool // input file numbers
+
+	mu sync.Mutex
+	// Per shard: finished, and the largest key of its sealed output.
+	done     []bool
+	progress [][]byte
+	// pending holds sealed outputs not yet installed.
+	pending []*fileMeta
+	// released marks inputs already swapped out.
+	released []bool
+	// group is a union-find over inputs: inputs that contributed to a row
+	// whose deletion was purged are released together.
+	group []int
+	// installs counts manifest edits made by this compaction.
+	installs int
+	// run is the compaction's run identifier (see fileMeta.run).
+	run uint64
+}
+
+func (c *compaction) init() {
+	c.nums = map[uint64]bool{}
+	for _, f := range c.inputs {
+		c.nums[f.num] = true
+	}
+	c.done = make([]bool, len(c.shards))
+	c.progress = make([][]byte, len(c.shards))
+	c.released = make([]bool, len(c.inputs))
+	c.group = make([]int, len(c.inputs))
+	for i := range c.group {
+		c.group[i] = i
+	}
+}
+
+// runID returns the compaction's run identifier, the number of its first
+// output.
+func (c *compaction) runID(num uint64) uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.run == 0 {
+		c.run = num
+	}
+	return c.run
+}
+
+func (c *compaction) find(i int) int {
+	for c.group[i] != i {
+		c.group[i] = c.group[c.group[i]]
+		i = c.group[i]
+	}
+	return i
+}
+
+// tie puts the given inputs in one release group.
+func (c *compaction) tie(inputs []int) {
+	if len(inputs) < 2 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	r := c.find(inputs[0])
+	for _, i := range inputs[1:] {
+		c.group[c.find(i)] = r
+	}
+}
+
+// exhaustedLocked reports whether every shard covering input i has sealed
+// output past its last key, or finished.
+func (c *compaction) exhaustedLocked(i int) bool {
+	f := c.inputs[i]
+	for s, b := range c.shards {
+		if (b[1] != nil && bytes.Compare(f.smallest.UserKey, b[1]) >= 0) ||
+			(b[0] != nil && bytes.Compare(f.largest.UserKey, b[0]) < 0) {
+			continue // shard s does not cover f
+		}
+		if c.done[s] {
+			continue
+		}
+		if c.progress[s] == nil || bytes.Compare(c.progress[s], f.largest.UserKey) < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// sealed records an output fragment of shard s, whose last key is last, and
+// releases inputs it completes.
+func (c *compaction) sealed(s int, out *fileMeta, last []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pending = append(c.pending, out)
+	c.progress[s] = last
+	before := c.installs
+	err := c.installLocked(false)
+	if err == nil && c.installs > before && c.e.testAfterEarlyRelease != nil {
+		c.e.testAfterEarlyRelease()
+	}
+	return err
+}
+
+func (c *compaction) shardFinished(s int, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err == nil {
+		c.done[s] = true
+	}
+}
+
+// installLocked swaps sealed outputs for released inputs in one manifest
+// edit. With final, every remaining input is released; otherwise only
+// release groups whose inputs are all exhausted, and nothing happens if
+// there are none.
+func (c *compaction) installLocked(final bool) error {
+	e, t := c.e, c.t
+	var release []int
+	if final {
+		for i := range c.inputs {
+			if !c.released[i] {
+				release = append(release, i)
+			}
+		}
+	} else {
+		if t.opts.fragmentSize() <= 0 {
+			return nil
+		}
+		ready := map[int]bool{}
+		for i := range c.inputs {
+			if c.released[i] {
+				continue
+			}
+			r := c.find(i)
+			ok, seen := ready[r]
+			if !seen {
+				ok = true
+				for j := range c.inputs {
+					if c.find(j) == r && !c.released[j] && !c.exhaustedLocked(j) {
+						ok = false
+						break
+					}
+				}
+				ready[r] = ok
+			}
+			if ok {
+				release = append(release, i)
+			}
+		}
+		if len(release) == 0 {
+			return nil
+		}
+	}
+	out := c.pending
+	if len(out) > 0 {
+		if err := syncDir(e.fs, t.dir); err != nil {
+			return err
+		}
+	}
+	e.manifestMu.Lock()
+	defer e.manifestMu.Unlock()
+	e.mu.Lock()
+	if e.mu.closed || t.dropped.Load() {
+		e.mu.Unlock()
+		return errCompactionAborted
+	}
+	te := &tableEdit{id: t.id, added: out}
+	for _, i := range release {
+		te.deleted = append(te.deleted, c.inputs[i].num)
+	}
+	manifest, nextFileNum := e.mu.manifest, e.mu.nextFileNum
+	e.mu.Unlock()
+	if err := manifest.write(&versionEdit{tables: []*tableEdit{te}, nextFileNum: nextFileNum}); err != nil {
+		return err
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	gone := map[*fileMeta]bool{}
+	for _, i := range release {
+		gone[c.inputs[i]] = true
+		c.released[i] = true
+	}
+	files := slices.Clone(out)
+	var size uint64
+	for _, f := range out {
+		size += f.size
+	}
+	for _, f := range t.files {
+		if !gone[f] {
+			files = append(files, f)
+		}
+	}
+	sortFilesNewestFirst(files)
+	t.files = files
+	for f := range gone {
+		f.obsolete.Store(true)
+	}
+	t.publishLocked()
+	e.metrics.bytesCompacted.Add(int64(size))
+	if !final {
+		e.metrics.earlyReleases.Add(int64(len(release)))
+	}
+	c.pending = nil
+	c.installs++
+	return nil
+}
+
+func (c *compaction) discardPending() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.discardPendingLocked()
+}
+
+func (c *compaction) discardPendingLocked() {
+	for _, f := range c.pending {
+		f.reader.close()
+		_ = c.e.fs.Remove(f.path)
+	}
+	c.pending = nil
+}
+
+// compactShard merges the inputs' rows in shard s into sstables: one, or a
+// run of fragments of about FragmentSize cut at partition boundaries.
 //
-// Rows are purged (row.Purge) when some input may hold a deletion older than
-// gcBefore; otherwise rows are copied without being decoded, and the output's
-// timestamps and summary are bounded by the inputs'.
-func (e *Engine) writeCompactionShard(t *Table, inputs []*fileMeta, inputNums map[uint64]bool, lower, upper []byte) (*fileMeta, error) {
+// Rows are purged (row.PurgeAndSummarize) when some input may hold a
+// deletion older than gcBefore; otherwise rows are copied without being
+// decoded, and the output's timestamps and summary are bounded by the
+// inputs'.
+func (c *compaction) compactShard(s int) error {
+	e, t := c.e, c.t
+	lower, upper := c.shards[s][0], c.shards[s][1]
 	var in []*fileMeta
-	for _, f := range inputs {
+	var inIdx []int // index in c.inputs
+	for i, f := range c.inputs {
 		if (upper == nil || bytes.Compare(f.smallest.UserKey, upper) < 0) &&
 			(lower == nil || bytes.Compare(f.largest.UserKey, lower) >= 0) {
 			in = append(in, f)
+			inIdx = append(inIdx, i)
 		}
 	}
 	if len(in) == 0 {
-		return nil, nil
+		return nil
 	}
 	// The buffer pool is released after the iterators that use it close
 	// (deferred calls run last-in, first-out).
@@ -1045,17 +1375,19 @@ func (e *Engine) writeCompactionShard(t *Table, inputs []*fileMeta, inputNums ma
 	defer bp.Release()
 	mi := mergingIter{merger: e.merger, upper: upper}
 	defer mi.close()
+	srcInput := map[source]int{}
 	// The output's timestamp range is the union of the inputs': merging only
 	// keeps or drops existing cells and deletions, so the union bounds the
 	// output's range. A wider range is safe: reads stop early only below a
 	// file's maxTS, and purging treats minTS as possibly-older data.
 	minTS, maxTS := int64(math.MaxInt64), int64(math.MinInt64)
-	for _, f := range in {
+	for j, f := range in {
 		src, err := newCompactionSource(f.reader, &bp)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		mi.sources = append(mi.sources, src)
+		srcInput[src] = inIdx[j]
 		minTS, maxTS = min(minTS, f.minTS), max(maxTS, f.maxTS)
 	}
 
@@ -1071,30 +1403,56 @@ func (e *Engine) writeCompactionShard(t *Table, inputs []*fileMeta, inputNums ma
 			}
 		}
 	}
-
-	e.mu.Lock()
-	num := e.mu.nextFileNum
-	e.mu.nextFileNum++
-	e.mu.Unlock()
-	b, err := newSSTBuilder(e.fs, t.dir, num, e.writerOpts, e.merger, purge, nowSec)
-	if err != nil {
-		return nil, err
-	}
-	if !purge {
-		b.minTS, b.maxTS = minTS, maxTS
-		if purger != nil {
-			b.stats = unionStats(nowSec, in)
-		} else {
-			b.stats = fileStats{}
-		}
-	}
-	var purged []byte
 	var lookup *purgeLookup
 	if purge {
-		lookup = &purgeLookup{e: e, t: t, inputs: inputNums}
+		lookup = &purgeLookup{e: e, t: t, inputs: c.nums}
 		defer lookup.close()
 	}
-	addLDT := func(ldt int64) { b.stats.hist.add(ldt, 1) }
+
+	var b *sstBuilder
+	var lastKey []byte
+	start := func() error {
+		e.mu.Lock()
+		num := e.mu.nextFileNum
+		e.mu.nextFileNum++
+		e.mu.Unlock()
+		var err error
+		if b, err = newSSTBuilder(e.fs, t.dir, num, e.writerOpts, e.merger, purge, nowSec); err != nil {
+			return err
+		}
+		if !purge {
+			b.minTS, b.maxTS = minTS, maxTS
+			if purger != nil {
+				b.stats = unionStats(nowSec, in)
+			} else {
+				b.stats = fileStats{}
+			}
+		}
+		return nil
+	}
+	seal := func() error {
+		out, err := b.finish()
+		path := b.path
+		b = nil
+		if err != nil || out == nil {
+			return err
+		}
+		if err := e.openFile(t, out); err != nil {
+			_ = e.fs.Remove(path)
+			return err
+		}
+		out.run = c.runID(out.num)
+		return c.sealed(s, out, slices.Clone(lastKey))
+	}
+	fail := func(err error) error {
+		if b != nil {
+			b.abort()
+		}
+		return err
+	}
+	fragment := uint64(t.opts.fragmentSize())
+	var purged []byte
+	var contrib []int
 	ok := false
 	if lower == nil {
 		ok = mi.first()
@@ -1103,8 +1461,18 @@ func (e *Engine) writeCompactionShard(t *Table, inputs []*fileMeta, inputNums ma
 	}
 	for n := 1; ok; ok, n = mi.next(), n+1 {
 		if n%1024 == 0 && (e.unusable.Load() || t.dropped.Load()) {
-			b.abort()
-			return nil, errCompactionAborted
+			return fail(errCompactionAborted)
+		}
+		// Cut a fragment at a partition boundary once it is large enough.
+		if b != nil && fragment > 0 && b.w.EstimatedSize() >= fragment && keyToken(mi.key) != keyToken(lastKey) {
+			if err := seal(); err != nil {
+				return fail(err)
+			}
+		}
+		if b == nil {
+			if err := start(); err != nil {
+				return fail(err)
+			}
 		}
 		value := mi.value
 		if purge {
@@ -1112,10 +1480,19 @@ func (e *Engine) writeCompactionShard(t *Table, inputs []*fileMeta, inputNums ma
 			key := mi.key
 			out, changed, empty, rs, err := purger.PurgeAndSummarize(purged[:0], value, nowSec, gcBefore, func(minTS, maxTS int64) (int64, error) {
 				return lookup.maxPurgeable(key, minTS, maxTS)
-			}, addLDT)
+			}, func(ldt int64) { b.stats.hist.add(ldt, 1) })
 			if err != nil {
-				b.abort()
-				return nil, err
+				return fail(err)
+			}
+			if changed && fragment > 0 && len(mi.cur) > 1 {
+				// The inputs holding this row's fragments are released
+				// together: a purged deletion may have shadowed data in
+				// another of them.
+				contrib = contrib[:0]
+				for _, ent := range mi.cur {
+					contrib = append(contrib, srcInput[ent.src])
+				}
+				c.tie(contrib)
 			}
 			if empty {
 				continue
@@ -1124,29 +1501,22 @@ func (e *Engine) writeCompactionShard(t *Table, inputs []*fileMeta, inputNums ma
 				purged, value = out, out
 			}
 			if err := b.addSummarized(mi.key, value, mi.trailer, &rs); err != nil {
-				b.abort()
-				return nil, err
+				return fail(err)
 			}
-			continue
+		} else if err := b.add(mi.key, value, mi.trailer); err != nil {
+			return fail(err)
 		}
-		if err := b.add(mi.key, value, mi.trailer); err != nil {
-			b.abort()
-			return nil, err
-		}
+		lastKey = append(lastKey[:0], mi.key...)
 	}
 	if mi.e != nil {
-		b.abort()
-		return nil, mi.e
+		return fail(mi.e)
 	}
-	out, err := b.finish()
-	if err != nil || out == nil {
-		return nil, err
+	if b != nil {
+		if err := seal(); err != nil {
+			return fail(err)
+		}
 	}
-	if err := e.openFile(t, out); err != nil {
-		_ = e.fs.Remove(b.path)
-		return nil, err
-	}
-	return out, nil
+	return nil
 }
 
 // maxPurgeable returns the smallest timestamp of key's data outside a

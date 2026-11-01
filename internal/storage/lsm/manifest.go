@@ -62,6 +62,10 @@ type fileMeta struct {
 	// compacting is set while a compaction uses the file. Guarded by
 	// Engine.mu.
 	compacting bool
+	// run identifies the files written by one flush or compaction (a run of
+	// non-overlapping fragments): the number of its first file. Zero (files
+	// from before a restart) means the file's own number.
+	run uint64
 }
 
 // unref drops a reference. The last one closes the file, and deletes it if
