@@ -619,3 +619,48 @@ func BenchmarkStreamRange(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkPutParallelDisk is the synced 4-writer benchmark on a real disk
+// (the test's temporary directory) instead of the in-memory file system, so
+// fsync and file growth cost what they do in production.
+func BenchmarkPutParallelDisk(b *testing.B) {
+	val := benchValue()
+	for _, eng := range engines {
+		b.Run(eng+"/sync=true", func(b *testing.B) {
+			dir := b.TempDir()
+			var put func(k []byte) error
+			var closeFn func() error
+			if eng == "lsm" {
+				e, err := Open(dir, &Options{FS: vfs.Default, DisableCompactions: true})
+				if err != nil {
+					b.Fatal(err)
+				}
+				if _, err := e.CreateTable(1); err != nil {
+					b.Fatal(err)
+				}
+				put = func(k []byte) error { return e.Put(1, k, val, Sync) }
+				closeFn = e.Close
+			} else {
+				c := pebble.NewCache(64 << 20)
+				defer c.Unref()
+				db, err := pebble.Open(dir, &pebble.Options{FS: vfs.Default, Cache: c, DisableAutomaticCompactions: true})
+				if err != nil {
+					b.Fatal(err)
+				}
+				put = func(k []byte) error { return db.Set(k, val, pebble.Sync) }
+				closeFn = db.Close
+			}
+			defer closeFn()
+			var n atomic.Int64
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					if err := put(benchKey(int(n.Add(1)))); err != nil {
+						b.Error(err)
+						return
+					}
+				}
+			})
+		})
+	}
+}

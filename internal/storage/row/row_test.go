@@ -221,3 +221,28 @@ func TestPurgeInvisible(t *testing.T) {
 	}
 	require.Greater(t, purged, 1000)
 }
+
+// TestPurgeAndSummarize checks that the stats PurgeAndSummarize returns are
+// Summarize's of its output, with the same reported deletion times.
+func TestPurgeAndSummarize(t *testing.T) {
+	rng := rand.New(rand.NewPCG(8, 9))
+	for i := 0; i < 20000; i++ {
+		a := randomRow(rng)
+		now := int64(rng.IntN(6))
+		limit := int64(rng.IntN(25))
+		var got []int64
+		out, _, empty, st, err := PurgeAndSummarize(nil, a, now, now-int64(rng.IntN(3)),
+			func(int64, int64) (int64, error) { return limit, nil }, func(t int64) { got = append(got, t) })
+		require.NoError(t, err)
+		if empty {
+			require.Zero(t, st.Cells)
+			require.Empty(t, got)
+			continue
+		}
+		var want []int64
+		ws, err := Summarize(out, func(t int64) { want = append(want, t) })
+		require.NoError(t, err)
+		require.Equal(t, ws, st)
+		require.Equal(t, want, got)
+	}
+}

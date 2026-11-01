@@ -606,7 +606,7 @@ func TestWALRecycleReplay(t *testing.T) {
 			fs := vfs.NewCrashableMem()
 			require.NoError(t, fs.MkdirAll("db", 0755))
 			require.NoError(t, syncDir(fs, ""))
-			old, err := createWAL(fs, "db", 1, 0)
+			old, err := createWAL(fs, "db", 1, 0, 0)
 			require.NoError(t, err)
 			require.NoError(t, syncDir(fs, "db"))
 			for i := 0; i < 2000; i++ {
@@ -614,7 +614,7 @@ func TestWALRecycleReplay(t *testing.T) {
 			}
 			require.NoError(t, old.close())
 
-			w, err := createWAL(fs, "db", 5, 1)
+			w, err := createWAL(fs, "db", 5, 1, 0)
 			require.NoError(t, err)
 			require.NoError(t, syncDir(fs, "db"))
 			var ps pendingSync

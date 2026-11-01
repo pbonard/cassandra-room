@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"cmp"
 	"container/heap"
+	"context"
 	"errors"
 	"fmt"
+	"github.com/cockroachdb/pebble/sstable"
 	"math"
 	"math/rand/v2"
 	"slices"
@@ -1087,6 +1089,12 @@ func (e *Engine) writeCompactionShard(t *Table, inputs []*fileMeta, inputNums ma
 		}
 	}
 	var purged []byte
+	var lookup *purgeLookup
+	if purge {
+		lookup = &purgeLookup{e: e, t: t, inputs: inputNums}
+		defer lookup.close()
+	}
+	addLDT := func(ldt int64) { b.stats.hist.add(ldt, 1) }
 	ok := false
 	if lower == nil {
 		ok = mi.first()
@@ -1100,10 +1108,11 @@ func (e *Engine) writeCompactionShard(t *Table, inputs []*fileMeta, inputNums ma
 		}
 		value := mi.value
 		if purge {
+			// One decoding purges the row and yields its statistics.
 			key := mi.key
-			out, changed, empty, err := purger.Purge(purged[:0], value, nowSec, gcBefore, func(minTS, maxTS int64) (int64, error) {
-				return e.maxPurgeable(t, inputNums, key, minTS, maxTS)
-			})
+			out, changed, empty, rs, err := purger.PurgeAndSummarize(purged[:0], value, nowSec, gcBefore, func(minTS, maxTS int64) (int64, error) {
+				return lookup.maxPurgeable(key, minTS, maxTS)
+			}, addLDT)
 			if err != nil {
 				b.abort()
 				return nil, err
@@ -1114,6 +1123,11 @@ func (e *Engine) writeCompactionShard(t *Table, inputs []*fileMeta, inputNums ma
 			if changed {
 				purged, value = out, out
 			}
+			if err := b.addSummarized(mi.key, value, mi.trailer, &rs); err != nil {
+				b.abort()
+				return nil, err
+			}
+			continue
 		}
 		if err := b.add(mi.key, value, mi.trailer); err != nil {
 			b.abort()
@@ -1150,6 +1164,60 @@ func (e *Engine) writeCompactionShard(t *Table, inputs []*fileMeta, inputNums ma
 // purged deletion is not shadowed by it: gc_grace_seconds is the bound on
 // how late such writes (hints, repair) may arrive.
 func (e *Engine) maxPurgeable(t *Table, inputs map[uint64]bool, key []byte, minTS, maxTS int64) (int64, error) {
+	p := purgeLookup{e: e, t: t, inputs: inputs}
+	defer p.close()
+	return p.maxPurgeable(key, minTS, maxTS)
+}
+
+// purgeLookup answers maxPurgeable for the rows of one compaction shard,
+// which come in key order. It keeps one point iterator per sstable it has
+// looked in (holding a reference on the file), instead of creating one per
+// row, so repeated lookups reuse the iterator and its loaded blocks. Each
+// lookup still reads the table's current state, so sstables and memtables
+// that appeared since earlier rows are seen.
+type purgeLookup struct {
+	e      *Engine
+	t      *Table
+	inputs map[uint64]bool
+	iters  map[uint64]*lookupIter
+}
+
+type lookupIter struct {
+	f  *fileMeta
+	it sstable.Iterator
+}
+
+func (p *purgeLookup) close() {
+	for _, li := range p.iters {
+		_ = li.it.Close()
+		li.f.unref()
+	}
+	p.iters = nil
+}
+
+// iter returns the cached iterator for f, creating it.
+func (p *purgeLookup) iter(f *fileMeta) (sstable.Iterator, error) {
+	if li := p.iters[f.num]; li != nil {
+		return li.it, nil
+	}
+	it, err := f.reader.r.NewPointIter(context.Background(), sstable.IterOptions{
+		FilterBlockSizeLimit: sstable.AlwaysUseFilterBlock,
+		Env:                  sstable.NoReadEnv,
+		ReaderProvider:       sstable.MakeTrivialReaderProvider(f.reader.r),
+	})
+	if err != nil {
+		return nil, err
+	}
+	f.refs.Add(1) // keeps the file open while the iterator lives
+	if p.iters == nil {
+		p.iters = map[uint64]*lookupIter{}
+	}
+	p.iters[f.num] = &lookupIter{f: f, it: it}
+	return it, nil
+}
+
+func (p *purgeLookup) maxPurgeable(key []byte, minTS, maxTS int64) (int64, error) {
+	e, t, inputs := p.e, p.t, p.inputs
 	s := t.acquireState()
 	defer s.release()
 	limit := int64(math.MaxInt64)
@@ -1161,12 +1229,12 @@ func (e *Engine) maxPurgeable(t *Table, inputs map[uint64]bool, key []byte, minT
 		return err
 	}
 	for _, m := range s.mems {
-		v, ok, err := m.getMerged(e.merger, key, math.MaxUint64, nil)
-		if err == nil && ok {
-			err = note(v)
-		}
-		if err != nil {
-			return 0, err
+		// Every fragment of the key, unmerged: only their smallest
+		// timestamp matters.
+		for n := m.get(key, math.MaxUint64>>8); n != nil && bytes.Equal(n.key, key); n = n.next() {
+			if err := note(n.value); err != nil {
+				return 0, err
+			}
 		}
 		if limit <= minTS {
 			return math.MinInt64, nil
@@ -1176,11 +1244,19 @@ func (e *Engine) maxPurgeable(t *Table, inputs map[uint64]bool, key []byte, minT
 		if inputs[f.num] || f.minTS >= limit || f.minTS > maxTS || !f.mayContain(key) {
 			continue
 		}
-		v, ok, err := f.reader.getMerged(e.merger, key, nil)
-		if err == nil && ok {
-			err = note(v)
-		}
+		it, err := p.iter(f)
 		if err != nil {
+			return 0, err
+		}
+		if kv := it.SeekPrefixGE(key, key, 0); kv != nil && bytes.Equal(kv.K.UserKey, key) {
+			v, _, verr := kv.Value(nil)
+			if verr == nil {
+				verr = note(v)
+			}
+			if verr != nil {
+				return 0, verr
+			}
+		} else if err := it.Error(); err != nil {
 			return 0, err
 		}
 		if limit <= minTS {

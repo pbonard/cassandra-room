@@ -23,6 +23,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"sync"
 )
 
 const (
@@ -207,17 +208,26 @@ func (d *decoder) next(c *Cell) bool {
 
 // Decode decodes a row. Cell values alias b.
 func Decode(b []byte) (*Row, error) {
+	r := &Row{}
+	if err := decodeInto(r, b); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// decodeInto decodes a row into r, reusing r.Cells' storage.
+func decodeInto(r *Row, b []byte) error {
 	d := newDecoder(b)
-	r := &Row{Deletion: d.deletion}
+	r.Deletion, r.Cells = d.deletion, r.Cells[:0]
 	var c Cell
 	for d.next(&c) {
 		r.Cells = append(r.Cells, c)
 	}
-	if d.err != nil {
-		return nil, d.err
-	}
-	return r, nil
+	return d.err
 }
+
+// rowPool holds rows for decoding scratch.
+var rowPool = sync.Pool{New: func() any { return new(Row) }}
 
 // reconcile returns the cell that wins between two cells of the same column
 // (Cassandra's Cells.resolveRegular).
@@ -431,34 +441,73 @@ func Summarize(v []byte, ldt func(int64)) (Stats, error) {
 // cells and no row deletion), so the row can be dropped. If nothing is
 // purged, it returns v itself, and changed and empty are false.
 func Purge(dst, v []byte, nowSec, gcBefore int64, maxPurgeable func(minTS, maxTS int64) (int64, error)) (out []byte, changed, empty bool, err error) {
+	out, changed, empty, _, err = PurgeAndSummarize(dst, v, nowSec, gcBefore, maxPurgeable, nil)
+	return out, changed, empty, err
+}
+
+// PurgeAndSummarize is Purge that also returns the Stats of the result (as
+// Summarize would, reporting its local deletion times to ldt), from the
+// same single decoding of v.
+func PurgeAndSummarize(dst, v []byte, nowSec, gcBefore int64, maxPurgeable func(minTS, maxTS int64) (int64, error), ldt func(int64)) (out []byte, changed, empty bool, st Stats, err error) {
 	d := newDecoder(v)
 	candidate := func(ldt int64) bool { return ldt < gcBefore && ldt <= nowSec }
 	cand := false
 	minTS, maxTS := int64(math.MaxInt64), int64(math.MinInt64)
 	note := func(ts int64) { cand, minTS, maxTS = true, min(minTS, ts), max(maxTS, ts) }
-	if !d.deletion.IsLive() && candidate(d.deletion.LocalDeletionTime) {
-		note(d.deletion.MarkedForDeleteAt)
+	st = Stats{MinTS: math.MaxInt64, MaxTS: math.MinInt64, MaxLDT: math.MinInt64, MinLDT: NoDeletionTime}
+	var ldtBuf [8]int64
+	ldts := ldtBuf[:0]
+	droppable := func(t int64) {
+		st.Tombstones++
+		st.MinLDT, st.MaxLDT = min(st.MinLDT, t), max(st.MaxLDT, t)
+		ldts = append(ldts, t)
+	}
+	if !d.deletion.IsLive() {
+		st.MinTS, st.MaxTS, st.HasTS = d.deletion.MarkedForDeleteAt, d.deletion.MarkedForDeleteAt, true
+		droppable(d.deletion.LocalDeletionTime)
+		if candidate(d.deletion.LocalDeletionTime) {
+			note(d.deletion.MarkedForDeleteAt)
+		}
 	}
 	var c Cell
 	for d.next(&c) {
-		if c.LocalDeletionTime != NoDeletionTime && !c.IsLive(nowSec) && candidate(c.LocalDeletionTime) {
+		st.Cells++
+		st.MinTS, st.MaxTS, st.HasTS = min(st.MinTS, c.Timestamp), max(st.MaxTS, c.Timestamp), true
+		if c.LocalDeletionTime == NoDeletionTime {
+			st.MaxLDT = NoDeletionTime
+			continue
+		}
+		droppable(c.LocalDeletionTime)
+		if !c.IsLive(nowSec) && candidate(c.LocalDeletionTime) {
 			note(c.Timestamp)
 		}
 	}
 	if d.err != nil {
-		return nil, false, false, d.err
+		return nil, false, false, Stats{}, d.err
+	}
+	unchanged := func() ([]byte, bool, bool, Stats, error) {
+		if ldt != nil {
+			for _, t := range ldts {
+				ldt(t)
+			}
+		}
+		return v, false, false, st, nil
 	}
 	if !cand {
-		return v, false, false, nil
+		return unchanged()
 	}
 	limit, err := maxPurgeable(minTS, maxTS)
 	if err != nil {
-		return nil, false, false, err
+		return nil, false, false, Stats{}, err
 	}
 	shouldPurge := func(ts, ldt int64) bool { return candidate(ldt) && ts < limit }
-	r, err := Decode(v)
-	if err != nil {
-		return nil, false, false, err
+	r := rowPool.Get().(*Row)
+	defer func() {
+		clear(r.Cells) // drop references into v
+		rowPool.Put(r)
+	}()
+	if err := decodeInto(r, v); err != nil {
+		return nil, false, false, Stats{}, err
 	}
 	if !r.Deletion.IsLive() && shouldPurge(r.Deletion.MarkedForDeleteAt, r.Deletion.LocalDeletionTime) {
 		r.Deletion = Deletion{MarkedForDeleteAt: NoTimestamp}
@@ -474,19 +523,46 @@ func Purge(dst, v []byte, nowSec, gcBefore int64, maxPurgeable func(minTS, maxTS
 	}
 	r.Cells = kept
 	if !changed {
-		return v, false, false, nil
+		return unchanged()
 	}
 	empty = len(r.Cells) == 0 && r.Deletion.IsLive()
 	if empty {
-		return dst, true, true, nil
+		return dst, true, true, Stats{MinTS: math.MaxInt64, MaxTS: math.MinInt64, MaxLDT: math.MinInt64, MinLDT: NoDeletionTime}, nil
 	}
-	return Append(dst, r), true, false, nil
+	return Append(dst, r), true, false, statsOf(r, ldt), nil
+}
+
+// statsOf is Summarize of a decoded row.
+func statsOf(r *Row, ldt func(int64)) Stats {
+	s := Stats{MinTS: math.MaxInt64, MaxTS: math.MinInt64, MaxLDT: math.MinInt64, MinLDT: NoDeletionTime}
+	droppable := func(t int64) {
+		s.Tombstones++
+		s.MinLDT, s.MaxLDT = min(s.MinLDT, t), max(s.MaxLDT, t)
+		if ldt != nil {
+			ldt(t)
+		}
+	}
+	if !r.Deletion.IsLive() {
+		s.MinTS, s.MaxTS, s.HasTS = r.Deletion.MarkedForDeleteAt, r.Deletion.MarkedForDeleteAt, true
+		droppable(r.Deletion.LocalDeletionTime)
+	}
+	for i := range r.Cells {
+		c := &r.Cells[i]
+		s.Cells++
+		s.MinTS, s.MaxTS, s.HasTS = min(s.MinTS, c.Timestamp), max(s.MaxTS, c.Timestamp), true
+		if c.LocalDeletionTime == NoDeletionTime {
+			s.MaxLDT = NoDeletionTime
+		} else {
+			droppable(c.LocalDeletionTime)
+		}
+	}
+	return s
 }
 
 // Summarize implements lsm.Purger.
 func (Merger) Summarize(v []byte, ldt func(int64)) (Stats, error) { return Summarize(v, ldt) }
 
-// Purge implements lsm.Purger.
-func (Merger) Purge(dst, v []byte, nowSec, gcBefore int64, maxPurgeable func(minTS, maxTS int64) (int64, error)) ([]byte, bool, bool, error) {
-	return Purge(dst, v, nowSec, gcBefore, maxPurgeable)
+// PurgeAndSummarize implements lsm.Purger.
+func (Merger) PurgeAndSummarize(dst, v []byte, nowSec, gcBefore int64, maxPurgeable func(minTS, maxTS int64) (int64, error), ldt func(int64)) ([]byte, bool, bool, Stats, error) {
+	return PurgeAndSummarize(dst, v, nowSec, gcBefore, maxPurgeable, ldt)
 }

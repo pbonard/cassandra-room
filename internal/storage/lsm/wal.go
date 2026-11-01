@@ -26,8 +26,9 @@ type walWriter struct {
 // file, and on a real disk makes each fsync cheaper (no block allocation or
 // file size update to journal). Records carry their segment number, so on
 // replay the old segment's records left past the new end are recognised as
-// stale and end the replay; recycle must be lower than num.
-func createWAL(fs vfs.FS, dir string, num, recycle uint64) (*walWriter, error) {
+// stale and end the replay; recycle must be lower than num. A new file is
+// preallocated to preallocate bytes.
+func createWAL(fs vfs.FS, dir string, num, recycle uint64, preallocate int64) (*walWriter, error) {
 	path := fs.PathJoin(dir, walFileName(num))
 	var f vfs.File
 	var err error
@@ -41,6 +42,13 @@ func createWAL(fs vfs.FS, dir string, num, recycle uint64) (*walWriter, error) {
 	}
 	if err != nil {
 		return nil, err
+	}
+	if recycle == 0 && preallocate > 0 {
+		// Reserve the segment's space up front, as Cassandra creates commit
+		// log segments at their full size: later syncs then need not
+		// allocate blocks or record a new file size. Best effort: some file
+		// systems do not support it.
+		_ = f.Preallocate(0, preallocate)
 	}
 	sem := make(chan struct{}, record.SyncConcurrency-1)
 	w := newLogWriter(f, num, record.LogWriterConfig{

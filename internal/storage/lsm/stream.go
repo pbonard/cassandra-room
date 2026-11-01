@@ -14,82 +14,107 @@ import (
 	"github.com/cockroachdb/pebble/vfs"
 )
 
-// exportFileSize is the size at which ExportRange starts a new file.
-const exportFileSize = 64 << 20
-
-// ExportRange writes the table's rows in [lower, upper) (nil bounds are
-// open), as of the call, into new sstables in dir on fs, and returns their
-// paths: the sending side of Cassandra's streaming, used by repair,
-// bootstrap and decommission to move token ranges between nodes. Rows are
-// written merged, one entry per key, in files of about 64 MiB. dir must
-// exist; existing files are not overwritten. The table is flushed first, as
-// Cassandra flushes before streaming (StreamSession.addTransferRanges), so
-// what is sent is durable at the sender.
+// ExportRange writes the table's data in [lower, upper) (nil bounds are
+// open) to sstables in dir on fs and returns their paths: the sending side
+// of Cassandra's streaming, used by repair, bootstrap and decommission to
+// move token ranges between nodes. As Cassandra does
+// (StreamSession.addTransferRanges, then CassandraOutgoingFile), the table
+// is flushed first, so what is sent is durable at the sender, and its
+// sstables are sent as they are rather than merged: an sstable wholly
+// inside the range is hard-linked into dir (copied, if fs is not the
+// engine's file system), as Cassandra's entire-sstable streaming
+// (CASSANDRA-14556) sends whole files; from one that crosses a bound, the
+// section inside the range is written to a new file, as Cassandra streams
+// sstable sections. The files hold row fragments, which the receiver
+// reconciles by timestamp like any others. Writes that arrive after the
+// flush are not sent. dir must exist; existing files are not overwritten.
 func (t *Table) ExportRange(lower, upper []byte, fs vfs.FS, dir string) ([]string, error) {
 	if err := t.Flush(); err != nil {
 		return nil, err
 	}
-	sn, err := t.NewSnapshot()
-	if err != nil {
-		return nil, err
+	if t.dropped.Load() {
+		return nil, ErrUnknownTable
 	}
-	defer sn.Close()
-	it, err := sn.NewIter(lower, upper)
-	if err != nil {
-		return nil, err
-	}
-	defer it.Close()
+	e := t.e
+	s := t.acquireState()
+	defer s.release()
+	files := slices.Clone(s.files)
+	slices.SortFunc(files, func(a, b *fileMeta) int { return bytes.Compare(a.smallest.UserKey, b.smallest.UserKey) })
 
 	var paths []string
-	var b *sstBuilder
-	created := t.e.opts.Now().Unix()
 	fail := func(err error) ([]string, error) {
-		if b != nil {
-			b.abort()
-		}
 		for _, p := range paths {
 			_ = fs.Remove(p)
 		}
 		return nil, err
 	}
-	finish := func() error {
-		meta, err := b.finish()
-		b = nil
-		if err == nil && meta != nil {
-			paths = append(paths, fs.PathJoin(dir, tableFileName(meta.num)))
-		}
-		return err
-	}
 	num := uint64(1)
-	for ok := it.First(); ok; ok = it.Next() {
-		if b == nil {
-			for {
-				if _, err := fs.Stat(fs.PathJoin(dir, tableFileName(num))); err != nil {
-					break
-				}
-				num++
-			}
-			// Importers rescan the files, so no summary is computed here.
-			if b, err = newSSTBuilder(fs, dir, num, t.e.writerOpts, t.e.merger, false, created); err != nil {
-				return fail(err)
-			}
+	nextPath := func() string {
+		for {
+			p := fs.PathJoin(dir, tableFileName(num))
 			num++
-		}
-		if err := b.add(it.Key(), it.Value(), it.m.trailer); err != nil {
-			return fail(err)
-		}
-		if b.w.EstimatedSize() >= exportFileSize {
-			if err := finish(); err != nil {
-				return fail(err)
+			if _, err := fs.Stat(p); err != nil {
+				return p
 			}
 		}
 	}
-	if err := it.Error(); err != nil {
-		return fail(err)
-	}
-	if b != nil {
-		if err := finish(); err != nil {
+	created := e.opts.Now().Unix()
+	for _, f := range files {
+		if (upper != nil && bytes.Compare(f.smallest.UserKey, upper) >= 0) ||
+			(lower != nil && bytes.Compare(f.largest.UserKey, lower) < 0) {
+			continue // no overlap
+		}
+		inside := (lower == nil || bytes.Compare(f.smallest.UserKey, lower) >= 0) &&
+			(upper == nil || bytes.Compare(f.largest.UserKey, upper) < 0)
+		dst := nextPath()
+		if inside {
+			var err error
+			if fs == e.fs {
+				err = fs.Link(f.path, dst)
+			} else {
+				err = vfs.CopyAcrossFS(e.fs, f.path, fs, dst)
+			}
+			if err != nil {
+				return fail(err)
+			}
+			paths = append(paths, dst)
+			continue
+		}
+		// The section of f inside the range.
+		var src tableSource
+		if err := src.init(f.reader, lower, upper, false); err != nil {
 			return fail(err)
+		}
+		var dstNum uint64
+		_, _ = fmt.Sscanf(fs.PathBase(dst), "%d.sst", &dstNum)
+		b, err := newSSTBuilder(fs, dir, dstNum, e.writerOpts, e.merger, false, created)
+		if err != nil {
+			src.close()
+			return fail(err)
+		}
+		k, v, tr, ok := src.first()
+		if lower != nil {
+			k, v, tr, ok = src.seekGE(lower)
+		}
+		for ; ok; k, v, tr, ok = src.next() {
+			if err := b.add(k, v, tr); err != nil {
+				b.abort()
+				src.close()
+				return fail(err)
+			}
+		}
+		err = src.err()
+		src.close()
+		if err != nil {
+			b.abort()
+			return fail(err)
+		}
+		meta, err := b.finish()
+		if err != nil {
+			return fail(err)
+		}
+		if meta != nil {
+			paths = append(paths, fs.PathJoin(dir, tableFileName(meta.num)))
 		}
 	}
 	if err := syncDir(fs, dir); err != nil {

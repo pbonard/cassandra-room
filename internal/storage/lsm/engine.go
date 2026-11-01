@@ -287,7 +287,7 @@ func (e *Engine) recover() error {
 
 	walNum := nextFileNum
 	nextFileNum++
-	wal, err := createWAL(e.fs, e.dir, walNum, 0)
+	wal, err := createWAL(e.fs, e.dir, walNum, 0, e.opts.WALSegmentSize)
 	if err != nil {
 		return err
 	}
@@ -771,11 +771,11 @@ func (e *Engine) rotateWALLocked() error {
 		recycle = e.mu.recycledWAL[0]
 		e.mu.recycledWAL = e.mu.recycledWAL[1:]
 	}
-	wal, err := createWAL(e.fs, e.dir, num, recycle)
+	wal, err := createWAL(e.fs, e.dir, num, recycle, e.opts.WALSegmentSize)
 	if err != nil && recycle != 0 {
 		// Fall back to a new file; the old one is no longer needed.
 		_ = e.fs.Remove(e.fs.PathJoin(e.dir, walFileName(recycle)))
-		wal, err = createWAL(e.fs, e.dir, num, 0)
+		wal, err = createWAL(e.fs, e.dir, num, 0, e.opts.WALSegmentSize)
 	}
 	if err == nil {
 		err = syncDir(e.fs, e.dir)

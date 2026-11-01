@@ -15,9 +15,11 @@ type Purger interface {
 	// Summarize returns a row's statistics and reports the local deletion
 	// time of each droppable part to ldt (if not nil).
 	Summarize(v []byte, ldt func(int64)) (row.Stats, error)
-	// Purge drops the parts of v whose deletion is older than gcBefore and
-	// whose timestamp is below maxPurgeable (see row.Purge).
-	Purge(dst, v []byte, nowSec, gcBefore int64, maxPurgeable func(minTS, maxTS int64) (int64, error)) (out []byte, changed, empty bool, err error)
+	// PurgeAndSummarize drops the parts of v whose deletion is older than
+	// gcBefore and whose timestamp is below maxPurgeable (see row.Purge),
+	// and returns the result's statistics, as Summarize would, from the
+	// same decoding.
+	PurgeAndSummarize(dst, v []byte, nowSec, gcBefore int64, maxPurgeable func(minTS, maxTS int64) (int64, error), ldt func(int64)) (out []byte, changed, empty bool, st row.Stats, err error)
 }
 
 // fileStats is an sstable's summary (Cassandra's Statistics.db: maximum

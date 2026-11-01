@@ -93,7 +93,7 @@ func (t *Table) MerkleTree(r TokenRange, depth int) (*MerkleTree, error) {
 	for ok := it.First(); ok; ok = it.Next() {
 		v := it.Value()
 		if purger != nil {
-			out, _, empty, err := purger.Purge(buf[:0], v, nowSec, gcBefore, noOther)
+			out, _, empty, _, err := purger.PurgeAndSummarize(buf[:0], v, nowSec, gcBefore, noOther, nil)
 			if err != nil {
 				return nil, err
 			}

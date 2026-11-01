@@ -294,3 +294,49 @@ func TestMerkleTreeOrderIndependent(t *testing.T) {
 	require.True(t, diff[0].First <= tok && tok <= diff[0].Last)
 	require.NotEqual(t, ma.Root(), mb.Root())
 }
+
+// TestExportRangeFiles checks that ExportRange links an sstable wholly
+// inside the range and writes only the in-range section of one that crosses
+// a bound, and that importing the files gives exactly the range's rows.
+func TestExportRangeFiles(t *testing.T) {
+	fs := &linkCountFS{FS: vfs.NewMem()}
+	e, err := Open("db", &Options{FS: fs, DisableCompactions: true})
+	require.NoError(t, err)
+	defer e.Close()
+	tbl, _ := e.CreateTable(1)
+	for i := 0; i < 100; i++ { // file 1: c000-c099, wholly inside [b, d)
+		set(t, e, 1, fmt.Sprintf("c%03d", i), "c", NoSync)
+	}
+	require.NoError(t, tbl.Flush())
+	for i := 0; i < 100; i++ { // file 2: a000-a099 and e000-e099, crosses both bounds
+		set(t, e, 1, fmt.Sprintf("a%03d", i), "a", NoSync)
+		set(t, e, 1, fmt.Sprintf("e%03d", i), "e", NoSync)
+	}
+	set(t, e, 1, "c050", "newer", NoSync)
+	require.NoError(t, tbl.Flush())
+	require.NoError(t, fs.MkdirAll("out", 0755))
+	paths, err := tbl.ExportRange([]byte("b"), []byte("d"), fs, "out")
+	require.NoError(t, err)
+	require.Len(t, paths, 2)
+
+	// The wholly-inside file was linked, the other written.
+	require.Equal(t, 1, fs.links)
+
+	dst, _ := e.CreateTable(2)
+	require.NoError(t, dst.Import(fs, paths))
+	got := scanAll(t, dst, nil, nil)
+	require.Len(t, got, 100)
+	require.Equal(t, "newer", got["c050"])
+	require.Equal(t, "c", got["c049"])
+}
+
+// linkCountFS counts hard links made in a file system.
+type linkCountFS struct {
+	vfs.FS
+	links int
+}
+
+func (fs *linkCountFS) Link(oldname, newname string) error {
+	fs.links++
+	return fs.FS.Link(oldname, newname)
+}

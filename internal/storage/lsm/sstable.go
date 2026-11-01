@@ -3,6 +3,7 @@ package lsm
 import (
 	"bytes"
 	"context"
+	"github.com/cassandra-room/cassandra-room/internal/storage/row"
 	"io"
 	"math"
 
@@ -125,6 +126,21 @@ func (b *sstBuilder) add(key, value []byte, trailer uint64) error {
 				b.minTS, b.maxTS = min(b.minTS, lo), max(b.maxTS, hi)
 			}
 		}
+	}
+	b.n++
+	k := pebble.InternalKey{
+		UserKey: key,
+		Trailer: pebble.InternalKeyTrailer(trailer&^0xff | uint64(pebble.InternalKeyKindMerge)),
+	}
+	return b.w.Add(k, value, false, sstable.KVMeta{})
+}
+
+// addSummarized adds a row whose statistics the caller computed (with a
+// Purger), so the row is not decoded again.
+func (b *sstBuilder) addSummarized(key, value []byte, trailer uint64, rs *row.Stats) error {
+	b.stats.add(rs)
+	if rs.HasTS {
+		b.minTS, b.maxTS = min(b.minTS, rs.MinTS), max(b.maxTS, rs.MaxTS)
 	}
 	b.n++
 	k := pebble.InternalKey{
