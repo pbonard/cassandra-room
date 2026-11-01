@@ -329,8 +329,15 @@ and `unified/Controller.java`.
   only together (`TestIncrementalReleasePurgeTie` checks this at each
   release and after a crash there, and fails without it). Every edit
   leaves a complete table. Fragments of one compaction share a run
-  identifier. Not used in the time-window mode, whose windows must end as
-  one file.
+  identifier. Flushes are cut into fragments the same way, so later
+  compactions can release their output piece by piece. A compaction
+  closes each input's iterator once it has read its last row and drops
+  its reference when it releases the input, so the file's space is
+  reclaimed as soon as readers finish with it, not when the compaction
+  ends. In `BenchmarkMajorCompactionSpace` (8 runs of 200k distinct rows,
+  then one full compaction), the extra space during compaction falls from
+  71.5 MiB to 9.2 MiB with 1 MiB fragments. Not used in the time-window
+  mode, whose windows must end as one file.
 - **Cross-level jobs (from ICS), when the table has no other compaction
   running, as there:**
   - *Garbage collection* (`find_garbage_collection_job`): an sstable whose

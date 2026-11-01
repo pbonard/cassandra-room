@@ -697,8 +697,9 @@ func dirBytes(fs vfs.FS, dir string) int64 {
 	return n
 }
 
-// BenchmarkMajorCompactionSpace overwrites a 200k-row token-spread table in
-// 8 rounds, one flush each, then compacts everything at once, sampling the
+// BenchmarkMajorCompactionSpace writes 8 rounds of 200k distinct
+// token-spread rows, one flush each, then compacts everything at once,
+// sampling the
 // sstable bytes on disk every millisecond. It reports the peak over the
 // data before compaction: how much extra space a full compaction needs.
 // "lsm" writes each shard's output whole (the inputs go when it ends);
@@ -730,7 +731,10 @@ func BenchmarkMajorCompactionSpace(b *testing.B) {
 					put = func(k, v []byte) error { return e.Put(1, k, v, NoSync) }
 					flush, compact, closeFn = tbl.Flush, tbl.Compact, e.Close
 				default:
-					db, err := pebble.Open("db", &pebble.Options{FS: fs, DisableAutomaticCompactions: true})
+					// No automatic compactions, and no write stall from the
+					// L0 files that accumulate meanwhile.
+					db, err := pebble.Open("db", &pebble.Options{FS: fs, DisableAutomaticCompactions: true,
+						MemTableSize: 64 << 20, L0CompactionThreshold: 1000, L0StopWritesThreshold: 1000})
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -748,7 +752,7 @@ func BenchmarkMajorCompactionSpace(b *testing.B) {
 							Cells: []row.Cell{{Column: 1, Timestamp: int64(round*200000 + i), LocalDeletionTime: row.NoDeletionTime,
 								Value: bytes.Repeat([]byte{byte(i), byte(round)}, 50)}},
 						})
-						if err := put(tokenBenchKey(i), v); err != nil {
+						if err := put(tokenBenchKey(round*200000+i), v); err != nil {
 							b.Fatal(err)
 						}
 					}

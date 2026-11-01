@@ -279,7 +279,7 @@ func (e *Engine) recover() error {
 	for id, m := range recovered {
 		t := e.mu.tables[id]
 		alloc := func() uint64 { nextFileNum++; return nextFileNum - 1 }
-		metas, err := writeTable(e.fs, t.dir, alloc, e.writerOpts, e.merger, m, t.flushBoundaries(m), e.opts.Now().Unix())
+		metas, err := writeTable(e.fs, t.dir, alloc, e.writerOpts, e.merger, m, t.flushBoundaries(m), t.opts.fragmentSize(), e.opts.Now().Unix())
 		if err != nil {
 			return err
 		}
@@ -891,7 +891,7 @@ func (e *Engine) flushOne() error {
 		e.mu.nextFileNum++
 		return e.mu.nextFileNum - 1
 	}
-	metas, err := writeTable(e.fs, t.dir, alloc, e.writerOpts, e.merger, im.mem, t.flushBoundaries(im.mem), e.opts.Now().Unix())
+	metas, err := writeTable(e.fs, t.dir, alloc, e.writerOpts, e.merger, im.mem, t.flushBoundaries(im.mem), t.opts.fragmentSize(), e.opts.Now().Unix())
 	closeAll := func() {
 		for _, m := range metas {
 			if m.reader != nil {

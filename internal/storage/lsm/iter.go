@@ -159,6 +159,10 @@ type mergingIter struct {
 	// cur holds the entries of the current key, out of the heap; they are
 	// advanced and pushed back by the next step.
 	cur []*srcEntry
+	// closeExhausted closes each source once it has no more rows (for
+	// compactions, which never reposition); closed records them.
+	closeExhausted bool
+	closed         map[source]bool
 	// entries backs the heap's entries, one per source, reused by every
 	// seek. Allocated on first use if the caller did not supply it.
 	entries []srcEntry
@@ -216,6 +220,16 @@ func (m *mergingIter) step() bool {
 			heap.Push(&m.h, e)
 		} else if err := e.src.err(); err != nil {
 			m.e = err
+		} else if m.closeExhausted {
+			// Done with this source: close it now, so a compaction can
+			// release its file before the compaction ends.
+			if err := e.src.close(); err != nil {
+				m.e = err
+			}
+			if m.closed == nil {
+				m.closed = map[source]bool{}
+			}
+			m.closed[e.src] = true
 		}
 	}
 	m.cur = m.cur[:0]
@@ -256,6 +270,9 @@ func (m *mergingIter) next() bool { return m.step() }
 func (m *mergingIter) close() error {
 	var err error
 	for _, s := range m.sources {
+		if m.closed[s] {
+			continue
+		}
 		if cerr := s.close(); err == nil {
 			err = cerr
 		}

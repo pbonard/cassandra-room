@@ -189,17 +189,20 @@ func (b *sstBuilder) abort() {
 // keys; see shardBoundaries), so no sstable crosses one. alloc returns file
 // numbers. It returns no files if the memtable is empty; on error it removes
 // what it wrote.
-func writeTable(fs vfs.FS, dir string, alloc func() uint64, wo sstable.WriterOptions, merger Merger, mem *memTable, boundaries [][]byte, created int64) ([]*fileMeta, error) {
+func writeTable(fs vfs.FS, dir string, alloc func() uint64, wo sstable.WriterOptions, merger Merger, mem *memTable, boundaries [][]byte, fragment int64, created int64) ([]*fileMeta, error) {
 	it := memIter{merger: merger, n: mem.first()}
-	return writeSharded(fs, dir, alloc, wo, merger, it.next, boundaries, created)
+	return writeSharded(fs, dir, alloc, wo, merger, it.next, boundaries, fragment, created)
 }
 
 // writeSharded writes the rows next returns, in key order, to sstables, a
-// new one starting at each shard boundary, and returns their metadata. On
-// error it removes what it wrote.
+// new one starting at each shard boundary and, with a positive fragment
+// size, at the first partition boundary past that size (so later
+// compactions can release the output piece by piece). It returns their
+// metadata; on error it removes what it wrote.
 func writeSharded(fs vfs.FS, dir string, alloc func() uint64, wo sstable.WriterOptions, merger Merger,
-	next func() (key, value []byte, trailer uint64, ok bool, err error), boundaries [][]byte, created int64) ([]*fileMeta, error) {
+	next func() (key, value []byte, trailer uint64, ok bool, err error), boundaries [][]byte, fragment int64, created int64) ([]*fileMeta, error) {
 	var out []*fileMeta
+	var lastKey []byte
 	var b *sstBuilder
 	fail := func(err error) ([]*fileMeta, error) {
 		if b != nil {
@@ -224,6 +227,9 @@ func writeSharded(fs vfs.FS, dir string, alloc func() uint64, wo sstable.WriterO
 			nextBound++
 			crossed = true
 		}
+		if !crossed && b != nil && fragment > 0 && b.w.EstimatedSize() >= uint64(fragment) && keyToken(key) != keyToken(lastKey) {
+			crossed = true
+		}
 		if crossed && b != nil {
 			meta, err := b.finish()
 			b = nil
@@ -240,6 +246,7 @@ func writeSharded(fs vfs.FS, dir string, alloc func() uint64, wo sstable.WriterO
 		if err := b.add(key, value, trailer); err != nil {
 			return fail(err)
 		}
+		lastKey = append(lastKey[:0], key...)
 	}
 	if b != nil {
 		meta, err := b.finish()

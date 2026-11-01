@@ -591,6 +591,9 @@ type compactionPick struct {
 	dropOnly bool
 	// single is a compaction of one sstable for its droppable tombstones.
 	single bool
+	// unreffed holds inputs whose reference the compaction dropped when it
+	// released them early. Guarded by Engine.mu.
+	unreffed map[*fileMeta]bool
 }
 
 // nextCompactionLocked chooses the next compaction for the table: fully
@@ -955,7 +958,9 @@ func (e *Engine) runCompaction(t *Table, p *compactionPick) {
 	defer e.mu.Unlock()
 	for _, f := range p.inputs {
 		f.compacting = false
-		f.unref()
+		if !p.unreffed[f] {
+			f.unref()
+		}
 	}
 	e.mu.compactions--
 	if err != nil && !e.mu.closed && !t.dropped.Load() {
@@ -1307,6 +1312,22 @@ func (c *compaction) installLocked(final bool) error {
 		gone[c.inputs[i]] = true
 		c.released[i] = true
 	}
+	if !final {
+		// Drop the compaction's reference on inputs released early, so
+		// their space is reclaimed once readers finish with them. Every
+		// shard's source on them is closed: a shard covering an exhausted
+		// input either finished, or has sealed output past its last key,
+		// which its source had to be advanced past (and closed) first.
+		for _, i := range release {
+			f := c.inputs[i]
+			f.obsolete.Store(true)
+			if c.p.unreffed == nil {
+				c.p.unreffed = map[*fileMeta]bool{}
+			}
+			c.p.unreffed[f] = true
+			f.unref()
+		}
+	}
 	files := slices.Clone(out)
 	var size uint64
 	for _, f := range out {
@@ -1373,7 +1394,7 @@ func (c *compaction) compactShard(s int) error {
 	var bp block.BufferPool
 	bp.Init(2*len(in)+4, block.ForCompaction)
 	defer bp.Release()
-	mi := mergingIter{merger: e.merger, upper: upper}
+	mi := mergingIter{merger: e.merger, upper: upper, closeExhausted: true}
 	defer mi.close()
 	srcInput := map[source]int{}
 	// The output's timestamp range is the union of the inputs': merging only
