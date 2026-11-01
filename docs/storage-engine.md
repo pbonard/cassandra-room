@@ -211,10 +211,14 @@ cluster layer (choosing ranges, peers and transfers) is out of scope.
   one for restoring with `Import`.
 - **Streaming out (`Table.ExportRange`):** the table is flushed first, as
   `StreamSession.addTransferRanges` flushes ("always flush on stream
-  request"), so what is sent is durable at the sender; then the rows of a
-  key range, from a read snapshot, are merged into sstables of about 64 MiB
-  in a directory the caller ships to the receiver. Cassandra streams
-  sections of existing sstables instead of rewriting them.
+  request"), so what is sent is durable at the sender. Then its sstables
+  are sent as they are, as Cassandra does: one wholly inside the range is
+  hard-linked into the caller's directory (copied if that is another file
+  system), as entire-sstable streaming sends whole files; from one that
+  crosses a bound, the section inside the range is written to a new file,
+  as Cassandra streams sstable sections. Nothing is merged: the files hold
+  row fragments, which the receiver reconciles by timestamp. Writes after
+  the flush are not sent.
 - **Streaming in (`Table.Import`, also `nodetool import`):** every file is
   read in full and validated first (the equivalent of
   `SSTableImporter`'s `extendedVerify`, which Cassandra leaves off by
@@ -362,9 +366,13 @@ differences it found were fixed or are listed.) Cell reconciliation
   strict `<` to `<=` already fails it). A row left with nothing is dropped.
 - **Cheaper than it sounds.** Compaction decodes rows only if some input's
   summary says it may hold a deletion past `gcBefore`; otherwise rows are
-  copied undecoded, as in M3.1. The lookups run only for rows with a
-  candidate, skip sources whose data is all newer than every candidate, and
-  stop at the first source at or below the oldest candidate.
+  copied undecoded, as in M3.1. When it does, one decoding per row both
+  purges it and yields its statistics (`row.PurgeAndSummarize`), into a
+  pooled scratch row. The lookups run only for rows with a candidate, skip
+  sources whose data is all newer than every candidate, stop at the first
+  source at or below the oldest candidate, read memtable fragments without
+  merging them, and reuse one point iterator per sstable for the whole
+  compaction shard (rows come in key order).
 - **Not ported: turning expired cells into tombstones.** Cassandra rewrites
   an expired cell that cannot be purged yet as a tombstone (smaller). A
   tombstone beats an expiring cell of the same timestamp, so the rewrite
@@ -537,6 +545,17 @@ compaction and in growing files):
   allocation; empty memtables are skipped.
 - **Synced writes are still slower than Pebble's** (see the M2 notes above); this
   milestone did not change the commit path.
+- *Later:* the commit pipeline (memtable nodes linked outside `commitMu`,
+  batches published in order) was tried again after M6 and measured
+  slower again in an interleaved A/B on this machine: single-writer `Put`
+  +19%, unsynced parallel puts +14%, synced within noise. It was reverted.
+  New WAL segments are now preallocated to `WALSegmentSize`, as Cassandra
+  creates commit log segments at their full size; that made no measurable
+  difference on this VM's disk, and the in-memory file system ignores it.
+  On a real disk (`BenchmarkPutParallelDisk`), synced 4-writer puts are
+  on par with Pebble's (0.94x and 1.05x in two runs): fsync dominates, and
+  most of the in-memory benchmark's gap comes from growing the WAL file in
+  memory.
 
 ### M4 results
 
