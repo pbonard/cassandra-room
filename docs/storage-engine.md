@@ -10,10 +10,12 @@ not by arrival order. It stores data in **Pebble's sstable format**, reusing
 Pebble's reader and writer. Compaction is Cassandra 5's Unified Compaction
 Strategy (UCS) per table.
 
-Status: M3 is done: Cassandra's architecture and timestamp semantics, a
-merging iterator, UCS compaction with one shard per table, and a randomized
-model test. Benchmarks against Pebble for each milestone are in section 10.
-Sections marked *planned* describe later milestones.
+Status: M6 is done: Cassandra's architecture and timestamp semantics, a
+merging iterator, UCS compaction with sharding and parallel compactions, a
+time-window mode, Cassandra's purge rules, read and on-disk snapshots,
+streaming (export and validated import) and Merkle trees for repair, all
+checked by a randomized model test with crashes. Benchmarks against Pebble
+for each milestone are in section 10.
 
 ## 1. Goals
 
@@ -23,7 +25,7 @@ Sections marked *planned* describe later milestones.
 - **Cassandra's semantics**: last-write-wins by cell timestamp, timestamped
   tombstones, TTLs, `gc_grace_seconds`.
 - **UCS compaction per table**, as in Cassandra 5, plus a time-window mode
-  for insert-only TTL tables (*planned*).
+  for insert-only TTL tables (M4).
 - **Partitions never split across sstables in a level or shard.** Shard
   boundaries are token boundaries, so this follows from the layout.
 - **Performance at least equal to the Pebble fork** on the workloads in
@@ -82,8 +84,9 @@ What Pebble's format holds for Cassandra:
   `SerializationHeader` does (*planned*, data-model layer);
 - the Bloom filter is built on the partition prefix through a `Comparer`
   whose `Split` returns its length (*planned*);
-- `Statistics.db`-style metadata (min and max timestamps, max expiry time,
-  tombstone histogram) is written by block property collectors (*planned*).
+- `Statistics.db`-style metadata (min and max timestamps, max local
+  deletion time, tombstone histogram) is recorded per sstable in the
+  manifest (M5, section 9) rather than by block property collectors.
 
 ## 4. Cassandra semantics (M2)
 
@@ -183,8 +186,53 @@ are deleted.
   same rows as point lookups. An iterator holds a reference on the table's
   read state, so sstables replaced by a compaction stay open (and on disk)
   until the last iterator using them closes.
-- **Snapshots (*planned*):** a sequence number plus a reference to a table's
-  file set.
+- **Read snapshots (M6, `Table.NewSnapshot`):** the table's read state (a
+  reference on its memtables and sstables) plus the visible sequence
+  number, which hides later writes in the memtables. Reads through the
+  snapshot (`Get`, `NewIter`) see the table as it was, whatever flushes,
+  compactions and purges happen afterwards: replaced sstables stay open and
+  on disk until the snapshot and its iterators close. Snapshots must be
+  closed before the engine.
+
+## 7a. Snapshots, streaming and repair (M6)
+
+These are the storage engine's side of Cassandra's operations; the
+cluster layer (choosing ranges, peers and transfers) is out of scope.
+
+- **On-disk snapshots (`Table.SnapshotToDisk`, `nodetool snapshot`):** the
+  table is flushed and its sstables hard-linked into
+  `snapshots/<name>/<table>/`, with a list file written last, so an
+  incomplete snapshot is recognisable. Links share space with the live
+  table until compaction replaces its files. Recovery ignores the snapshots
+  directory. `Engine.ClearSnapshot` deletes one; `Table.SnapshotFiles` lists
+  one for restoring with `Import`.
+- **Streaming out (`Table.ExportRange`):** the rows of a key range, from a
+  read snapshot, merged into sstables of about 64 MiB in a directory the
+  caller ships to the receiver. Rows exported from unsynced writes become
+  durable once imported; Cassandra flushes before streaming for the same
+  reason.
+- **Streaming in (`Table.Import`, also `nodetool import`):** every file is
+  read in full and validated first: keys strictly increasing (one entry per
+  key, as the engine's reads require), only `SET` and `MERGE` entries, rows
+  the Merger decodes; the same pass computes the file's summary. Files on
+  the engine's file system with sequence numbers below 2⁴⁸ are then
+  hard-linked in unchanged, as Cassandra's zero-copy streaming of entire
+  sstables (CASSANDRA-14556); the others are merged and rewritten, split at
+  shard boundaries. All files are installed in one manifest edit or none,
+  and a rejected file installs nothing (`TestImportRejectsBadFiles`).
+  Imported rows reconcile by timestamp like any fragment, so importing the
+  same data twice changes nothing.
+- **Repair (`Table.MerkleTree`, `MerkleTree.Diff`):** a hash tree of the
+  rows of a token range, split into `2^depth` equal leaves (Cassandra's
+  validation compaction and `MerkleTree`). Rows are hashed as reads see them
+  after purging what gc grace allows (as validation compaction does), so a
+  replica that has already purged a deletion matches one that has not.
+  `Diff` returns the differing token ranges, adjacent ones merged;
+  `TokenRange.Bounds` turns one into key bounds for `ExportRange`.
+  `TestRepair` runs a full repair between two diverged engines: after
+  streaming the differing ranges both ways their trees and rows are equal.
+- *Not done:* incremental repair (repaired/unrepaired sstable sets and
+  `repairedAt`), and with it `only_purge_repaired_tombstones`.
 
 ## 8. Compaction: UCS per table (M3, M4)
 
@@ -320,6 +368,9 @@ Checked against cassandra-5.0's `AbstractCell.purge`,
 - Crash tests with `vfs.NewCrashableMem`: crash at random points, dropping
   unsynced data, and check that every synced write survives and nothing else
   appears.
+- The model test (M6) also holds read snapshots across random operations
+  and checks them against the model as of their creation, and streams
+  random ranges out and back in (which must change nothing).
 - A randomized model test (M3, `TestModel`): random row fragments with
   out-of-order timestamps, cell tombstones and row deletions against an
   in-memory model, with random flushes, compactions (every scaling
@@ -497,6 +548,55 @@ data for its key, which tiered compaction (T4) keeps longer than Pebble's
 leveled bottom level, and every tombstone is a row with a timestamp and a
 deletion time.
 
+### M6 results (final)
+
+The plan was to benchmark against the Pebble fork at M6; the fork is not
+available to this repository, so every comparison is with upstream Pebble
+at the commit in `go.mod`. `StreamRange` (new) moves a 100k-row table to a
+second store: the engine exports and imports (validated, then linked),
+Pebble writes an external sstable from an iterator and ingests it, without
+reading it back.
+
+| Benchmark | M6 | M6 ÷ Pebble | Pebble (M6 run) |
+|---|---|---|---|
+| `Put`, one writer | 1292 ns | 0.91 | 1413 ns |
+| `Put`, 4 writers, periodic sync | 1201 ns | 0.92 | 1308 ns |
+| `Put`, 4 writers, synced | 3311 ns | 1.11 | 2982 ns |
+| `Get` from sstables | 1682 ns | **0.61** | 2755 ns |
+| `Scan100` | 8.4 µs | **0.81** | 10.4 µs |
+| `WriteSustained` | 1740 ns | 1.01 | 1721 ns |
+| `WriteSustainedTokens`, `lsm` / `lsm-sharded` | 2006 / 1752 ns | 1.05 / **0.91** | 1919 ns |
+| write amplification, `WriteSustainedTokens` `lsm-sharded` | 2.74 | **0.81** | 3.39 |
+| `DeleteHeavy`, purging / not | 2394 / 2071 ns | 1.17 / 1.01 | 2044 ns |
+| `DeleteHeavy` MiB after major compaction, purging / not | 5.06 / 7.40 | 1.20 / 1.76 | 4.20 |
+| `StreamRange` per row | 847 ns | 1.93 | 438 ns |
+
+Ratio to Pebble (same run) across milestones:
+
+| Benchmark | M3 | M3.1 | M4 | M5 | M6 |
+|---|---|---|---|---|---|
+| `Put`, one writer | 0.90 | 0.93 | 0.83 | 0.94 | 0.91 |
+| `Put`, 4 writers | 0.96 | 0.88 | 0.86 | 0.84 | 0.92 |
+| `Put`, 4 writers, synced | 1.06 | 1.18 | 1.10 | 1.20 | 1.11 |
+| `Get` | 0.68 | 0.65 | 0.60 | 0.64 | 0.61 |
+| `Scan100` | 0.84 | 0.76 | 0.78 | 0.78 | 0.81 |
+| `WriteSustained` | 1.38 | 1.06 | 1.06 | 1.04 | 1.01 |
+| `WriteSustainedTokens`, sharded | | | 0.77 | 0.85 | 0.91 |
+
+Where the engine is still slower, and why:
+
+- **Synced writes (1.1–1.2×):** the commit path inserts into the memtable
+  under the commit lock; see the M2 notes. Cassandra's default commit log
+  mode is periodic, where the engine is faster.
+- **Deletes with purging (1.17× time, 1.2× space after a major
+  compaction):** purging costs row decoding and maximum-purgeable lookups,
+  and Cassandra's rule keeps a tombstone while older data for its key may
+  remain elsewhere; see the M5 notes.
+- **Streaming (1.9×):** Import reads every file in full to validate it and
+  compute its summary before linking it in; Pebble's ingest reads only the
+  metadata. The validation is what keeps a corrupt or foreign file out of
+  the table, so it stays.
+
 ## 11. Milestones
 
 | Milestone | Contents |
@@ -508,4 +608,4 @@ deletion time.
 | **M3.1** (done) | Speed: compaction reads outside the block cache, copy-free merging iterator, WAL segment recycling, fewer read allocations. |
 | **M4** (done) | UCS sharding of flushes and compactions, overlap buckets, parallel output shards and concurrent compactions per table, time-window mode. |
 | **M5** (done) | Purge rule in compactions, per-sstable summaries in the manifest, fully expired sstable drops, single-sstable tombstone compactions. |
-| M6 | Snapshots, streaming and repair support, benchmarks against the Pebble fork. |
+| **M6** (done) | Read snapshots, on-disk snapshots, range export and validated import (linked when possible), Merkle trees for repair; final benchmarks against Pebble. |

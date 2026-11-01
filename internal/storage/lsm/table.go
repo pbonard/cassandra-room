@@ -142,12 +142,17 @@ func (t *Table) Get(key []byte) ([]byte, error) {
 	if t.dropped.Load() {
 		return nil, ErrUnknownTable
 	}
-	merger := t.e.opts.Merger
 	// Load the state before the sequence number: every sstable in the state
 	// holds only entries at or below the sequence number loaded after it.
 	s := t.acquireState()
 	defer s.release()
-	seq := t.e.visibleSeq.Load()
+	return t.getFromState(s, t.e.visibleSeq.Load(), key)
+}
+
+// getFromState looks key up in a read state, ignoring memtable entries
+// above seq.
+func (t *Table) getFromState(s *readState, seq uint64, key []byte) ([]byte, error) {
+	merger := t.e.opts.Merger
 	var acc []byte
 	found := false
 	for _, m := range s.mems {
@@ -256,7 +261,12 @@ func (t *Table) NewIter(lower, upper []byte) (*Iterator, error) {
 		return nil, ErrUnknownTable
 	}
 	s := t.acquireState()
-	seq := t.e.visibleSeq.Load()
+	return t.newIterFromState(s, t.e.visibleSeq.Load(), lower, upper)
+}
+
+// newIterFromState returns an iterator over a read state, ignoring
+// memtable entries above seq. It takes over the caller's reference on s.
+func (t *Table) newIterFromState(s *readState, seq uint64, lower, upper []byte) (*Iterator, error) {
 	it := &Iterator{s: s, lower: lower, upper: upper}
 	it.m.merger = t.e.opts.Merger
 	it.m.upper = upper

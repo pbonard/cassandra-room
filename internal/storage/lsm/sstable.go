@@ -175,6 +175,14 @@ func (b *sstBuilder) abort() {
 // what it wrote.
 func writeTable(fs vfs.FS, dir string, alloc func() uint64, wo sstable.WriterOptions, merger Merger, mem *memTable, boundaries [][]byte, created int64) ([]*fileMeta, error) {
 	it := memIter{merger: merger, n: mem.first()}
+	return writeSharded(fs, dir, alloc, wo, merger, it.next, boundaries, created)
+}
+
+// writeSharded writes the rows next returns, in key order, to sstables, a
+// new one starting at each shard boundary, and returns their metadata. On
+// error it removes what it wrote.
+func writeSharded(fs vfs.FS, dir string, alloc func() uint64, wo sstable.WriterOptions, merger Merger,
+	next func() (key, value []byte, trailer uint64, ok bool, err error), boundaries [][]byte, created int64) ([]*fileMeta, error) {
 	var out []*fileMeta
 	var b *sstBuilder
 	fail := func(err error) ([]*fileMeta, error) {
@@ -186,9 +194,9 @@ func writeTable(fs vfs.FS, dir string, alloc func() uint64, wo sstable.WriterOpt
 		}
 		return nil, err
 	}
-	next := 0 // the next boundary
+	nextBound := 0
 	for {
-		key, value, trailer, ok, err := it.next()
+		key, value, trailer, ok, err := next()
 		if err != nil {
 			return fail(err)
 		}
@@ -196,8 +204,8 @@ func writeTable(fs vfs.FS, dir string, alloc func() uint64, wo sstable.WriterOpt
 			break
 		}
 		crossed := false
-		for next < len(boundaries) && bytes.Compare(key, boundaries[next]) >= 0 {
-			next++
+		for nextBound < len(boundaries) && bytes.Compare(key, boundaries[nextBound]) >= 0 {
+			nextBound++
 			crossed = true
 		}
 		if crossed && b != nil {

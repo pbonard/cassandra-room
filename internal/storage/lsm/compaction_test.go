@@ -313,10 +313,9 @@ func runModel(t *testing.T, seed uint64) {
 		}
 		return m
 	}
-	check := func(e *Engine, frags []frag) {
-		want := merged(frags)
-		tbl, err := e.Table(1)
-		require.NoError(t, err)
+	// checkReader compares a table or a snapshot with the model's rows as of
+	// time now.
+	checkReader := func(tbl modelReader, want map[string][]byte, now int64) {
 		got := map[string][]byte{}
 		it, err := tbl.NewIter(nil, nil)
 		require.NoError(t, err)
@@ -328,7 +327,6 @@ func runModel(t *testing.T, seed uint64) {
 		if purge {
 			// Compare what reads see now: purging changes the bytes but
 			// never the live cells.
-			now := clock.Load()
 			visible := func(v []byte) []row.Cell {
 				if v == nil {
 					return nil
@@ -380,6 +378,25 @@ func runModel(t *testing.T, seed uint64) {
 			require.True(t, bytes.Equal(v, g), "get: key %s", k)
 		}
 	}
+	check := func(e *Engine, frags []frag) {
+		tbl, err := e.Table(1)
+		require.NoError(t, err)
+		checkReader(tbl, merged(frags), clock.Load())
+	}
+	// A read snapshot held across operations, with the model's rows and the
+	// time when it was taken.
+	var snap *Snapshot
+	var snapWant map[string][]byte
+	var snapNow int64
+	closeSnap := func() {
+		if snap != nil {
+			checkReader(snap, snapWant, snapNow)
+			require.NoError(t, snap.Close())
+			snap = nil
+		}
+	}
+	scratch := vfs.NewMem()
+	exports := 0
 	// gc_grace_seconds is Cassandra's bound on how late a write may arrive
 	// relative to a deletion: once a deletion (or expired cell) is past it,
 	// it may be purged, and a write arriving afterwards with an older
@@ -445,6 +462,36 @@ func runModel(t *testing.T, seed uint64) {
 		if rng.IntN(40) == 0 {
 			clock.Add(int64(1 + rng.IntN(3)))
 		}
+		switch {
+		case snap == nil && rng.IntN(150) == 0:
+			tbl, err := e.Table(1)
+			require.NoError(t, err)
+			snap, err = tbl.NewSnapshot()
+			require.NoError(t, err)
+			snapWant, snapNow = merged(written), clock.Load()
+		case snap != nil && rng.IntN(60) == 0:
+			closeSnap()
+		case rng.IntN(150) == 0:
+			// Streaming a range out and back in changes nothing: the rows
+			// reconcile with themselves. Imported sstables are durable at
+			// once, so the sender's writes are made durable first (Cassandra
+			// flushes before streaming); otherwise a crash could keep
+			// exported writes and lose earlier ones.
+			require.NoError(t, e.SyncWAL())
+			synced = slices.Clone(written)
+			tbl, err := e.Table(1)
+			require.NoError(t, err)
+			a, b := []byte(modelKey(rng.IntN(300))), []byte(modelKey(rng.IntN(300)))
+			if bytes.Compare(a, b) > 0 {
+				a, b = b, a
+			}
+			exports++
+			dir := fmt.Sprintf("x%d", exports)
+			require.NoError(t, scratch.MkdirAll(dir, 0755))
+			paths, err := tbl.ExportRange(a, b, scratch, dir)
+			require.NoError(t, err)
+			require.NoError(t, tbl.Import(scratch, paths))
+		}
 		switch p := rng.IntN(100); {
 		case p < 85:
 			key := modelKey(rng.IntN(300))
@@ -466,12 +513,14 @@ func runModel(t *testing.T, seed uint64) {
 			require.NoError(t, e.WaitForCompactions())
 			check(e, written)
 		case p < 98:
+			closeSnap()
 			require.NoError(t, e.Close())
 			e, err = Open("db", opts(fs))
 			require.NoError(t, err)
 			synced = slices.Clone(written) // Close syncs the WAL
 			check(e, written)
 		default:
+			closeSnap()
 			crashed := fs.CrashClone(vfs.CrashCloneCfg{UnsyncedDataPercent: 0})
 			require.NoError(t, e.Close())
 			fs = crashed
@@ -489,6 +538,7 @@ func runModel(t *testing.T, seed uint64) {
 			check(e, written)
 		}
 	}
+	closeSnap()
 	check(e, written)
 	m := e.Metrics()
 	t.Logf("compactions %d, tombstone compactions %d, expired sstables dropped %d",
@@ -694,4 +744,10 @@ func TestTimeWindowCompaction(t *testing.T) {
 	// The newest window follows UCS (T4): 6 flushes leave fewer than 4.
 	require.Less(t, perWindow[2], 4)
 	require.Equal(t, want, scanAll(t, tbl, nil, nil))
+}
+
+// modelReader is what the model test reads: a table or a snapshot.
+type modelReader interface {
+	Get(key []byte) ([]byte, error)
+	NewIter(lower, upper []byte) (*Iterator, error)
 }

@@ -15,6 +15,8 @@ import (
 	"github.com/cassandra-room/cassandra-room/internal/storage/row"
 	"github.com/cespare/xxhash/v2"
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
+	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/sstable/tablefilters/bloom"
 	"github.com/cockroachdb/pebble/vfs"
 )
@@ -494,5 +496,126 @@ func waitPebble(b *testing.B, db *pebble.DB) {
 	}
 	if paused {
 		b.StartTimer()
+	}
+}
+
+// BenchmarkStreamRange moves a table of 100k token-spread rows to a second
+// store, as streaming does for repair or bootstrap, and reports time per
+// row. The engine exports the rows to sstables (ExportRange) and imports
+// them (Import: validated, merged and rewritten into shards). Pebble writes
+// an external sstable from an iterator and ingests it (DB.Ingest, which
+// links the file without rewriting it).
+func BenchmarkStreamRange(b *testing.B) {
+	const rows = 100000
+	val := benchValue()
+	for _, eng := range []string{"lsm", "pebble"} {
+		b.Run(eng, func(b *testing.B) {
+			fs := vfs.NewMem()
+			switch eng {
+			case "lsm":
+				open := func(dir string) (*Engine, *Table) {
+					e, err := Open(dir, &Options{FS: fs, DisableCompactions: true})
+					if err != nil {
+						b.Fatal(err)
+					}
+					tbl, err := e.CreateTable(1)
+					if err != nil {
+						b.Fatal(err)
+					}
+					return e, tbl
+				}
+				src, st := open("src")
+				defer src.Close()
+				for i := 0; i < rows; i++ {
+					if err := src.Put(1, tokenBenchKey(i), val, NoSync); err != nil {
+						b.Fatal(err)
+					}
+				}
+				if err := st.Flush(); err != nil {
+					b.Fatal(err)
+				}
+				b.ResetTimer()
+				for n := 0; n < b.N; n++ {
+					b.StopTimer()
+					dst, dt := open(fmt.Sprintf("dst%d", n))
+					dir := fmt.Sprintf("stream%d", n)
+					if err := fs.MkdirAll(dir, 0755); err != nil {
+						b.Fatal(err)
+					}
+					b.StartTimer()
+					paths, err := st.ExportRange(nil, nil, fs, dir)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if err := dt.Import(fs, paths); err != nil {
+						b.Fatal(err)
+					}
+					b.StopTimer()
+					dst.Close()
+					b.StartTimer()
+				}
+			default:
+				c := pebble.NewCache(64 << 20)
+				defer c.Unref()
+				open := func(dir string) *pebble.DB {
+					opts := &pebble.Options{FS: fs, Cache: c, DisableAutomaticCompactions: true}
+					for i := range opts.Levels {
+						opts.Levels[i].TableFilterPolicy = func() pebble.TableFilterPolicy { return bloom.FilterPolicy(10) }
+					}
+					db, err := pebble.Open(dir, opts)
+					if err != nil {
+						b.Fatal(err)
+					}
+					return db
+				}
+				src := open("src")
+				defer src.Close()
+				for i := 0; i < rows; i++ {
+					if err := src.Set(tokenBenchKey(i), val, pebble.NoSync); err != nil {
+						b.Fatal(err)
+					}
+				}
+				if err := src.Flush(); err != nil {
+					b.Fatal(err)
+				}
+				b.ResetTimer()
+				for n := 0; n < b.N; n++ {
+					b.StopTimer()
+					dst := open(fmt.Sprintf("dst%d", n))
+					path := fmt.Sprintf("stream%d.sst", n)
+					b.StartTimer()
+					f, err := fs.Create(path, vfs.WriteCategoryUnspecified)
+					if err != nil {
+						b.Fatal(err)
+					}
+					w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
+						TableFormat:  dst.TableFormat(),
+						FilterPolicy: bloom.FilterPolicy(10),
+					})
+					it, err := src.NewIter(nil)
+					if err != nil {
+						b.Fatal(err)
+					}
+					for ok := it.First(); ok; ok = it.Next() {
+						if err := w.Set(it.Key(), it.Value()); err != nil {
+							b.Fatal(err)
+						}
+					}
+					if err := it.Close(); err != nil {
+						b.Fatal(err)
+					}
+					if err := w.Close(); err != nil {
+						b.Fatal(err)
+					}
+					if err := dst.Ingest(context.Background(), []string{path}); err != nil {
+						b.Fatal(err)
+					}
+					b.StopTimer()
+					dst.Close()
+					b.StartTimer()
+				}
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*rows), "ns/row")
+		})
 	}
 }
