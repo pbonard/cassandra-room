@@ -6,6 +6,7 @@ import (
 	"math"
 	"slices"
 	"sync/atomic"
+	"time"
 )
 
 // Table is one table's store: its memtables and sstables, in its own
@@ -27,6 +28,10 @@ type Table struct {
 	opts       TableOptions
 	// flushSize is a moving average of flush output sizes, UCS's m.
 	flushSize float64
+	// lastExpiredCheck is when fully expired sstables were last looked for.
+	lastExpiredCheck time.Time
+	// majorPending pauses background compactions while Compact waits.
+	majorPending bool
 }
 
 // immMemTable is a memtable waiting to be flushed.

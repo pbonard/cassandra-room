@@ -83,6 +83,8 @@ type Engine struct {
 	metrics       struct {
 		bytesFlushed, bytesCompacted atomic.Int64
 		flushes, compactions         atomic.Int64
+		tombstoneCompactions         atomic.Int64
+		expiredDropped               atomic.Int64
 	}
 
 	// The periodic WAL syncer (WALSyncPeriod).
@@ -268,7 +270,7 @@ func (e *Engine) recover() error {
 	for id, m := range recovered {
 		t := e.mu.tables[id]
 		alloc := func() uint64 { nextFileNum++; return nextFileNum - 1 }
-		metas, err := writeTable(e.fs, t.dir, alloc, e.writerOpts, e.merger, m, t.flushBoundaries(m))
+		metas, err := writeTable(e.fs, t.dir, alloc, e.writerOpts, e.merger, m, t.flushBoundaries(m), e.opts.Now().Unix())
 		if err != nil {
 			return err
 		}
@@ -642,6 +644,10 @@ func (e *Engine) periodicSync(period time.Duration) {
 type Metrics struct {
 	Flushes, Compactions         int64
 	BytesFlushed, BytesCompacted int64
+	// TombstoneCompactions counts single-sstable compactions run for
+	// droppable tombstones; ExpiredSSTablesDropped counts fully expired
+	// sstables deleted without being rewritten.
+	TombstoneCompactions, ExpiredSSTablesDropped int64
 	// WriteAmplification is (flushed + compacted) / flushed bytes: how many
 	// times each flushed byte was written to sstables.
 	WriteAmplification float64
@@ -654,6 +660,9 @@ func (e *Engine) Metrics() Metrics {
 		Compactions:    e.metrics.compactions.Load(),
 		BytesFlushed:   e.metrics.bytesFlushed.Load(),
 		BytesCompacted: e.metrics.bytesCompacted.Load(),
+
+		TombstoneCompactions:   e.metrics.tombstoneCompactions.Load(),
+		ExpiredSSTablesDropped: e.metrics.expiredDropped.Load(),
 	}
 	if m.BytesFlushed > 0 {
 		m.WriteAmplification = float64(m.BytesFlushed+m.BytesCompacted) / float64(m.BytesFlushed)
@@ -869,7 +878,7 @@ func (e *Engine) flushOne() error {
 		e.mu.nextFileNum++
 		return e.mu.nextFileNum - 1
 	}
-	metas, err := writeTable(e.fs, t.dir, alloc, e.writerOpts, e.merger, im.mem, t.flushBoundaries(im.mem))
+	metas, err := writeTable(e.fs, t.dir, alloc, e.writerOpts, e.merger, im.mem, t.flushBoundaries(im.mem), e.opts.Now().Unix())
 	closeAll := func() {
 		for _, m := range metas {
 			if m.reader != nil {

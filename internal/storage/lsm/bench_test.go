@@ -5,6 +5,7 @@ package lsm
 // Run with: go test -run x -bench . ./internal/storage/lsm/
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sync/atomic"
@@ -306,36 +307,7 @@ func benchWriteSustained(b *testing.B, key func(int) []byte, engines []string) {
 					if err := db.Flush(); err != nil {
 						b.Fatal(err)
 					}
-					// Wait until Pebble has no compaction running or owed, so
-					// both engines are measured after the same work. With
-					// keys spread over the key space Pebble can report a
-					// debt it never schedules a compaction for, so it is
-					// also done once it has started none for 500 ms.
-					// The timer is paused while Pebble is idle, so that
-					// wait is not measured.
-					idleSince, lastCount, paused := time.Now(), int64(-1), false
-					for {
-						m := db.Metrics()
-						if m.Compact.NumInProgress == 0 && m.Compact.EstimatedDebt == 0 {
-							break
-						}
-						if m.Compact.NumInProgress > 0 || m.Compact.Count != lastCount {
-							idleSince, lastCount = time.Now(), m.Compact.Count
-							if paused {
-								b.StartTimer()
-								paused = false
-							}
-						} else if !paused {
-							b.StopTimer()
-							paused = true
-						} else if time.Since(idleSince) > 500*time.Millisecond {
-							break
-						}
-						time.Sleep(time.Millisecond)
-					}
-					if paused {
-						b.StartTimer()
-					}
+					waitPebble(b, db)
 				}
 				wa = func() float64 {
 					// Sum the levels directly: Metrics.Total adds WAL bytes to
@@ -365,5 +337,162 @@ func benchWriteSustained(b *testing.B, key func(int) []byte, engines []string) {
 			b.StopTimer()
 			b.ReportMetric(wa(), "write-amp")
 		})
+	}
+}
+
+// BenchmarkDeleteHeavy overwrites and deletes random keys of a 200k-key,
+// token-spread key space (one operation in three is a delete), waits for
+// compactions, and reports the sstable bytes left. The engine writes
+// Cassandra tombstones with gc_grace_seconds 0, so compaction purges them
+// (and the data they shadow) once nothing older remains elsewhere; Pebble
+// deletes with its DELETE tombstones, dropped when they reach the bottom of
+// the LSM. "lsm-nopurge" keeps the default 10-day gc_grace_seconds, so
+// nothing is purged: the difference with "lsm" is what purging reclaims.
+// After the timed part, the clock moves an hour ahead (past gc grace for
+// "lsm") and both stores run a major compaction; "MiB-left" is measured
+// after it, "MiB-before-major" before.
+func BenchmarkDeleteHeavy(b *testing.B) {
+	// Every operation gets the next timestamp, so the last one wins in both
+	// stores (Cassandra reconciles by timestamp, Pebble by arrival).
+	var ts atomic.Int64
+	ts.Store(time.Now().UnixMicro())
+	value := func() []byte {
+		return row.Append(nil, &row.Row{
+			Deletion: row.Deletion{MarkedForDeleteAt: row.NoTimestamp},
+			Cells:    []row.Cell{{Column: 1, Timestamp: ts.Add(1), LocalDeletionTime: row.NoDeletionTime, Value: make([]byte, 100)}},
+		})
+	}
+	for _, eng := range []string{"lsm", "lsm-nopurge", "pebble"} {
+		b.Run(eng, func(b *testing.B) {
+			var put, del func(k []byte) error
+			var wait func()
+			var tableBytes func() float64
+			var major func() error
+			var closeFn func() error
+			switch eng {
+			case "lsm", "lsm-nopurge":
+				grace := int64(-1)
+				if eng == "lsm-nopurge" {
+					grace = 0 // the default
+				}
+				var skew atomic.Int64
+				e, err := Open("db", &Options{FS: vfs.NewMem(), MemTableBudget: 12 << 20,
+					Now:          func() time.Time { return time.Now().Add(time.Duration(skew.Load())) },
+					TableOptions: func(TableID) TableOptions { return TableOptions{GCGraceSeconds: grace} }})
+				if err != nil {
+					b.Fatal(err)
+				}
+				tbl, err := e.CreateTable(1)
+				if err != nil {
+					b.Fatal(err)
+				}
+				put = func(k []byte) error { return e.Put(1, k, value(), NoSync) }
+				del = func(k []byte) error {
+					tomb := row.Append(nil, &row.Row{
+						Deletion: row.Deletion{MarkedForDeleteAt: row.NoTimestamp},
+						Cells:    []row.Cell{{Column: 1, Timestamp: ts.Add(1), LocalDeletionTime: time.Now().Unix()}},
+					})
+					return e.Put(1, k, tomb, NoSync)
+				}
+				wait = func() {
+					if err := e.Flush(); err != nil {
+						b.Fatal(err)
+					}
+					if err := e.WaitForCompactions(); err != nil {
+						b.Fatal(err)
+					}
+				}
+				tableBytes = func() float64 {
+					var n uint64
+					e.mu.Lock()
+					for _, f := range tbl.files {
+						n += f.size
+					}
+					e.mu.Unlock()
+					return float64(n)
+				}
+				major = func() error {
+					skew.Store(int64(time.Hour))
+					return tbl.Compact()
+				}
+				closeFn = e.Close
+			default:
+				c := pebble.NewCache(64 << 20)
+				defer c.Unref()
+				opts := &pebble.Options{FS: vfs.NewMem(), Cache: c, MemTableSize: 4 << 20}
+				for i := range opts.Levels {
+					opts.Levels[i].TableFilterPolicy = func() pebble.TableFilterPolicy { return bloom.FilterPolicy(10) }
+				}
+				db, err := pebble.Open("db", opts)
+				if err != nil {
+					b.Fatal(err)
+				}
+				put = func(k []byte) error { return db.Set(k, value(), pebble.NoSync) }
+				del = func(k []byte) error { return db.Delete(k, pebble.NoSync) }
+				wait = func() {
+					if err := db.Flush(); err != nil {
+						b.Fatal(err)
+					}
+					waitPebble(b, db)
+				}
+				tableBytes = func() float64 { return float64(db.Metrics().Total().Tables.Bytes) }
+				major = func() error {
+					return db.Compact(context.Background(), []byte{0}, bytes.Repeat([]byte{0xff}, 32), true)
+				}
+				closeFn = db.Close
+			}
+			defer closeFn()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				k := tokenBenchKey((i * 7919) % 200000)
+				var err error
+				if i%3 == 2 {
+					err = del(k)
+				} else {
+					err = put(k)
+				}
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			wait()
+			b.StopTimer()
+			b.ReportMetric(tableBytes()/(1<<20), "MiB-before-major")
+			if err := major(); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportMetric(tableBytes()/(1<<20), "MiB-left")
+		})
+	}
+}
+
+// waitPebble waits until Pebble has no compaction running or owed, so both
+// engines are measured after the same work. With keys spread over the key
+// space Pebble can report a debt it never schedules a compaction for, so it
+// is also done once it has started none for 500 ms; the timer is paused
+// while it is idle, so that wait is not measured.
+func waitPebble(b *testing.B, db *pebble.DB) {
+	idleSince, lastCount, paused := time.Now(), int64(-1), false
+	for {
+		m := db.Metrics()
+		if m.Compact.NumInProgress == 0 && m.Compact.EstimatedDebt == 0 {
+			break
+		}
+		if m.Compact.NumInProgress > 0 || m.Compact.Count != lastCount {
+			idleSince, lastCount = time.Now(), m.Compact.Count
+			if paused {
+				b.StartTimer()
+				paused = false
+			}
+		} else if !paused {
+			b.StopTimer()
+			paused = true
+		} else if time.Since(idleSince) > 500*time.Millisecond {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if paused {
+		b.StartTimer()
 	}
 }

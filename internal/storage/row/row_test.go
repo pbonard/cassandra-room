@@ -2,6 +2,7 @@ package row
 
 import (
 	"bytes"
+	"math"
 	"math/rand/v2"
 	"testing"
 
@@ -151,4 +152,72 @@ func TestCanonical(t *testing.T) {
 	require.Equal(t, []Cell{live(2, 20, "new")}, d.Cells)
 	require.True(t, bytes.Equal(enc, mustMerge(t, enc, enc)))
 	require.Equal(t, []Cell{live(2, 20, "new")}, r.Live(0))
+}
+
+// TestPurgeInvisible checks the purge rule on random rows: purging a
+// compaction's merged row a, against data b stored elsewhere (maxPurgeable
+// is b's smallest timestamp), never changes the cells reads see once a and b
+// are merged, at any time from now on.
+func TestPurgeInvisible(t *testing.T) {
+	rng := rand.New(rand.NewPCG(5, 6))
+	visible := func(v []byte, now int64) []Cell {
+		if v == nil {
+			return nil
+		}
+		r, err := Decode(v)
+		require.NoError(t, err)
+		return r.Live(now)
+	}
+	purged := 0
+	for i := 0; i < 50000; i++ {
+		a, b := randomRow(rng), randomRow(rng)
+		hasB := rng.IntN(3) != 0
+		now := int64(rng.IntN(6))
+		gcBefore := now - int64(rng.IntN(3))
+		limit := int64(math.MaxInt64)
+		if hasB {
+			lo, _, ok, err := Timestamps(b)
+			require.NoError(t, err)
+			if ok {
+				limit = lo
+			}
+		}
+		calls := 0
+		p, changed, empty, err := Purge(nil, a, now, gcBefore, func(minTS, maxTS int64) (int64, error) {
+			calls++
+			// Exercise the allowed shortcut: nothing purgeable.
+			if limit <= minTS && rng.IntN(2) == 0 {
+				return math.MinInt64, nil
+			}
+			return limit, nil
+		})
+		require.NoError(t, err)
+		require.LessOrEqual(t, calls, 1)
+		if !changed {
+			require.True(t, bytes.Equal(p, a))
+		} else {
+			purged++
+		}
+		if empty {
+			p = nil
+		}
+		for _, at := range []int64{now, now + 1, now + 10} {
+			want, got := visible(a, at), visible(p, at)
+			if hasB {
+				want = visible(mustMerge(t, a, b), at)
+				if p == nil {
+					got = visible(b, at)
+				} else {
+					got = visible(mustMerge(t, p, b), at)
+				}
+			}
+			require.Equal(t, want, got, "row %d at %d", i, at)
+		}
+		s, err := Summarize(a, nil)
+		require.NoError(t, err)
+		if changed {
+			require.Less(t, s.MinLDT, gcBefore, "purged before the earliest deletion time")
+		}
+	}
+	require.Greater(t, purged, 1000)
 }

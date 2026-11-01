@@ -81,10 +81,13 @@ type sstBuilder struct {
 	computeTS    bool
 	merger       Merger
 	minTS, maxTS int64
-	n            int
+	// stats is computed from the rows with computeTS and a Purger merger,
+	// and otherwise supplied by the caller.
+	stats fileStats
+	n     int
 }
 
-func newSSTBuilder(fs vfs.FS, dir string, num uint64, wo sstable.WriterOptions, merger Merger, computeTS bool) (*sstBuilder, error) {
+func newSSTBuilder(fs vfs.FS, dir string, num uint64, wo sstable.WriterOptions, merger Merger, computeTS bool, created int64) (*sstBuilder, error) {
 	path := fs.PathJoin(dir, tableFileName(num))
 	f, err := fs.Create(path, vfs.WriteCategoryUnspecified)
 	if err != nil {
@@ -95,6 +98,7 @@ func newSSTBuilder(fs vfs.FS, dir string, num uint64, wo sstable.WriterOptions, 
 		w:         sstable.NewRawWriter(objstorageprovider.NewFileWritable(f), wo),
 		computeTS: computeTS, merger: merger,
 		minTS: math.MaxInt64, maxTS: math.MinInt64,
+		stats: newFileStats(created),
 	}, nil
 }
 
@@ -102,12 +106,24 @@ func newSSTBuilder(fs vfs.FS, dir string, num uint64, wo sstable.WriterOptions, 
 // other sstables may hold other fragments of the row.
 func (b *sstBuilder) add(key, value []byte, trailer uint64) error {
 	if b.computeTS {
-		lo, hi, has, err := b.merger.Timestamps(value)
-		if err != nil {
-			return err
-		}
-		if has {
-			b.minTS, b.maxTS = min(b.minTS, lo), max(b.maxTS, hi)
+		if p, ok := b.merger.(Purger); ok {
+			rs, err := p.Summarize(value, func(ldt int64) { b.stats.hist.add(ldt, 1) })
+			if err != nil {
+				return err
+			}
+			b.stats.add(&rs)
+			if rs.HasTS {
+				b.minTS, b.maxTS = min(b.minTS, rs.MinTS), max(b.maxTS, rs.MaxTS)
+			}
+		} else {
+			b.stats.valid = false
+			lo, hi, has, err := b.merger.Timestamps(value)
+			if err != nil {
+				return err
+			}
+			if has {
+				b.minTS, b.maxTS = min(b.minTS, lo), max(b.maxTS, hi)
+			}
 		}
 	}
 	b.n++
@@ -142,6 +158,7 @@ func (b *sstBuilder) finish() (*fileMeta, error) {
 		maxSeq:   uint64(md.SeqNums.High),
 		minTS:    b.minTS,
 		maxTS:    b.maxTS,
+		stats:    b.stats,
 	}, nil
 }
 
@@ -156,7 +173,7 @@ func (b *sstBuilder) abort() {
 // keys; see shardBoundaries), so no sstable crosses one. alloc returns file
 // numbers. It returns no files if the memtable is empty; on error it removes
 // what it wrote.
-func writeTable(fs vfs.FS, dir string, alloc func() uint64, wo sstable.WriterOptions, merger Merger, mem *memTable, boundaries [][]byte) ([]*fileMeta, error) {
+func writeTable(fs vfs.FS, dir string, alloc func() uint64, wo sstable.WriterOptions, merger Merger, mem *memTable, boundaries [][]byte, created int64) ([]*fileMeta, error) {
 	it := memIter{merger: merger, n: mem.first()}
 	var out []*fileMeta
 	var b *sstBuilder
@@ -192,7 +209,7 @@ func writeTable(fs vfs.FS, dir string, alloc func() uint64, wo sstable.WriterOpt
 			out = append(out, meta)
 		}
 		if b == nil {
-			if b, err = newSSTBuilder(fs, dir, alloc(), wo, merger, true); err != nil {
+			if b, err = newSSTBuilder(fs, dir, alloc(), wo, merger, true, created); err != nil {
 				return fail(err)
 			}
 		}

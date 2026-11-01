@@ -48,6 +48,7 @@ type fileMeta struct {
 	// table (Cassandra's Statistics.db min/max timestamp). Reads skip tables
 	// whose data is all older than a row deletion already found.
 	minTS, maxTS int64
+	stats        fileStats
 
 	// Runtime state, not part of the manifest.
 	reader *tableReader
@@ -105,6 +106,7 @@ const (
 	tagCreateTable = 6 // table
 	tagDropTable   = 7 // table
 	tagFlushedSeq  = 8 // table, seq
+	tagFileStats   = 9 // table, num, fileStats; follows the file's tagAddFile
 )
 
 var errCorruptManifest = errors.New("lsm: corrupt manifest")
@@ -134,6 +136,10 @@ func (e *versionEdit) encode() []byte {
 			b = binary.AppendVarint(b, f.maxTS)
 			b = appendInternalKey(b, f.smallest)
 			b = appendInternalKey(b, f.largest)
+			if f.stats.valid {
+				put(tagFileStats, id, f.num)
+				b = appendFileStats(b, &f.stats)
+			}
 		}
 		for _, num := range t.deleted {
 			put(tagDeleteFile, id, num)
@@ -230,6 +236,25 @@ func decodeVersionEdit(b []byte) (*versionEdit, error) {
 			f.smallest = readKey()
 			f.largest = readKey()
 			t.added = append(t.added, f)
+		case tagFileStats:
+			t := tableEditFor(TableID(readNum()))
+			num := readNum()
+			s := fileStats{valid: true, created: readVarint(), entries: readNum(), tombstones: readNum(),
+				maxLDT: readVarint(), minLDT: readVarint()}
+			n := readNum()
+			if err == nil && n > uint64(len(b)) {
+				err = errCorruptManifest
+			}
+			for i := uint64(0); i < n && err == nil; i++ {
+				s.hist.points = append(s.hist.points, readVarint())
+				s.hist.counts = append(s.hist.counts, readNum())
+			}
+			if l := len(t.added); err == nil && (l == 0 || t.added[l-1].num != num) {
+				err = fmt.Errorf("%w: stats for file %d not after it", errCorruptManifest, num)
+			}
+			if err == nil {
+				t.added[len(t.added)-1].stats = s
+			}
 		default:
 			if err == nil {
 				err = fmt.Errorf("%w: unknown tag %d", errCorruptManifest, tag)

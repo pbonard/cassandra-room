@@ -50,6 +50,22 @@ type TableOptions struct {
 	// older window into a single sstable, so whole files expire together.
 	// Output is not sharded.
 	TimeWindow time.Duration
+
+	// Purging (M5). GCGraceSeconds is gc_grace_seconds: zero uses the
+	// default, 864000 (10 days); negative means 0.
+	GCGraceSeconds int64
+	// TombstoneThreshold is tombstone_threshold: an sstable whose estimated
+	// ratio of droppable tombstones exceeds it is compacted on its own when
+	// nothing else is due. Zero uses the default, 0.2; negative disables it.
+	TombstoneThreshold float64
+	// TombstoneCompactionInterval is tombstone_compaction_interval: the
+	// minimum age of an sstable compacted for its tombstones. Zero uses the
+	// default, one day; negative means 0.
+	TombstoneCompactionInterval time.Duration
+	// ExpiredCheckInterval is expired_sstable_check_frequency_seconds: how
+	// often fully expired sstables are looked for. Zero uses the default,
+	// 10 minutes; negative checks at every opportunity.
+	ExpiredCheckInterval time.Duration
 }
 
 func (o *TableOptions) ensureDefaults() {
@@ -71,7 +87,23 @@ func (o *TableOptions) ensureDefaults() {
 	if o.SSTableGrowth == 0 {
 		o.SSTableGrowth = 0.333
 	}
+	if o.GCGraceSeconds == 0 {
+		o.GCGraceSeconds = 864000
+	}
+	if o.TombstoneThreshold == 0 {
+		o.TombstoneThreshold = 0.2
+	}
+	if o.TombstoneCompactionInterval == 0 {
+		o.TombstoneCompactionInterval = 24 * time.Hour
+	}
+	if o.ExpiredCheckInterval == 0 {
+		o.ExpiredCheckInterval = 10 * time.Minute
+	}
 }
+
+// gcBefore returns the local deletion time before which tombstones may be
+// purged.
+func (o *TableOptions) gcBefore(nowSec int64) int64 { return nowSec - max(o.GCGraceSeconds, 0) }
 
 func (o *TableOptions) sstableGrowth() float64 { return min(max(o.SSTableGrowth, 0), 1) }
 
@@ -414,6 +446,122 @@ func (t *Table) pickCompactionLocked() []*fileMeta {
 	return t.ucsPickLocked(candidates)
 }
 
+// compactionPick is a compaction to run.
+type compactionPick struct {
+	inputs []*fileMeta
+	// dropOnly deletes fully expired inputs without reading them.
+	dropOnly bool
+	// single is a compaction of one sstable for its droppable tombstones.
+	single bool
+}
+
+// nextCompactionLocked chooses the next compaction for the table: fully
+// expired sstables first (checked every ExpiredCheckInterval), then UCS's
+// (or the time-window mode's) pick, then an sstable due for its tombstones.
+func (t *Table) nextCompactionLocked() *compactionPick {
+	now := t.e.opts.Now()
+	if t.opts.ExpiredCheckInterval < 0 || now.Sub(t.lastExpiredCheck) >= t.opts.ExpiredCheckInterval {
+		t.lastExpiredCheck = now
+		if expired := t.fullyExpiredLocked(now.Unix()); len(expired) > 0 {
+			return &compactionPick{inputs: expired, dropOnly: true}
+		}
+	}
+	if inputs := t.pickCompactionLocked(); len(inputs) >= 2 {
+		return &compactionPick{inputs: inputs}
+	}
+	if f := t.dueFileLocked(now.Unix()); f != nil {
+		return &compactionPick{inputs: []*fileMeta{f}, single: true}
+	}
+	return nil
+}
+
+// fullyExpiredLocked follows CompactionController.getFullyExpiredSSTables:
+// sstables whose every part is deleted or expired before gcBefore (maximum
+// local deletion time) and whose newest data is older than all data
+// overlapping them elsewhere (other sstables and memtables). Their
+// deletions shadow nothing stored elsewhere and their data is invisible, so
+// they can be deleted without being read.
+func (t *Table) fullyExpiredLocked(nowSec int64) []*fileMeta {
+	gcBefore := t.opts.gcBefore(nowSec)
+	var candidates []*fileMeta
+	for _, f := range t.files {
+		if !f.compacting && f.stats.valid && f.stats.maxLDT < gcBefore && f.stats.maxLDT <= nowSec {
+			candidates = append(candidates, f)
+		}
+	}
+	var expired []*fileMeta
+	for _, c := range candidates {
+		minOther := t.memtableMinTSLocked(c.smallest.UserKey, c.largest.UserKey)
+		for _, f := range t.files {
+			if slices.Contains(candidates, f) ||
+				bytes.Compare(f.largest.UserKey, c.smallest.UserKey) < 0 ||
+				bytes.Compare(f.smallest.UserKey, c.largest.UserKey) > 0 {
+				continue
+			}
+			minOther = min(minOther, f.minTS)
+		}
+		if c.maxTS < minOther {
+			expired = append(expired, c)
+		}
+	}
+	return expired
+}
+
+// memtableScanLimit bounds the memtable entries memtableMinTSLocked reads;
+// past it the memtables are assumed to hold arbitrarily old data.
+const memtableScanLimit = 4096
+
+// memtableMinTSLocked returns the smallest timestamp of the memtables'
+// entries in [lo, hi], math.MaxInt64 if there are none, or math.MinInt64 if
+// that cannot be told cheaply.
+func (t *Table) memtableMinTSLocked(lo, hi []byte) int64 {
+	mems := []*memTable{t.mem}
+	for _, im := range t.imm {
+		mems = append(mems, im.mem)
+	}
+	minTS, n := int64(math.MaxInt64), 0
+	for _, m := range mems {
+		for nd := m.seekGE(lo, math.MaxUint64); nd != nil && bytes.Compare(nd.key, hi) <= 0; nd = nd.next() {
+			if n++; n > memtableScanLimit {
+				return math.MinInt64
+			}
+			ts, _, ok, err := t.e.merger.Timestamps(nd.value)
+			if err != nil {
+				return math.MinInt64
+			}
+			if ok {
+				minTS = min(minTS, ts)
+			}
+		}
+	}
+	return minTS
+}
+
+// dueFileLocked returns the sstable with the highest estimated ratio of
+// droppable tombstones, if it exceeds TombstoneThreshold and the sstable is
+// older than TombstoneCompactionInterval (Cassandra's single-sstable
+// tombstone compactions, AbstractCompactionStrategy.worthDroppingTombstones).
+func (t *Table) dueFileLocked(nowSec int64) *fileMeta {
+	if t.opts.TombstoneThreshold < 0 {
+		return nil
+	}
+	gcBefore := t.opts.gcBefore(nowSec)
+	maxCreated := nowSec - int64(max(t.opts.TombstoneCompactionInterval, 0)/time.Second)
+	var best *fileMeta
+	bestRatio := t.opts.TombstoneThreshold
+	for _, f := range t.files {
+		// A file written in this second is never due, so a file whose
+		// tombstones cannot be dropped yet is not rewritten in a loop.
+		if f.compacting || !f.stats.valid || f.stats.created > maxCreated || f.stats.created >= nowSec {
+			continue
+		}
+		if r := f.stats.droppableRatio(gcBefore); r > bestRatio {
+			best, bestRatio = f, r
+		}
+	}
+	return best
+}
+
 // maybeScheduleCompactionsLocked starts compactions, round-robin across
 // tables, up to MaxConcurrentCompactions. A table may run several at once:
 // each pick excludes files other compactions use, and UCS's buckets do not
@@ -434,28 +582,31 @@ func (e *Engine) maybeScheduleCompactionsLocked() {
 				return
 			}
 			t := e.mu.tables[id]
-			inputs := t.pickCompactionLocked()
-			if len(inputs) < 2 {
+			if t.majorPending {
 				continue
 			}
-			for _, f := range inputs {
+			p := t.nextCompactionLocked()
+			if p == nil {
+				continue
+			}
+			for _, f := range p.inputs {
 				f.compacting = true
 				f.refs.Add(1)
 			}
 			e.mu.compactions++
 			e.compactWG.Add(1)
-			go e.runCompaction(t, inputs)
+			go e.runCompaction(t, p)
 			progress = true
 		}
 	}
 }
 
-func (e *Engine) runCompaction(t *Table, inputs []*fileMeta) {
+func (e *Engine) runCompaction(t *Table, p *compactionPick) {
 	defer e.compactWG.Done()
-	err := e.compact(t, inputs)
+	err := e.compact(t, p)
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	for _, f := range inputs {
+	for _, f := range p.inputs {
 		f.compacting = false
 		f.unref()
 	}
@@ -465,6 +616,55 @@ func (e *Engine) runCompaction(t *Table, inputs []*fileMeta) {
 	}
 	e.mu.cond.Broadcast()
 	e.maybeScheduleCompactionsLocked()
+}
+
+// Compact runs a major compaction of the table (Cassandra's nodetool
+// compact): it flushes, waits for the table's running compactions, then
+// merges all of its sstables, purging what the purge rule allows, into one
+// set of shards. Background compactions of the table pause meanwhile.
+func (t *Table) Compact() error {
+	if err := t.Flush(); err != nil {
+		return err
+	}
+	e := t.e
+	e.mu.Lock()
+	t.majorPending = true
+	defer func() {
+		e.mu.Lock()
+		t.majorPending = false
+		e.maybeScheduleCompactionsLocked()
+		e.mu.Unlock()
+	}()
+	for {
+		if err := e.checkUsableLocked(); err != nil {
+			e.mu.Unlock()
+			return err
+		}
+		if t.dropped.Load() {
+			e.mu.Unlock()
+			return ErrUnknownTable
+		}
+		if !slices.ContainsFunc(t.files, func(f *fileMeta) bool { return f.compacting }) {
+			break
+		}
+		e.mu.cond.Wait()
+	}
+	files := slices.Clone(t.files)
+	if len(files) == 0 {
+		e.mu.Unlock()
+		return nil
+	}
+	for _, f := range files {
+		f.compacting = true
+		f.refs.Add(1)
+	}
+	e.mu.compactions++
+	e.compactWG.Add(1)
+	e.mu.Unlock()
+	e.runCompaction(t, &compactionPick{inputs: files})
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.checkUsableLocked()
 }
 
 // errCompactionAborted stops a compaction when the engine closes or the
@@ -507,17 +707,26 @@ func (t *Table) outputShards(inputs []*fileMeta) [][2][]byte {
 
 // compact merges the inputs into one sstable per output shard and installs
 // them in one manifest edit. Fragments of each key are merged with the
-// Merger; nothing is purged yet (M5).
-func (e *Engine) compact(t *Table, inputs []*fileMeta) error {
-	shards := t.outputShards(inputs)
+// Merger, and what the purge rule allows is dropped (see
+// writeCompactionShard). A drop-only pick installs no output.
+func (e *Engine) compact(t *Table, p *compactionPick) error {
+	inputs := p.inputs
+	var shards [][2][]byte
+	if !p.dropOnly {
+		shards = t.outputShards(inputs)
+	}
 	outs := make([]*fileMeta, len(shards))
 	errs := make([]error, len(shards))
+	inputNums := map[uint64]bool{}
+	for _, f := range inputs {
+		inputNums[f.num] = true
+	}
 	run := func(i int) {
 		e.compactionSem <- struct{}{}
 		defer func() { <-e.compactionSem }()
-		outs[i], errs[i] = e.writeCompactionShard(t, inputs, shards[i][0], shards[i][1])
+		outs[i], errs[i] = e.writeCompactionShard(t, inputs, inputNums, shards[i][0], shards[i][1])
 	}
-	if t.opts.SerialOutputShards || len(shards) == 1 {
+	if t.opts.SerialOutputShards || len(shards) <= 1 {
 		for i := range shards {
 			if run(i); errs[i] != nil {
 				break
@@ -593,13 +802,24 @@ func (e *Engine) compact(t *Table, inputs []*fileMeta) error {
 	}
 	t.publishLocked()
 	e.metrics.bytesCompacted.Add(int64(size))
-	e.metrics.compactions.Add(1)
+	switch {
+	case p.dropOnly:
+		e.metrics.expiredDropped.Add(int64(len(inputs)))
+	case p.single:
+		e.metrics.tombstoneCompactions.Add(1)
+	default:
+		e.metrics.compactions.Add(1)
+	}
 	return nil
 }
 
 // writeCompactionShard merges the inputs' rows in [lower, upper) into one
 // sstable, or returns nil if there are none.
-func (e *Engine) writeCompactionShard(t *Table, inputs []*fileMeta, lower, upper []byte) (*fileMeta, error) {
+//
+// Rows are purged (row.Purge) when some input may hold a deletion older than
+// gcBefore; otherwise rows are copied without being decoded, and the output's
+// timestamps and summary are bounded by the inputs'.
+func (e *Engine) writeCompactionShard(t *Table, inputs []*fileMeta, inputNums map[uint64]bool, lower, upper []byte) (*fileMeta, error) {
 	var in []*fileMeta
 	for _, f := range inputs {
 		if (upper == nil || bytes.Compare(f.smallest.UserKey, upper) < 0) &&
@@ -631,15 +851,36 @@ func (e *Engine) writeCompactionShard(t *Table, inputs []*fileMeta, lower, upper
 		minTS, maxTS = min(minTS, f.minTS), max(maxTS, f.maxTS)
 	}
 
+	nowSec := e.opts.Now().Unix()
+	gcBefore := t.opts.gcBefore(nowSec)
+	purger, _ := e.merger.(Purger)
+	purge := false
+	if purger != nil {
+		for _, f := range in {
+			// Files without a summary may hold anything.
+			if !f.stats.valid || (f.stats.minLDT < gcBefore && f.stats.minLDT <= nowSec) {
+				purge = true
+			}
+		}
+	}
+
 	e.mu.Lock()
 	num := e.mu.nextFileNum
 	e.mu.nextFileNum++
 	e.mu.Unlock()
-	b, err := newSSTBuilder(e.fs, t.dir, num, e.writerOpts, e.merger, false)
+	b, err := newSSTBuilder(e.fs, t.dir, num, e.writerOpts, e.merger, purge, nowSec)
 	if err != nil {
 		return nil, err
 	}
-	b.minTS, b.maxTS = minTS, maxTS
+	if !purge {
+		b.minTS, b.maxTS = minTS, maxTS
+		if purger != nil {
+			b.stats = unionStats(nowSec, in)
+		} else {
+			b.stats = fileStats{}
+		}
+	}
+	var purged []byte
 	ok := false
 	if lower == nil {
 		ok = mi.first()
@@ -651,7 +892,24 @@ func (e *Engine) writeCompactionShard(t *Table, inputs []*fileMeta, lower, upper
 			b.abort()
 			return nil, errCompactionAborted
 		}
-		if err := b.add(mi.key, mi.value, mi.trailer); err != nil {
+		value := mi.value
+		if purge {
+			key := mi.key
+			out, changed, empty, err := purger.Purge(purged[:0], value, nowSec, gcBefore, func(minTS, maxTS int64) (int64, error) {
+				return e.maxPurgeable(t, inputNums, key, minTS, maxTS)
+			})
+			if err != nil {
+				b.abort()
+				return nil, err
+			}
+			if empty {
+				continue
+			}
+			if changed {
+				purged, value = out, out
+			}
+		}
+		if err := b.add(mi.key, value, mi.trailer); err != nil {
 			b.abort()
 			return nil, err
 		}
@@ -669,6 +927,61 @@ func (e *Engine) writeCompactionShard(t *Table, inputs []*fileMeta, lower, upper
 		return nil, err
 	}
 	return out, nil
+}
+
+// maxPurgeable returns the smallest timestamp of key's data outside a
+// compaction (DeletionPurger's maxPurgeableTimestamp): in every memtable,
+// including entries not yet visible to readers, and in every sstable of the
+// table's current state other than the compaction's inputs. A deletion
+// older than that cannot shadow anything stored elsewhere.
+//
+// Only the decision for deletions with timestamps in [minTS, maxTS]
+// matters: sources whose data is all newer than maxTS are skipped, and once
+// a source at or below minTS is found nothing can be purged, so it returns
+// math.MinInt64.
+//
+// As in Cassandra, a write arriving later with an older timestamp than a
+// purged deletion is not shadowed by it: gc_grace_seconds is the bound on
+// how late such writes (hints, repair) may arrive.
+func (e *Engine) maxPurgeable(t *Table, inputs map[uint64]bool, key []byte, minTS, maxTS int64) (int64, error) {
+	s := t.acquireState()
+	defer s.release()
+	limit := int64(math.MaxInt64)
+	note := func(v []byte) error {
+		lo, _, ok, err := e.merger.Timestamps(v)
+		if ok {
+			limit = min(limit, lo)
+		}
+		return err
+	}
+	for _, m := range s.mems {
+		v, ok, err := m.getMerged(e.merger, key, math.MaxUint64, nil)
+		if err == nil && ok {
+			err = note(v)
+		}
+		if err != nil {
+			return 0, err
+		}
+		if limit <= minTS {
+			return math.MinInt64, nil
+		}
+	}
+	for _, f := range s.files {
+		if inputs[f.num] || f.minTS >= limit || f.minTS > maxTS || !f.mayContain(key) {
+			continue
+		}
+		v, ok, err := f.reader.getMerged(e.merger, key, nil)
+		if err == nil && ok {
+			err = note(v)
+		}
+		if err != nil {
+			return 0, err
+		}
+		if limit <= minTS {
+			return math.MinInt64, nil
+		}
+	}
+	return limit, nil
 }
 
 // openFile opens an sstable of the table and fills in its runtime fields.

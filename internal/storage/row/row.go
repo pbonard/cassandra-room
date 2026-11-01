@@ -355,3 +355,134 @@ func (Merger) Timestamps(v []byte) (minTS, maxTS int64, ok bool, err error) {
 
 // DeletedAt implements lsm.Merger.
 func (Merger) DeletedAt(v []byte) (int64, error) { return DeletedAt(v) }
+
+// Stats summarises a row for sstable metadata (Cassandra's
+// MetadataCollector: timestamps, local deletion times, tombstones).
+type Stats struct {
+	// MinTS and MaxTS are the smallest and largest timestamps, counting the
+	// row deletion; HasTS is false for an empty row.
+	MinTS, MaxTS int64
+	HasTS        bool
+	// MaxLDT is the largest local deletion time, NoDeletionTime if the row
+	// has a live (non-expiring) cell: once MaxLDT is in the past, every part
+	// of the row is deleted or expired.
+	MaxLDT int64
+	// Tombstones counts cell tombstones, expiring cells and the row
+	// deletion: the parts that become droppable at their local deletion
+	// time (the expiry time, for expiring cells).
+	Tombstones int
+	// MinLDT is the earliest local deletion time of those parts, or
+	// NoDeletionTime if there are none: nothing in the row can be purged
+	// before MinLDT.
+	MinLDT int64
+}
+
+// Summarize returns the row's Stats. If ldt is not nil, it is called with
+// the local deletion time of every tombstone, expiring cell and row deletion
+// (for the tombstone drop-time histogram).
+func Summarize(v []byte, ldt func(int64)) (Stats, error) {
+	d := newDecoder(v)
+	s := Stats{MinTS: math.MaxInt64, MaxTS: math.MinInt64, MaxLDT: math.MinInt64, MinLDT: NoDeletionTime}
+	droppable := func(t int64) {
+		s.Tombstones++
+		s.MinLDT = min(s.MinLDT, t)
+		s.MaxLDT = max(s.MaxLDT, t)
+		if ldt != nil {
+			ldt(t)
+		}
+	}
+	if !d.deletion.IsLive() {
+		s.MinTS, s.MaxTS, s.HasTS = d.deletion.MarkedForDeleteAt, d.deletion.MarkedForDeleteAt, true
+		droppable(d.deletion.LocalDeletionTime)
+	}
+	var c Cell
+	for d.next(&c) {
+		s.MinTS, s.MaxTS, s.HasTS = min(s.MinTS, c.Timestamp), max(s.MaxTS, c.Timestamp), true
+		if c.LocalDeletionTime == NoDeletionTime {
+			s.MaxLDT = NoDeletionTime
+		} else {
+			droppable(c.LocalDeletionTime)
+		}
+	}
+	return s, d.err
+}
+
+// Purge drops from row v what Cassandra's compaction purges
+// (AbstractCell.purge, DeletionPurger.shouldPurge): tombstones, expired
+// cells and a row deletion whose local deletion time is before gcBefore and
+// whose timestamp is below maxPurgeable, the smallest timestamp of the row's
+// data outside the compaction. Such a deletion cannot shadow anything still
+// stored elsewhere, so dropping it never changes what reads return.
+// maxPurgeable is called at most once, only if something is a candidate,
+// with the smallest and largest candidate timestamps: it may skip data newer
+// than maxTS (it decides nothing), and may return math.MinInt64 as soon as
+// it finds data at or below minTS (then nothing can be purged).
+//
+// Unlike Cassandra, expired cells that cannot be purged yet are not turned
+// into tombstones: a tombstone beats an expiring cell of the same
+// timestamp, so the conversion could hide a later-expiring cell stored
+// elsewhere.
+//
+// It appends the result to dst; empty reports that purging left nothing (no
+// cells and no row deletion), so the row can be dropped. If nothing is
+// purged, it returns v itself, and changed and empty are false.
+func Purge(dst, v []byte, nowSec, gcBefore int64, maxPurgeable func(minTS, maxTS int64) (int64, error)) (out []byte, changed, empty bool, err error) {
+	d := newDecoder(v)
+	candidate := func(ldt int64) bool { return ldt < gcBefore && ldt <= nowSec }
+	cand := false
+	minTS, maxTS := int64(math.MaxInt64), int64(math.MinInt64)
+	note := func(ts int64) { cand, minTS, maxTS = true, min(minTS, ts), max(maxTS, ts) }
+	if !d.deletion.IsLive() && candidate(d.deletion.LocalDeletionTime) {
+		note(d.deletion.MarkedForDeleteAt)
+	}
+	var c Cell
+	for d.next(&c) {
+		if c.LocalDeletionTime != NoDeletionTime && !c.IsLive(nowSec) && candidate(c.LocalDeletionTime) {
+			note(c.Timestamp)
+		}
+	}
+	if d.err != nil {
+		return nil, false, false, d.err
+	}
+	if !cand {
+		return v, false, false, nil
+	}
+	limit, err := maxPurgeable(minTS, maxTS)
+	if err != nil {
+		return nil, false, false, err
+	}
+	shouldPurge := func(ts, ldt int64) bool { return candidate(ldt) && ts < limit }
+	r, err := Decode(v)
+	if err != nil {
+		return nil, false, false, err
+	}
+	if !r.Deletion.IsLive() && shouldPurge(r.Deletion.MarkedForDeleteAt, r.Deletion.LocalDeletionTime) {
+		r.Deletion = Deletion{MarkedForDeleteAt: NoTimestamp}
+		changed = true
+	}
+	kept := r.Cells[:0]
+	for _, c := range r.Cells {
+		if c.LocalDeletionTime != NoDeletionTime && !c.IsLive(nowSec) && shouldPurge(c.Timestamp, c.LocalDeletionTime) {
+			changed = true
+			continue
+		}
+		kept = append(kept, c)
+	}
+	r.Cells = kept
+	if !changed {
+		return v, false, false, nil
+	}
+	empty = len(r.Cells) == 0 && r.Deletion.IsLive()
+	if empty {
+		return dst, true, true, nil
+	}
+	return Append(dst, r), true, false, nil
+}
+
+// Summarize implements lsm.Purger.
+func (Merger) Summarize(v []byte, ldt func(int64)) (Stats, error) { return Summarize(v, ldt) }
+
+// Purge implements lsm.Purger.
+func (Merger) Purge(dst, v []byte, nowSec, gcBefore int64, maxPurgeable func(minTS, maxTS int64) (int64, error)) ([]byte, bool, bool, error) {
+	return Purge(dst, v, nowSec, gcBefore, maxPurgeable)
+}

@@ -77,6 +77,9 @@ type Options struct {
 	// DisableCompactions turns automatic compactions off (for tests and
 	// benchmarks).
 	DisableCompactions bool
+	// Now is the clock used to decide what is expired and purgeable.
+	// Defaults to time.Now.
+	Now func() time.Time
 }
 
 // Merger reconciles row fragments. The engine stores every write as a
@@ -122,6 +125,9 @@ func (o *Options) ensureDefaults() {
 	}
 	if o.Merger == nil {
 		o.Merger = row.Merger{}
+	}
+	if o.Now == nil {
+		o.Now = time.Now
 	}
 	if o.MaxConcurrentCompactions <= 0 {
 		o.MaxConcurrentCompactions = min(max(runtime.NumCPU()/2, 2), 8)

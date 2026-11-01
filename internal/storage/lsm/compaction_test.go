@@ -2,12 +2,14 @@ package lsm
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"os"
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -251,9 +253,18 @@ func runModel(t *testing.T, seed uint64) {
 		}
 		return k
 	}
+	// A controlled clock. Seeds with purge (seed%3 != 0) use a short
+	// gc_grace_seconds, so deletions and expired cells are purged, expired
+	// sstables dropped and sstables compacted for their tombstones; the
+	// others keep the default 10 days, so nothing is purged and rows must
+	// match the model byte for byte.
+	var clock atomic.Int64
+	clock.Store(1000)
+	purge := seed%3 != 0
 	fs := vfs.NewCrashableMem()
 	opts := func(fs vfs.FS) *Options {
 		return &Options{
+			Now:            func() time.Time { return time.Unix(clock.Load(), 0) },
 			FS:             fs,
 			MemTableBudget: int64(16<<10 + rng.IntN(64<<10)),
 			WALSegmentSize: 8 << 10,
@@ -270,6 +281,11 @@ func runModel(t *testing.T, seed uint64) {
 				}
 				if seed%5 == 4 {
 					o.TimeWindow = 20 * time.Microsecond // timestamps are 0..99
+				}
+				if purge {
+					o.GCGraceSeconds = []int64{-1, 5}[seed%2]
+					o.TombstoneCompactionInterval = 2 * time.Second
+					o.ExpiredCheckInterval = -1
 				}
 				return o
 			},
@@ -309,27 +325,115 @@ func runModel(t *testing.T, seed uint64) {
 		}
 		require.NoError(t, it.Error())
 		require.NoError(t, it.Close())
-		require.Equal(t, len(want), len(got))
+		if purge {
+			// Compare what reads see now: purging changes the bytes but
+			// never the live cells.
+			now := clock.Load()
+			visible := func(v []byte) []row.Cell {
+				if v == nil {
+					return nil
+				}
+				r, err := row.Decode(v)
+				require.NoError(t, err)
+				return r.Live(now)
+			}
+			for k := range got {
+				if _, ok := want[k]; !ok {
+					require.Empty(t, visible(got[k]), "scan: key %x not in the model", k)
+				}
+			}
+			for k, v := range want {
+				require.Equal(t, visible(v), visible(got[k]), "scan: key %x", k)
+				g, err := tbl.Get([]byte(k))
+				if errors.Is(err, ErrNotFound) {
+					g, err = nil, nil
+				}
+				require.NoError(t, err)
+				require.Equal(t, visible(v), visible(g), "get: key %x", k)
+			}
+			return
+		}
+		// Without purging, rows match byte for byte. Empty rows (no cells,
+		// no deletion) carry nothing and may be dropped: an sstable of them
+		// counts as fully expired.
+		empty := func(v []byte) bool {
+			r, err := row.Decode(v)
+			require.NoError(t, err)
+			return len(r.Cells) == 0 && r.Deletion.IsLive()
+		}
+		for k, v := range got {
+			if _, ok := want[k]; !ok {
+				require.True(t, empty(v), "scan: key %s not in the model", k)
+			}
+		}
 		for k, v := range want {
-			require.True(t, bytes.Equal(v, got[k]), "scan: key %s", k)
 			g, err := tbl.Get([]byte(k))
+			if empty(v) {
+				require.True(t, errors.Is(err, ErrNotFound) || (err == nil && bytes.Equal(v, g)), "get: key %s", k)
+				if gv, ok := got[k]; ok {
+					require.True(t, bytes.Equal(v, gv), "scan: key %s", k)
+				}
+				continue
+			}
+			require.True(t, bytes.Equal(v, got[k]), "scan: key %s", k)
 			require.NoError(t, err)
 			require.True(t, bytes.Equal(v, g), "get: key %s", k)
 		}
 	}
-	randomFrag := func() []byte {
+	// gc_grace_seconds is Cassandra's bound on how late a write may arrive
+	// relative to a deletion: once a deletion (or expired cell) is past it,
+	// it may be purged, and a write arriving afterwards with an older
+	// timestamp is not shadowed. So with purge, a new write's timestamps
+	// exceed those of the key's deletions already past gc grace; they are
+	// still out of order otherwise.
+	grace := int64(864000)
+	if purge {
+		grace = max([]int64{-1, 5}[seed%2], 0)
+	}
+	tsFloor := func(key string) int64 {
+		if !purge {
+			return 0
+		}
+		now := clock.Load()
+		floor := int64(0)
+		for _, f := range written {
+			if f.key != key {
+				continue
+			}
+			r, err := row.Decode(f.v)
+			require.NoError(t, err)
+			if d := r.Deletion; !d.IsLive() && d.LocalDeletionTime < now-grace {
+				floor = max(floor, d.MarkedForDeleteAt+1)
+			}
+			for _, c := range r.Cells {
+				if c.LocalDeletionTime != row.NoDeletionTime && c.LocalDeletionTime < now-grace && c.LocalDeletionTime <= now {
+					floor = max(floor, c.Timestamp+1)
+				}
+			}
+		}
+		return floor
+	}
+	randomFrag := func(key string) []byte {
+		now := clock.Load()
+		floor := tsFloor(key)
 		r := row.Row{Deletion: row.Deletion{MarkedForDeleteAt: row.NoTimestamp}}
 		if rng.IntN(15) == 0 {
-			r.Deletion = row.Deletion{MarkedForDeleteAt: int64(rng.IntN(100)), LocalDeletionTime: int64(rng.IntN(5))}
+			r.Deletion = row.Deletion{MarkedForDeleteAt: floor + int64(rng.IntN(100)), LocalDeletionTime: now - int64(rng.IntN(5))}
 		}
 		for col := uint32(0); col < 4; col++ {
 			if rng.IntN(2) == 0 {
 				continue
 			}
-			ts := int64(rng.IntN(100)) // out of order on purpose
-			if rng.IntN(5) == 0 {
-				r.Cells = append(r.Cells, row.Cell{Column: col, Timestamp: ts, LocalDeletionTime: int64(rng.IntN(5))})
-			} else {
+			ts := floor + int64(rng.IntN(100)) // out of order on purpose
+			switch rng.IntN(10) {
+			case 0, 1:
+				r.Cells = append(r.Cells, row.Cell{Column: col, Timestamp: ts, LocalDeletionTime: now - int64(rng.IntN(5))})
+			case 2:
+				// Expiring, some already expired.
+				ttl := uint32(1 + rng.IntN(20))
+				r.Cells = append(r.Cells, row.Cell{Column: col, Timestamp: ts, TTL: ttl,
+					LocalDeletionTime: now - 5 + int64(rng.IntN(15)), Value: []byte(fmt.Sprint(rng.IntN(1000)))})
+			default:
 				r.Cells = append(r.Cells, row.Cell{Column: col, Timestamp: ts, LocalDeletionTime: row.NoDeletionTime,
 					Value: []byte(fmt.Sprint(rng.IntN(1000)))})
 			}
@@ -338,9 +442,13 @@ func runModel(t *testing.T, seed uint64) {
 	}
 
 	for op := 0; op < 3000; op++ {
+		if rng.IntN(40) == 0 {
+			clock.Add(int64(1 + rng.IntN(3)))
+		}
 		switch p := rng.IntN(100); {
 		case p < 85:
-			f := frag{modelKey(rng.IntN(300)), randomFrag()}
+			key := modelKey(rng.IntN(300))
+			f := frag{key, randomFrag(key)}
 			sync := rng.IntN(20) == 0
 			wo := NoSync
 			if sync {
@@ -382,6 +490,9 @@ func runModel(t *testing.T, seed uint64) {
 		}
 	}
 	check(e, written)
+	m := e.Metrics()
+	t.Logf("compactions %d, tombstone compactions %d, expired sstables dropped %d",
+		m.Compactions, m.TombstoneCompactions, m.ExpiredSSTablesDropped)
 	require.NoError(t, e.Close())
 }
 

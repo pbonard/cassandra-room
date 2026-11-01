@@ -242,9 +242,10 @@ and `unified/Controller.java`.
   read state; each input file is closed and deleted when its last reader
   releases it. After a crash, recovery deletes sstables the manifest does
   not reference, so a compaction is either fully installed or invisible.
-- **Fully expired sstables** (*planned*) are dropped without rewriting, checked every 10
-  minutes (`CompactionController.getFullyExpiredSSTables`, used by every
-  Cassandra strategy).
+- **Fully expired sstables (M5)** are dropped without rewriting, checked
+  every `ExpiredCheckInterval` (10 minutes, `expired_sstable_check_frequency_seconds`;
+  `CompactionController.getFullyExpiredSSTables`, used by every Cassandra
+  strategy). See section 9.
 - **Time-window mode (M4, `TableOptions.TimeWindow`):** for insert-only
   TTL tables, as Cassandra's `TimeWindowCompactionStrategy`: sstables are
   grouped by the window of their maximum write timestamp; the newest window
@@ -253,15 +254,65 @@ and `unified/Controller.java`.
   Output is not sharded, so a window ends as one file that expires as a
   whole.
 
-## 9. Purging (*planned*, M5)
+## 9. Purging (M5)
 
-- **Purge rule (Cassandra's):** a tombstone older than `gc_grace_seconds` is
-  dropped if no sstable outside the compaction overlaps its key with older
-  data (checked with Bloom filters and per-file timestamp ranges) and no
-  memtable holds the key.
-- **Due sstables:** the Pebble fork's per-file summary and `IsFileDue` carry
-  over, so files whose tombstones become due (by time or by repair
-  watermark) are compacted even when UCS would not pick them.
+Checked against cassandra-5.0's `AbstractCell.purge`,
+`DeletionPurger`, `CompactionController.getPurgeEvaluator` and
+`getFullyExpiredSSTables`.
+
+- **Purge rule.** A compaction drops a cell tombstone, an expired cell or a
+  row deletion when its local deletion time (the expiry time, for expiring
+  cells) is before `gcBefore = now − gc_grace_seconds` and its timestamp is
+  below the row's *maximum purgeable timestamp*: the smallest timestamp of
+  the row's data outside the compaction, in every memtable (including
+  entries not yet visible to readers) and in every sstable of the table's
+  current state that may hold the key (key range, then a point lookup that
+  starts with the Bloom filter). Such a deletion cannot shadow anything
+  still stored, so dropping it never changes what reads return, now or
+  later (`row.TestPurgeInvisible` checks this on random rows; changing the
+  strict `<` to `<=` already fails it). A row left with nothing is dropped.
+- **Cheaper than it sounds.** Compaction decodes rows only if some input's
+  summary says it may hold a deletion past `gcBefore`; otherwise rows are
+  copied undecoded, as in M3.1. The lookups run only for rows with a
+  candidate, skip sources whose data is all newer than every candidate, and
+  stop at the first source at or below the oldest candidate.
+- **Not ported: turning expired cells into tombstones.** Cassandra rewrites
+  an expired cell that cannot be purged yet as a tombstone (smaller). A
+  tombstone beats an expiring cell of the same timestamp, so the rewrite
+  could hide a later-expiring cell stored elsewhere; the engine keeps the
+  expired cell until it can be purged.
+- **The gc grace contract.** As in Cassandra, a write that arrives after a
+  deletion was purged, with an older timestamp than the deletion, is not
+  shadowed by it: `gc_grace_seconds` bounds how late writes (hints, repair)
+  may arrive. The model test generates writes accordingly.
+- **Summaries.** Every sstable records, in the manifest, its creation time,
+  row count, number of droppable parts (tombstones, expiring cells, row
+  deletions), the smallest and largest local deletion times (the largest
+  is "never" if any cell is live), and a 32-bin streaming histogram of drop
+  times (as Cassandra's `TombstoneHistogram`). Flushes and purging
+  compactions compute them exactly; compactions that copy rows undecoded
+  combine the inputs' (upper bounds on counts, safe bounds on times). Files
+  from before M5 have none and are never dropped or picked for tombstones.
+- **Fully expired sstables.** An sstable whose largest local deletion time
+  is before `gcBefore`, and whose newest data is older than all data
+  overlapping it in other sstables and memtables, is deleted without being
+  read. Memtables are checked by scanning the overlapping range, up to 4096
+  entries (beyond that the sstable is kept).
+- **Due sstables.** When UCS (or the time-window mode) picks nothing, an
+  sstable older than `TombstoneCompactionInterval` (one day) whose estimated
+  ratio of droppable parts exceeds `TombstoneThreshold` (0.2) is compacted
+  on its own (`worthDroppingTombstones`). A file written in the current
+  second is never due, so a file whose tombstones cannot be dropped yet is
+  not rewritten in a loop.
+- **Row existence.** The row codec has no primary-key liveness (Cassandra's
+  row marker): a row with no cells and no deletion is empty and may be
+  dropped. The schema layer must represent `INSERT` of a key alone with a
+  cell (for example an empty marker column).
+- **Major compaction (`Table.Compact`):** Cassandra's `nodetool compact`:
+  flush, wait for the table's running compactions (pausing new ones), then
+  merge and purge all of its sstables into one set of shards.
+- *Not done:* repair-aware purging (`only_purge_repaired_tombstones`) needs
+  repaired-state tracking (section 11).
 
 ## 10. Testing and benchmarks
 
@@ -413,6 +464,39 @@ Write amplification of `WriteSustained` rose from 2.81 to 3.05: buckets now
 take in every sstable that transitively overlaps the triggering set, as
 Cassandra's do, so compactions are larger; it stays level with Pebble's.
 
+### M5 results
+
+`DeleteHeavy` overwrites and deletes random keys of a 200k-key token-spread
+key space (one operation in three is a delete; every operation carries the
+next timestamp, so the last one wins in both stores), waits for
+compactions, then moves the clock an hour ahead and runs a major
+compaction. `lsm` uses `gc_grace_seconds` 0; `lsm-nopurge` keeps the
+default 10 days, so the difference is what purging reclaims. Pebble deletes
+with its own tombstones. The other benchmarks were unchanged within noise.
+
+| Benchmark | M5 | M5 ÷ Pebble | Pebble (M5 run) |
+|---|---|---|---|
+| `Put`, one writer | 1194 ns | 0.94 | 1269 ns |
+| `Put`, 4 writers, periodic sync | 1097 ns | 0.84 | 1303 ns |
+| `Put`, 4 writers, synced | 3309 ns | 1.20 | 2747 ns |
+| `Get` from sstables | 1571 ns | 0.64 | 2461 ns |
+| `Scan100` | 8.5 µs | 0.78 | 11.0 µs |
+| `WriteSustained` | 1699 ns | 1.04 | 1628 ns |
+| `WriteSustainedTokens`, `lsm` / `lsm-sharded` | 1814 / 1547 ns | 1.00 / 0.85 | 1810 ns |
+| `DeleteHeavy`, `lsm` (purging) | 2506 ns | 1.26 | 1992 ns |
+| `DeleteHeavy`, `lsm-nopurge` | 2130 ns | 1.07 | 1992 ns |
+| `DeleteHeavy` sstable MiB before major compaction, `lsm` / `lsm-nopurge` | 7.05 / 11.41 | 1.45 / 2.35 | 4.85 |
+| `DeleteHeavy` sstable MiB after major compaction, `lsm` / `lsm-nopurge` | 5.06 / 7.40 | 1.20 / 1.76 | 4.20 |
+
+Purging costs 18% on this workload (decoding rows of compactions that may
+hold purgeable deletions, and the point lookups for maximum purgeable
+timestamps) and saves 38% of the space before the major compaction. What
+remains above Pebble is Cassandra's model rather than overhead: a
+tombstone stays while any sstable outside the compaction may hold older
+data for its key, which tiered compaction (T4) keeps longer than Pebble's
+leveled bottom level, and every tombstone is a row with a timestamp and a
+deletion time.
+
 ## 11. Milestones
 
 | Milestone | Contents |
@@ -423,5 +507,5 @@ Cassandra's do, so compactions are larger; it stays level with Pebble's.
 | **M3** (done) | Merging iterator, UCS for one shard per table, model test, reference-counted read states. |
 | **M3.1** (done) | Speed: compaction reads outside the block cache, copy-free merging iterator, WAL segment recycling, fewer read allocations. |
 | **M4** (done) | UCS sharding of flushes and compactions, overlap buckets, parallel output shards and concurrent compactions per table, time-window mode. |
-| M5 | Purge rule, collector summaries, due-file picking. |
+| **M5** (done) | Purge rule in compactions, per-sstable summaries in the manifest, fully expired sstable drops, single-sstable tombstone compactions. |
 | M6 | Snapshots, streaming and repair support, benchmarks against the Pebble fork. |
