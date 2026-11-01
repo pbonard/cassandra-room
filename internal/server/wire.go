@@ -483,4 +483,3 @@ func skipStringList(b []byte, pos int) (int, error) {
 	}
 	return pos, nil
 }
-

@@ -30,8 +30,9 @@ type benchStore interface {
 	put(key, value []byte, sync bool) error
 	get(key []byte) error
 	flush() error
-	// compact rewrites everything into the fewest files; the engine has no
-	// compaction yet and already holds one file per flush.
+	// compact leaves each key in one file. The benchmarks write every key
+	// once and flush once, so the engine already holds one file; Pebble
+	// moves its flushed file down with a manual compaction.
 	compact() error
 	close() error
 }
@@ -78,7 +79,7 @@ func (s pebbleStore) close() error { return s.db.Close() }
 func openBench(b *testing.B, engine string) benchStore {
 	switch engine {
 	case "lsm":
-		e, err := Open("db", &Options{FS: vfs.NewMem()})
+		e, err := Open("db", &Options{FS: vfs.NewMem(), DisableCompactions: true})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -88,8 +89,9 @@ func openBench(b *testing.B, engine string) benchStore {
 		}
 		return lsmStore{e, tbl}
 	default:
-		// Compactions are off: the engine has none yet. Pebble gets the same
-		// block cache size and Bloom filters as the engine's defaults.
+		// Automatic compactions are off for the read and write benchmarks;
+		// BenchmarkWriteSustained measures them. Pebble gets the same block
+		// cache size and Bloom filters as the engine's defaults.
 		c := pebble.NewCache(64 << 20)
 		defer c.Unref()
 		opts := &pebble.Options{FS: vfs.NewMem(), Cache: c, DisableAutomaticCompactions: true}

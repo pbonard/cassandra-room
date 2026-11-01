@@ -10,9 +10,10 @@ not by arrival order. It stores data in **Pebble's sstable format**, reusing
 Pebble's reader and writer. Compaction is Cassandra 5's Unified Compaction
 Strategy (UCS) per table.
 
-Status: M2 is done: Cassandra's architecture and timestamp semantics, with
-the speed fixes in section 10. Sections marked *planned* describe later
-milestones.
+Status: M3 is done: Cassandra's architecture and timestamp semantics, a
+merging iterator, UCS compaction with one shard per table, and a randomized
+model test. Benchmarks against Pebble for each milestone are in section 10.
+Sections marked *planned* describe later milestones.
 
 ## 1. Goals
 
@@ -111,7 +112,7 @@ repair, hinted handoff and client-supplied timestamps cause routinely. So:
   read stops once a row deletion shadows the next sstable's newest data, as
   Cassandra's single-partition reads do. TTL expiry is decided by the reader
   (`row.Row.Live(now)`), not stored.
-- **Compaction will merge fragments with the same function** (M3).
+- **Compaction merges fragments with the same function** (M3).
 - **Pebble's `DELETE`, `SINGLEDEL` and `RANGEDEL` are never used for user
   data**: they hide older entries by sequence number, which would let an
   older tombstone delete newer data.
@@ -173,12 +174,16 @@ are deleted.
   Bloom filter may contain the key contribute fragments, which are merged
   (section 4). sstables are visited by maximum timestamp and skipped once a
   row deletion shadows them. Blocks come from the block cache.
-- **Iterators (*planned*, M3):** a merging iterator over a table's memtables
-  and the sstables of the shards that overlap the bounds.
+- **Iterators (M3):** `Table.NewIter(lower, upper)` merges a table's
+  memtables and the sstables whose key ranges overlap the bounds, combining
+  every source's fragment of a row with the `Merger`, so a scan returns the
+  same rows as point lookups. An iterator holds a reference on the table's
+  read state, so sstables replaced by a compaction stay open (and on disk)
+  until the last iterator using them closes.
 - **Snapshots (*planned*):** a sequence number plus a reference to a table's
   file set.
 
-## 8. Compaction: UCS per table (*planned*, M3–M4)
+## 8. Compaction: UCS per table (M3; sharding M4)
 
 The rules follow Cassandra 5's Unified Compaction Strategy, checked against
 the cassandra-5.0 branch (commit 3e6d5ca):
@@ -200,9 +205,17 @@ and `unified/Controller.java`.
   `m·F^n`, where `m` is the flush size.
 - **Trigger:** within a level, sstables are grouped into overlapping sets; a
   set with `T` or more sstables is compacted.
-- **Sharding:** output is cut at token boundaries, so a partition is never
-  split, and compactions in different shards run in parallel.
-- **Fully expired sstables** are dropped without rewriting, checked every 10
+- **Sharding** (*planned*, M4): output is cut at token boundaries, so a
+  partition is never split, and compactions in different shards run in
+  parallel. In M3 every table has one shard, so density is file size and a
+  table runs at most one compaction at a time (`MaxConcurrentCompactions`
+  bounds compactions across tables).
+- **Installing a compaction (M3):** the output is written and synced, then
+  one manifest edit adds it and deletes the inputs. Readers switch to the new
+  read state; each input file is closed and deleted when its last reader
+  releases it. After a crash, recovery deletes sstables the manifest does
+  not reference, so a compaction is either fully installed or invisible.
+- **Fully expired sstables** (*planned*) are dropped without rewriting, checked every 10
   minutes (`CompactionController.getFullyExpiredSSTables`, used by every
   Cassandra strategy).
 - **Time-window mode** (*planned*): sstables grouped by maximum write
@@ -224,9 +237,11 @@ and `unified/Controller.java`.
 - Crash tests with `vfs.NewCrashableMem`: crash at random points, dropping
   unsynced data, and check that every synced write survives and nothing else
   appears.
-- A randomized model test (*planned*, M3): random operations against the
-  engine and an in-memory model, with random flushes, compactions, reopens
-  and crashes.
+- A randomized model test (M3, `TestModel`): random row fragments with
+  out-of-order timestamps, cell tombstones and row deletions against an
+  in-memory model, with random flushes, compactions (every scaling
+  parameter class), reopens and crashes; every scan and point lookup must
+  equal the model byte for byte, and no synced write may be lost.
 - Benchmarks against Pebble on the same workload, re-run after each
   milestone.
 
@@ -268,6 +283,25 @@ What changed in M2, from CPU and allocation profiles:
   lock-free insertion is kept and tested for later use. Cassandra's default
   commit log mode is periodic, where the engine is faster than Pebble.
 
+### Results from M3 on (4-core Xeon, Linux)
+
+The figures above came from an Apple M-series laptop. From M3 on, the
+benchmarks run on a 4-vCPU Intel Xeon (2.1 GHz) Linux VM, so they are not
+comparable with the table above. Each figure is the median of 6 runs
+(`benchstat`); this machine is noisier, with spreads of 5–20%.
+`WriteSustained` runs with `-benchtime=1000000x`. The engine's read and
+write benchmarks run with `DisableCompactions`, like Pebble's.
+
+| Benchmark | M3 | Pebble | Notes |
+|---|---|---|---|
+| `Put`, one writer, periodic sync | 1149 ns | 1272 ns | |
+| `Put`, 4 writers, periodic sync | 1232 ns | 1288 ns | |
+| `Put`, 4 writers, synced | 3135 ns | **2954 ns** | |
+| `Get` from sstables | **1708 ns** | 2525 ns | |
+| `Scan100` (seek, then 100 rows) | **8.9 µs** | 10.6 µs | |
+| `WriteSustained` (with compactions) | 2289 ns | **1659 ns** | |
+| `WriteSustained` write amplification | **2.50** | 2.93 | UCS T4 against Pebble's leveled |
+
 ## 11. Milestones
 
 | Milestone | Contents |
@@ -275,7 +309,7 @@ What changed in M2, from CPU and allocation profiles:
 | **M1** (done) | WAL, memtable, flush to sstables, manifest, recovery, point lookups, for one key space. |
 | **M1.5** (done) | Cassandra's architecture: one WAL with segments and a memory budget, per-table memtables, sstables and directories, create and drop table. |
 | **M2** (done) | Cassandra's timestamp semantics (row codec, merge on read and flush, timestamp-ordered reads); periodic and group commit log sync; the speed fixes in section 10. |
-| M3 | Merging iterator, UCS for one shard per table, model test. |
+| **M3** (done) | Merging iterator, UCS for one shard per table, model test, reference-counted read states. |
 | M4 | UCS sharding, parallel compactions, time-window mode. |
 | M5 | Purge rule, collector summaries, due-file picking. |
 | M6 | Snapshots, streaming and repair support, benchmarks against the Pebble fork. |
