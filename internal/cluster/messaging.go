@@ -39,6 +39,8 @@ const (
 	VerbLWTPropose
 	VerbLWTCommit
 	VerbStreamPush
+	VerbReadDigest
+	VerbCounterMutation
 )
 
 // Handler handles a request and returns the response payload.

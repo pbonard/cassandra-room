@@ -21,6 +21,7 @@ import (
 // testCluster is a cluster of in-process nodes, each with its own
 // in-memory file system that survives restarts.
 type testCluster struct {
+	dcs   []string // data center per node ("" for the default)
 	t     *testing.T
 	fs    []vfs.FS
 	addrs []string
@@ -34,8 +35,8 @@ func freeAddr(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-func newTestCluster(t *testing.T, n int) *testCluster {
-	c := &testCluster{t: t}
+func newTestCluster(t *testing.T, n int, dcs ...string) *testCluster {
+	c := &testCluster{t: t, dcs: dcs}
 	for i := 0; i < n; i++ {
 		c.fs = append(c.fs, vfs.NewMem())
 		c.addrs = append(c.addrs, freeAddr(t))
@@ -66,7 +67,11 @@ func (c *testCluster) add() int {
 }
 
 func (c *testCluster) startReplacing(i int, replace string) {
-	d, err := Open("db", Options{FS: c.fs[i], Address: net.IPv4(127, 0, 0, byte(1+i)), Cluster: &ClusterOptions{
+	o := Options{FS: c.fs[i], Address: net.IPv4(127, 0, 0, byte(1+i))}
+	if i < len(c.dcs) {
+		o.DataCenter = c.dcs[i]
+	}
+	d, err := Open("db", Options{FS: o.FS, Address: o.Address, DataCenter: o.DataCenter, Cluster: &ClusterOptions{
 		ListenAddress: c.addrs[i], Seeds: []string{c.addrs[0]}, NumTokens: 8, ReplaceAddress: replace,
 		Membership:   testMembership(),
 		WriteTimeout: time.Second, ReadTimeout: time.Second,
@@ -521,4 +526,61 @@ func TestClusterOperations(t *testing.T) {
 	require.ElementsMatch(t, oldTokens, me.Tokens)
 	c.checkReplicas(200)
 	require.Len(t, c.values(2, all, "SELECT k FROM ks.kv"), 200)
+}
+
+// TestClusterEachQuorum checks EACH_QUORUM across two data centers.
+func TestClusterEachQuorum(t *testing.T) {
+	c := newTestCluster(t, 3, "dc1", "dc1", "dc2")
+	each := primitive.ConsistencyLevelEachQuorum
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': 2, 'dc2': 1}")
+	c.ok(0, quorum, "CREATE TABLE ks.kv (k int PRIMARY KEY, v text)")
+	for i := 0; i < 20; i++ {
+		c.ok(i%3, each, "INSERT INTO ks.kv (k, v) VALUES (?, 'x')", i)
+	}
+	require.Len(t, c.values(1, each, "SELECT k FROM ks.kv"), 20)
+	require.Equal(t, []string{"x"}, c.values(2, each, "SELECT v FROM ks.kv WHERE k = 3"))
+	// dc2 down: EACH_QUORUM is unavailable, QUORUM (2 of 3) is not.
+	c.stop(2)
+	require.Eventually(t, func() bool { return !c.nodes[0].proxy.g.IsAlive(c.addrs[2]) }, 5*time.Second, 10*time.Millisecond)
+	_, ok := c.exec(0, each, "INSERT INTO ks.kv (k, v) VALUES (1, 'y')").(*message.Unavailable)
+	require.True(t, ok)
+	_, ok = c.exec(0, each, "SELECT v FROM ks.kv WHERE k = 1").(*message.Unavailable)
+	require.True(t, ok)
+	c.ok(0, quorum, "INSERT INTO ks.kv (k, v) VALUES (1, 'y')")
+	c.ok(1, primitive.ConsistencyLevelLocalQuorum, "INSERT INTO ks.kv (k, v) VALUES (2, 'y')")
+}
+
+// TestClusterCounters updates counters of many partitions per statement
+// (IN, counter batches) from every coordinator concurrently.
+func TestClusterCounters(t *testing.T) {
+	c := newTestCluster(t, 3)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
+	c.ok(0, quorum, "CREATE TABLE ks.cnt (k int PRIMARY KEY, n counter)")
+	var wg sync.WaitGroup
+	for w := 0; w < 6; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 10; i++ {
+				c.ok(w%3, quorum, "UPDATE ks.cnt SET n = n + 1 WHERE k IN (1, 2, 3, 4, 5, 6, 7, 8)")
+				c.ok(w%3, quorum, "BEGIN COUNTER BATCH UPDATE ks.cnt SET n = n + 2 WHERE k = 1; UPDATE ks.cnt SET n = n + 3 WHERE k = 9; UPDATE ks.cnt SET n = n + 1 WHERE k = 1; APPLY BATCH")
+			}
+		}()
+	}
+	wg.Wait()
+	for n := range c.nodes {
+		got := c.values(n, quorum, "SELECT k, n FROM ks.cnt")
+		want := []string{}
+		for _, k := range []int{5, 1, 2, 8, 9, 3, 4, 7, 6} {
+			v := 60
+			switch k {
+			case 1:
+				v = 60 + 180
+			case 9:
+				v = 180
+			}
+			want = append(want, fmt.Sprintf("%d %s", k, string([]byte{0, 0, 0, 0, 0, 0, byte(v >> 8), byte(v)})))
+		}
+		require.ElementsMatch(t, want, got, "node %d", n)
+	}
 }

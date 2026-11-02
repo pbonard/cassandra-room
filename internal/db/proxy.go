@@ -3,6 +3,7 @@ package db
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -54,6 +55,7 @@ type proxy struct {
 	m      *cluster.Messaging
 	g      *cluster.Gossiper
 	cms    *cluster.CMS
+	lat    readLatency
 	// initialCMS are the metadata service's members before the metadata
 	// records any.
 	initialCMS []string
@@ -144,10 +146,12 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	p := &proxy{d: d, m: m, opts: *o, self: m.Addr(), stopCh: make(chan struct{})}
 	m.Handle(cluster.VerbMutation, p.handleMutation)
 	m.Handle(cluster.VerbReadRow, p.handleReadRow)
+	m.Handle(cluster.VerbReadDigest, p.handleReadDigest)
 	m.Handle(cluster.VerbReadRange, p.handleReadRange)
 	m.Handle(cluster.VerbExecute, p.handleExecute)
 	m.Handle(cluster.VerbRepair, p.handleRepair)
 	m.Handle(cluster.VerbStreamPush, p.handleStreamPush)
+	m.Handle(cluster.VerbCounterMutation, p.handleCounterMutation)
 	for _, v := range []cluster.Verb{cluster.VerbLWTPrepare, cluster.VerbLWTPropose, cluster.VerbLWTCommit} {
 		m.Handle(v, p.handlePaxos(v))
 	}
@@ -450,6 +454,87 @@ func (p *proxy) replicas(k *Keyspace, token int64, cl primitive.ConsistencyLevel
 	return append(up, down...), len(up)
 }
 
+// ackNeed is what a consistency level needs from a partition's replicas:
+// a number of responses, or, for EACH_QUORUM under NetworkTopologyStrategy,
+// a number per data center.
+type ackNeed struct {
+	total int
+	perDC map[string]int
+}
+
+// acks counts responses, in total and per data center.
+type acks struct {
+	total int
+	perDC map[string]int
+}
+
+func (a *acks) add(n *cluster.Node) {
+	a.total++
+	if a.perDC == nil {
+		a.perDC = map[string]int{}
+	}
+	a.perDC[n.DataCenter]++
+}
+
+func (n ackNeed) met(a acks) bool {
+	if n.perDC != nil {
+		for dc, need := range n.perDC {
+			if a.perDC[dc] < need {
+				return false
+			}
+		}
+		return true
+	}
+	return a.total >= n.total
+}
+
+// need returns what cl requires of a partition's replicas, pending ones
+// included (ConsistencyLevel.blockForWrite counts every pending replica).
+func (p *proxy) need(cl primitive.ConsistencyLevel, k *Keyspace, pending []*cluster.Node) ackNeed {
+	_, perDC := cluster.ReplicationFactor(k.Replication)
+	if cl == primitive.ConsistencyLevelEachQuorum && len(perDC) > 0 {
+		n := ackNeed{perDC: map[string]int{}}
+		for dc, rf := range perDC {
+			n.perDC[dc] = rf/2 + 1
+		}
+		for _, r := range pending {
+			n.perDC[r.DataCenter]++
+		}
+		return n
+	}
+	n := ackNeed{total: blockFor(cl, k, p.d.opts.DataCenter)}
+	for _, r := range pending {
+		local := cl == primitive.ConsistencyLevelLocalQuorum || cl == primitive.ConsistencyLevelLocalOne || cl == primitive.ConsistencyLevelLocalSerial
+		if cl != primitive.ConsistencyLevelAny && (!local || r.DataCenter == p.d.opts.DataCenter) {
+			n.total++
+		}
+	}
+	return n
+}
+
+// count is the total number of responses needed.
+func (n ackNeed) count() int {
+	if n.perDC == nil {
+		return n.total
+	}
+	t := 0
+	for _, x := range n.perDC {
+		t += x
+	}
+	return t
+}
+
+// liveAcks counts the live nodes among nodes, as acks.
+func (p *proxy) liveAcks(nodes []*cluster.Node) acks {
+	var a acks
+	for _, n := range nodes {
+		if p.up(n) {
+			a.add(n)
+		}
+	}
+	return a
+}
+
 // blockFor is the number of replica responses a consistency level needs
 // (ConsistencyLevel.blockFor).
 func blockFor(cl primitive.ConsistencyLevel, k *Keyspace, localDC string) int {
@@ -554,8 +639,9 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 		return nil
 	}
 	type group struct {
-		need, acks int
-		reps       []*cluster.Node
+		need ackNeed
+		acks acks
+		reps []*cluster.Node // natural and pending
 	}
 	groups := map[string]*group{} // by keyspace and token
 	perNode := map[string][]write{}
@@ -570,30 +656,27 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 		gk := k.Name + "/" + strconv.FormatInt(w.token, 10)
 		g := groups[gk]
 		if g == nil {
-			reps, live := p.replicas(k, w.token, cl)
-			g = &group{need: blockFor(cl, k, p.d.opts.DataCenter), reps: reps}
-			if live < g.need && cl != primitive.ConsistencyLevelAny {
-				return &unavailableError{cl: cl, required: g.need, alive: live}
+			reps, _ := p.replicas(k, w.token, cl)
+			// Nodes joining or taking over the range get the write too, and
+			// must acknowledge it on top of the consistency level.
+			pending := p.pendingReplicas(k, w.token, reps)
+			g = &group{need: p.need(cl, k, pending), reps: append(reps, pending...)}
+			if live := p.liveAcks(g.reps); !g.need.met(live) && cl != primitive.ConsistencyLevelAny {
+				return &unavailableError{cl: cl, required: g.need.count(), alive: live.total}
 			}
 			groups[gk] = g
-			for _, r := range reps {
-				writeGroups[r.Addr] = append(writeGroups[r.Addr], g)
+			for _, r := range g.reps {
+				if p.up(r) { // (a replaced node may share its address with its replacement)
+					writeGroups[r.Addr] = append(writeGroups[r.Addr], g)
+				}
 			}
 		}
 		for _, r := range g.reps {
-			nodes[r.Addr] = r
 			if p.up(r) {
+				nodes[r.Addr] = r
 				perNode[r.Addr] = append(perNode[r.Addr], w)
 			} else {
 				hints = append(hints, hint{hostID: r.HostID, w: w})
-			}
-		}
-		// Nodes joining or taking over the range get the write too, not
-		// counted for the consistency level.
-		for _, r := range p.pendingReplicas(k, w.token, g.reps) {
-			if p.g.IsAlive(r.Addr) {
-				nodes[r.Addr] = r
-				perNode[r.Addr] = append(perNode[r.Addr], w)
 			}
 		}
 	}
@@ -617,7 +700,7 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 	}
 	satisfied := func() bool {
 		for _, g := range groups {
-			if g.acks < g.need {
+			if !g.need.met(g.acks) {
 				return false
 			}
 		}
@@ -638,7 +721,7 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 				continue
 			}
 			for _, g := range writeGroups[a.addr] {
-				g.acks++
+				g.acks.add(nodes[a.addr])
 			}
 		case <-ctx.Done():
 			pending = nil
@@ -667,8 +750,8 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 		}
 		minAcks, need := 1<<30, 0
 		for _, g := range groups {
-			if g.acks < minAcks {
-				minAcks, need = g.acks, g.need
+			if !g.need.met(g.acks) && g.acks.total < minAcks {
+				minAcks, need = g.acks.total, g.need.count()
 			}
 		}
 		return &timeoutError{write: true, cl: cl, received: minAcks, blockFor: need, batch: len(groups) > 1}
@@ -829,19 +912,84 @@ func (p *proxy) handleReadRow(_ string, payload []byte) ([]byte, error) {
 	return append([]byte{1}, v...), nil
 }
 
-// readTargets returns the replicas to read token from: blockFor live
-// replicas, this node first.
-func (s *distSource) readTargets(token int64) ([]*cluster.Node, int, error) {
+// readTargets returns the live replicas to read token from, this node
+// first (for EACH_QUORUM, a quorum of each data center first), and what
+// the consistency level needs of them.
+func (s *distSource) readTargets(token int64) ([]*cluster.Node, ackNeed, error) {
 	reps, live := s.p.replicas(s.k, token, s.cl)
-	need := blockFor(s.cl, s.k, s.p.d.opts.DataCenter)
-	if live < need {
-		return nil, 0, &unavailableError{cl: s.cl, required: need, alive: live}
+	reps = reps[:live]
+	need := s.p.need(s.cl, s.k, nil)
+	if a := s.p.liveAcks(reps); !need.met(a) {
+		return nil, need, &unavailableError{cl: s.cl, required: need.count(), alive: a.total}
 	}
-	return reps[:live], need, nil
+	if need.perDC != nil {
+		var first, rest []*cluster.Node
+		taken := map[string]int{}
+		for _, r := range reps {
+			if taken[r.DataCenter] < need.perDC[r.DataCenter] {
+				taken[r.DataCenter]++
+				first = append(first, r)
+			} else {
+				rest = append(rest, r)
+			}
+		}
+		reps = append(first, rest...)
+	}
+	return reps, need, nil
 }
 
-// get reads a row from blockFor replicas, merges their fragments, and
-// repairs the replicas that returned less (blocking read repair).
+// readLatency tracks replica read latencies for speculative retry.
+type readLatency struct {
+	mu      sync.Mutex
+	samples [256]time.Duration
+	n       int
+	p99     atomic.Int64
+}
+
+func (l *readLatency) add(d time.Duration) {
+	l.mu.Lock()
+	l.samples[l.n%len(l.samples)] = d
+	l.n++
+	if l.n%32 == 0 {
+		c := slices.Clone(l.samples[:min(l.n, len(l.samples))])
+		slices.Sort(c)
+		l.p99.Store(int64(c[len(c)*99/100]))
+	}
+	l.mu.Unlock()
+}
+
+// threshold is when to speculate: the 99th percentile of replica reads
+// (speculative_retry = 99p), 50ms until enough reads were seen.
+func (l *readLatency) threshold(timeout time.Duration) time.Duration {
+	t := time.Duration(l.p99.Load())
+	if t <= 0 {
+		t = 50 * time.Millisecond
+	}
+	return min(max(t, time.Millisecond), timeout/2)
+}
+
+func rowDigest(found bool, v []byte) []byte {
+	if !found {
+		return []byte{0}
+	}
+	h := sha256.Sum256(v)
+	return append([]byte{1}, h[:16]...)
+}
+
+func (p *proxy) handleReadDigest(from string, payload []byte) ([]byte, error) {
+	b, err := p.handleReadRow(from, payload)
+	if err != nil {
+		return nil, err
+	}
+	return rowDigest(b[0] == 1, b[1:]), nil
+}
+
+// get reads a row (a ReadCommand on one partition key): the full row from
+// one replica and digests from the others needed. Matching digests answer
+// at once; a mismatch reads the full row from every replica that answered,
+// merges, and repairs those that returned less (blocking read repair). A
+// replica slower than the usual 99th percentile, or failing, gets another
+// replica asked in its place (speculative retry).
 func (s *distSource) get(key []byte) ([]byte, error) {
 	reps, need, err := s.readTargets(tokenOf(key))
 	if err != nil {
@@ -850,46 +998,129 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.p.opts.ReadTimeout)
 	defer cancel()
 	type resp struct {
-		addr  string
-		found bool
-		v     []byte
-		err   error
+		node   *cluster.Node
+		data   bool
+		found  bool
+		v      []byte // the row, or the digest
+		err    error
+		digest []byte
 	}
 	ch := make(chan resp, len(reps))
-	ask := func(r *cluster.Node) {
-		b, err := s.p.m.Request(ctx, r.Addr, cluster.VerbReadRow, encodeKey(s.id, key))
+	payload := encodeKey(s.id, key)
+	ask := func(r *cluster.Node, data bool) {
+		start := time.Now()
+		verb := cluster.VerbReadDigest
+		if data {
+			verb = cluster.VerbReadRow
+		}
+		b, err := s.p.m.Request(ctx, r.Addr, verb, payload)
 		if err == nil && len(b) == 0 {
 			err = errors.New("empty response")
 		}
 		if err != nil {
-			ch <- resp{addr: r.Addr, err: err}
+			ch <- resp{node: r, data: data, err: err}
 			return
 		}
-		ch <- resp{addr: r.Addr, found: b[0] == 1, v: b[1:]}
+		s.p.lat.add(time.Since(start))
+		if data {
+			ch <- resp{node: r, data: true, found: b[0] == 1, v: b[1:], digest: rowDigest(b[0] == 1, b[1:])}
+		} else {
+			ch <- resp{node: r, digest: b}
+		}
 	}
-	for _, r := range reps[:need] {
-		go ask(r)
+	initial := need.count()
+	go ask(reps[0], true)
+	for _, r := range reps[1:initial] {
+		go ask(r, false)
 	}
-	next := need
+	next, outstanding := initial, initial
 	var got []resp
-	for len(got) < need {
+	var answered acks
+	haveData := false
+	speculate := time.NewTimer(s.p.lat.threshold(s.p.opts.ReadTimeout))
+	defer speculate.Stop()
+	timeout := func() error {
+		return &timeoutError{cl: s.cl, received: answered.total, blockFor: need.count()}
+	}
+	for !(haveData && need.met(answered)) {
 		select {
 		case r := <-ch:
+			outstanding--
 			if r.err != nil {
-				if next < len(reps) {
-					go ask(reps[next]) // speculative retry on another replica
+				// Ask another replica in its place (of the same data center
+				// for EACH_QUORUM).
+				for next < len(reps) && need.perDC != nil && reps[next].DataCenter != r.node.DataCenter {
 					next++
+				}
+				if next < len(reps) {
+					go ask(reps[next], r.data || !haveData)
+					next++
+					outstanding++
 					continue
 				}
-				return nil, &timeoutError{cl: s.cl, received: len(got), blockFor: need}
+				if outstanding == 0 {
+					return nil, timeout()
+				}
+				continue
 			}
 			got = append(got, r)
+			answered.add(r.node)
+			haveData = haveData || r.data
+		case <-speculate.C:
+			if need.perDC == nil && next < len(reps) {
+				go ask(reps[next], !haveData)
+				next++
+				outstanding++
+			}
 		case <-ctx.Done():
-			return nil, &timeoutError{cl: s.cl, received: len(got), blockFor: need}
+			return nil, timeout()
+		}
+	}
+	var data *resp
+	match := true
+	for i := range got {
+		if got[i].data && data == nil {
+			data = &got[i]
+		}
+	}
+	for _, r := range got {
+		if !bytes.Equal(r.digest, data.digest) {
+			match = false
+		}
+	}
+	if match {
+		if !data.found {
+			return nil, errNotFound
+		}
+		return data.v, nil
+	}
+	// Digest mismatch: full rows from everyone who answered.
+	full := make(chan resp, len(got))
+	for _, r := range got {
+		if r.data {
+			full <- r
+			continue
+		}
+		go ask(r.node, true)
+	}
+	var rows []resp
+	for len(rows) < len(got) {
+		select {
+		case r := <-full:
+			rows = append(rows, r)
+		case r := <-ch:
+			if r.err != nil {
+				return nil, timeout()
+			}
+			if r.data {
+				rows = append(rows, r)
+			}
+		case <-ctx.Done():
+			return nil, timeout()
 		}
 	}
 	var merged []byte
-	for _, r := range got {
+	for _, r := range rows {
 		if !r.found {
 			continue
 		}
@@ -905,9 +1136,9 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 		return nil, errNotFound
 	}
 	var stale []string
-	for _, r := range got {
+	for _, r := range rows {
 		if !r.found || !bytes.Equal(r.v, merged) {
-			stale = append(stale, r.addr)
+			stale = append(stale, r.node.Addr)
 		}
 	}
 	if len(stale) > 0 {
@@ -1044,7 +1275,7 @@ func (it *distIter) load(from []byte) bool {
 			it.err = err
 			return false
 		}
-		kvs, cutoff, err := it.fetch(reps, need, from, segEnd)
+		kvs, cutoff, err := it.fetch(reps, need.count(), from, segEnd)
 		if err != nil {
 			it.err = err
 			return false
@@ -1190,9 +1421,8 @@ func (it *distIter) Close() error  { return nil }
 
 // ---- forwarded statements ----
 
-// forwarded is a statement run on another node: a schema change on the
-// schema leader, or a counter or conditional update on the partition's
-// leader replica.
+// forwarded is a statement run on another node (index queries scattered
+// to every node).
 type forwarded struct {
 	Keyspace  string
 	Query     string
@@ -1302,46 +1532,103 @@ func (p *proxy) handleExecute(_ string, payload []byte) ([]byte, error) {
 	return encodeMessage(res)
 }
 
-// route decides where a statement runs: schema and role changes on the
-// schema leader, counter and conditional updates on the partition's first
-// live replica. It returns "" to run here.
-func (p *proxy) route(st *prepState, e *execCtx) string {
-	switch s := st.stmt.(type) {
-	case *modification:
-		if s.cond == nil && s.isCounter() {
-			return p.partitionLeader(s, e)
-		}
-	case *batchStmt:
-		if len(s.mods) > 0 && !s.conditional && s.mods[0].isCounter() {
-			return p.partitionLeader(s.mods[0], e)
-		}
-	}
-	return ""
-}
+// route decides where a statement runs: "" to run here. (Every statement
+// runs on its coordinator now: conditional updates run Paxos, counter
+// updates send deltas to their partitions' leaders.)
+func (p *proxy) route(st *prepState, e *execCtx) string { return "" }
 
 func (m *modification) isCounter() bool {
 	return slices.ContainsFunc(m.ops, func(o setOp) bool { return o.kind == opCounter })
 }
 
-func (p *proxy) partitionLeader(m *modification, e *execCtx) string {
-	pks, err := m.where.partitionKeys(e, m.t)
-	if err != nil || len(pks) == 0 {
-		return ""
-	}
-	k := p.d.schema.Load().Keyspaces[m.t.Keyspace]
-	if k == nil {
-		return ""
-	}
-	reps, live := p.replicas(k, Token(pks[0]), primitive.ConsistencyLevelAll)
+// ---- counters (CounterMutation) ----
+
+// counterLeader is the node that applies a partition's counter updates:
+// its first live replica (StorageProxy.findSuitableReplica).
+func (p *proxy) counterLeader(k *Keyspace, token int64) (*cluster.Node, error) {
+	reps, live := p.replicas(k, token, primitive.ConsistencyLevelAll)
 	if live == 0 {
-		return ""
+		return nil, &unavailableError{cl: primitive.ConsistencyLevelOne, required: 1, alive: 0}
 	}
 	for _, r := range reps[:live] {
 		if r.Addr == p.self {
-			return ""
+			return r, nil
 		}
 	}
-	return reps[0].Addr
+	return reps[0], nil
+}
+
+// applyCounters sends counter deltas to each partition's leader, which
+// turns them into its shard and replicates them.
+func (p *proxy) applyCounters(m *mutation, cl primitive.ConsistencyLevel) error {
+	byLeader := map[string][]write{}
+	for _, w := range m.writes {
+		k := p.keyspaceOf(w.table)
+		if k == nil {
+			return invalidf("a table was dropped while it was written")
+		}
+		l, err := p.counterLeader(k, w.token)
+		if err != nil {
+			return err
+		}
+		byLeader[l.Addr] = append(byLeader[l.Addr], w)
+	}
+	errs := make(chan error, len(byLeader))
+	for addr, ws := range byLeader {
+		go func() {
+			if addr == p.self {
+				errs <- p.d.applyCounterDeltas(ws, cl)
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), p.opts.WriteTimeout*2)
+			defer cancel()
+			b, _ := json.Marshal(counterRequest{CL: uint16(cl), Writes: encodeWrites(ws)})
+			resp, err := p.m.Request(ctx, addr, cluster.VerbCounterMutation, b)
+			if err == nil && len(resp) > 0 {
+				m, derr := decodeMessage(resp)
+				if derr == nil {
+					if e, ok := m.(message.Error); ok {
+						err = fmt.Errorf("%s", e.GetErrorMessage())
+						if wt, ok := m.(*message.WriteTimeout); ok {
+							err = &timeoutError{write: true, cl: wt.Consistency, received: int(wt.Received), blockFor: int(wt.BlockFor)}
+						} else if u, ok := m.(*message.Unavailable); ok {
+							err = &unavailableError{cl: u.Consistency, required: int(u.Required), alive: int(u.Alive)}
+						}
+					}
+				}
+			} else if err != nil {
+				err = &timeoutError{write: true, cl: cl, blockFor: 1}
+			}
+			errs <- err
+		}()
+	}
+	var first error
+	for range byLeader {
+		if err := <-errs; err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+type counterRequest struct {
+	CL     uint16
+	Writes []byte
+}
+
+func (p *proxy) handleCounterMutation(_ string, payload []byte) ([]byte, error) {
+	var r counterRequest
+	if err := json.Unmarshal(payload, &r); err != nil {
+		return nil, err
+	}
+	ws, err := decodeWrites(r.Writes)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.d.applyCounterDeltas(ws, primitive.ConsistencyLevel(r.CL)); err != nil {
+		return encodeMessage(ErrorMessage(err))
+	}
+	return nil, nil
 }
 
 // ---- system.peers ----

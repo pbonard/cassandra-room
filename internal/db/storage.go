@@ -1,9 +1,13 @@
 package db
 
 import (
+	"bytes"
+	"encoding/binary"
+	"strconv"
 	"strings"
 
 	"github.com/cassandra-room/cassandra-room/internal/storage/lsm"
+	"github.com/cassandra-room/cassandra-room/internal/storage/row"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
 )
 
@@ -66,4 +70,54 @@ func (d *DB) applyLocal(writes []write) error {
 		return err
 	}
 	return nil
+}
+
+// applyCounterDeltas turns counter deltas (8-byte cell values) into this
+// node's counter shards, reading its current shard locally, and writes the
+// result at cl (the leader's part of CounterMutation.apply). Deltas on the
+// same counter in one mutation build on each other.
+func (d *DB) applyCounterDeltas(ws []write, cl primitive.ConsistencyLevel) error {
+	d.counterMu.Lock()
+	defer d.counterMu.Unlock()
+	type shard struct{ clock, count int64 }
+	cur := map[string]shard{}
+	out := make([]write, 0, len(ws))
+	for _, w := range ws {
+		r, err := row.Decode(w.value)
+		if err != nil {
+			return err
+		}
+		changed := false
+		for i := range r.Cells {
+			c := &r.Cells[i]
+			if !c.Counter || len(c.Value) != 8 {
+				continue
+			}
+			id := string(w.key) + "/" + strconv.FormatUint(uint64(c.Column), 10) + "/" + string(c.Path)
+			sh, ok := cur[id]
+			if !ok {
+				if lt, err := d.engine.Table(w.table); err == nil {
+					if v, err := lt.Get(w.key); err == nil {
+						if old, err := row.Decode(v); err == nil {
+							for _, oc := range old.Cells {
+								if oc.Column == c.Column && oc.Counter && bytes.Equal(oc.Path, c.Path) {
+									sh.clock, sh.count, _ = row.CounterShard(oc.Value, d.hostID)
+								}
+							}
+						}
+					}
+				}
+			}
+			sh.clock++
+			sh.count += int64(binary.BigEndian.Uint64(c.Value))
+			cur[id] = sh
+			c.Value = row.CounterContext(d.hostID, sh.clock, sh.count)
+			changed = true
+		}
+		if changed {
+			w.value = row.Append(nil, r)
+		}
+		out = append(out, w)
+	}
+	return d.store.apply(&mutation{writes: out}, cl)
 }

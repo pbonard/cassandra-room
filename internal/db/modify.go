@@ -336,6 +336,23 @@ type boundModification struct {
 
 // applyModifications applies statements' mutations in one atomic batch.
 func (d *DB) applyModifications(mods []boundModification, batchCtx *execCtx) error {
+	if d.proxy != nil && mods[0].m.isCounter() {
+		// Counter deltas, applied by each partition's leader.
+		b := &mutation{}
+		if len(mods) > 1 {
+			batchCtx.timestamp()
+		}
+		for _, bm := range mods {
+			bm.e.counterDeltas = true
+			if len(mods) > 1 {
+				bm.e.ts = batchCtx.ts
+			}
+			if err := bm.m.addMutations(bm.e, b); err != nil {
+				return err
+			}
+		}
+		return d.proxy.applyCounters(b, batchCtx.cl)
+	}
 	for _, bm := range mods {
 		if slices.ContainsFunc(bm.m.ops, func(o setOp) bool { return o.kind == opCounter }) {
 			d.counterMu.Lock()
@@ -417,6 +434,11 @@ func (m *modification) addMutations(e *execCtx, b *mutation) error {
 	}
 	needRead := false
 	for i := range m.ops {
+		// In a cluster, counter updates carry deltas the partition's
+		// leader turns into its shard (CounterMutation): nothing to read.
+		if m.ops[i].kind == opCounter && e.counterDeltas {
+			continue
+		}
 		needRead = needRead || m.ops[i].readsBefore()
 	}
 	var cells, statics []row.Cell
@@ -778,6 +800,11 @@ func (m *modification) buildCells(e *execCtx, ts, ttl int64, cur *current) (cell
 			delta := int64(binary.BigEndian.Uint64(v))
 			if op.neg {
 				delta = -delta
+			}
+			if e.counterDeltas {
+				add(c, row.Cell{Column: c.ID, Counter: true, Timestamp: ts, LocalDeletionTime: row.NoDeletionTime,
+					Value: binary.BigEndian.AppendUint64(nil, uint64(delta))})
+				break
 			}
 			var clock, count int64
 			if cc := cur.of(c); len(cc) > 0 {

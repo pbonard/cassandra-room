@@ -160,6 +160,8 @@ type execCtx struct {
 	user    string                         // the logged-in role
 	cl      primitive.ConsistencyLevel
 	serial  primitive.ConsistencyLevel // for conditional updates
+	// counterDeltas builds counter updates as deltas (in a cluster).
+	counterDeltas bool
 	// local restricts reads to this node (replica-side reads).
 	local bool
 }
@@ -355,16 +357,6 @@ func (d *DB) ExecuteBatch(typ primitive.BatchType, children []BatchChild, o *Req
 		child := *ctx
 		child.values = c.Values
 		mods = append(mods, boundModification{m: m, e: &child})
-	}
-	if d.proxy != nil && !o.forwarded && !conditional && mods[0].m.isCounter() {
-		if to := d.proxy.partitionLeader(mods[0].m, mods[0].e); to != "" {
-			f := &forwarded{CL: uint16(o.Consistency), Serial: uint16(o.SerialConsistency), Timestamp: o.Timestamp, NowInSec: o.NowInSec, User: o.User, BatchType: uint8(typ)}
-			for _, c := range children {
-				vals, null, unset := packValues(c.Values)
-				f.Batch = append(f.Batch, forwardedChild{Keyspace: c.Prepared.Keyspace, Query: c.Prepared.Query, Values: vals, Null: null, Unset: unset})
-			}
-			return d.proxy.forward(to, f)
-		}
 	}
 	if conditional {
 		res, err := d.executeCAS(mods, ctx)
