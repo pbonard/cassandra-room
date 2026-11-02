@@ -10,10 +10,10 @@ import (
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
 )
 
-// Lightweight transactions on one node: the condition is read and the
+// Lightweight transactions. On one node the condition is read and the
 // update applied under a lock on the partition, so conditional statements
-// on a partition are linearizable among themselves (what Paxos provides
-// across replicas; StorageProxy.cas).
+// on a partition are linearizable among themselves; in a cluster they run
+// Paxos among the partition's replicas (paxos.go).
 
 type condition struct {
 	ifNotExists, ifExists bool
@@ -105,10 +105,51 @@ func (d *DB) executeCAS(mods []boundModification, batchCtx *execCtx) (message.Me
 		}
 		pk = p
 	}
+	t := mods[0].m.t
+	if k := d.schema.Load().Keyspaces[t.Keyspace]; d.proxy != nil && k != nil && !k.virtual {
+		var res message.Message
+		err := d.proxy.cas(t, pk, batchCtx.serial, batchCtx.cl, func(ts int64, readCL primitive.ConsistencyLevel) (bool, []write, error) {
+			applied, r, err := d.checkConditions(mods, readCL)
+			if err != nil || !applied {
+				res = r
+				return false, nil, err
+			}
+			res = r
+			// The update is timestamped with the ballot, so decisions apply
+			// in ballot order.
+			batchCtx.ts = ts
+			mu := &mutation{}
+			for _, bm := range mods {
+				bm.e.ts = ts
+				if err := bm.m.addMutations(bm.e, mu); err != nil {
+					return false, nil, err
+				}
+			}
+			return true, mu.writes, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		return res, nil
+	}
 	lock := &casLocks[maphash.Bytes(casSeed, pk)%uint64(len(casLocks))]
 	lock.Lock()
 	defer lock.Unlock()
+	applied, res, err := d.checkConditions(mods, serialRead(batchCtx.serial))
+	if err != nil {
+		return nil, err
+	}
+	if applied {
+		if err := d.applyModifications(mods, batchCtx); err != nil {
+			return nil, err
+		}
+	}
+	return res, nil
+}
 
+// checkConditions reads the current rows at readCL and checks every
+// statement's condition, returning the [applied] result.
+func (d *DB) checkConditions(mods []boundModification, readCL primitive.ConsistencyLevel) (bool, message.Message, error) {
 	t := mods[0].m.t
 	md := &message.RowsMetadata{Columns: (&condition{}).metadata()}
 	out := [][]byte{{1}}
@@ -117,10 +158,9 @@ func (d *DB) executeCAS(mods []boundModification, batchCtx *execCtx) (message.Me
 		if m.cond == nil {
 			continue
 		}
-		// Conditions read at QUORUM (SERIAL, without Paxos).
-		res, err := m.cond.read.execute(&execCtx{d: d, values: e.values, now: e.now, nowSec: e.nowSec, cl: serialRead(e.cl)})
+		res, err := m.cond.read.execute(&execCtx{d: d, values: e.values, now: e.now, nowSec: e.nowSec, cl: readCL})
 		if err != nil {
-			return nil, err
+			return false, nil, err
 		}
 		rows := res.(*message.RowsResult).Data
 		var current map[*Column][]byte // the current row, nil if none
@@ -140,7 +180,7 @@ func (d *DB) executeCAS(mods []boundModification, batchCtx *execCtx) (message.Me
 			for _, f := range m.cond.conds {
 				ok, err := f.matchesCAS(e, current)
 				if err != nil {
-					return nil, err
+					return false, nil, err
 				}
 				if !ok {
 					applied = false
@@ -171,12 +211,7 @@ func (d *DB) executeCAS(mods []boundModification, batchCtx *execCtx) (message.Me
 		c.Keyspace, c.Table, c.Index = t.Keyspace, t.Name, int32(i)
 	}
 	md.ColumnCount = int32(len(md.Columns))
-	if out[0][0] == 1 {
-		if err := d.applyModifications(mods, batchCtx); err != nil {
-			return nil, err
-		}
-	}
-	return &message.RowsResult{Metadata: md, Data: message.RowSet{out}}, nil
+	return out[0][0] == 1, &message.RowsResult{Metadata: md, Data: message.RowSet{out}}, nil
 }
 
 func boolByte(b bool) byte {
@@ -237,9 +272,9 @@ func (f *filter) matchesCAS(e *execCtx, r map[*Column][]byte) (bool, error) {
 	return false, invalidf("Unsupported operator %s in condition", f.op)
 }
 
-func serialRead(cl primitive.ConsistencyLevel) primitive.ConsistencyLevel {
-	switch cl {
-	case primitive.ConsistencyLevelLocalSerial, primitive.ConsistencyLevelLocalQuorum, primitive.ConsistencyLevelLocalOne:
+// serialRead is the consistency level a serial consistency reads at.
+func serialRead(serial primitive.ConsistencyLevel) primitive.ConsistencyLevel {
+	if serial == primitive.ConsistencyLevelLocalSerial {
 		return primitive.ConsistencyLevelLocalQuorum
 	}
 	return primitive.ConsistencyLevelQuorum

@@ -66,6 +66,9 @@ func ErrorMessage(err error) message.Message {
 			if te.batch {
 				wt = primitive.WriteTypeUnloggedBatch
 			}
+			if te.cas {
+				wt = primitive.WriteTypeCas
+			}
 			return &message.WriteTimeout{ErrorMessage: te.Error(), Consistency: te.cl, Received: int32(te.received), BlockFor: int32(te.blockFor), WriteType: wt}
 		}
 		return &message.ReadTimeout{ErrorMessage: te.Error(), Consistency: te.cl, Received: int32(te.received), BlockFor: int32(te.blockFor)}

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"slices"
 	"sort"
@@ -59,6 +60,22 @@ type proxy struct {
 	seq    atomic.Uint64
 }
 
+// cmsStateFileName holds the metadata service's acceptor state.
+const cmsStateFileName = "cms-paxos.json"
+
+// readFile reads a file of the data directory, nil if there is none.
+func (d *DB) readFile(name string) ([]byte, error) {
+	f, err := d.fs.Open(d.fs.PathJoin(d.dir, name))
+	if oserrorIsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
+}
+
 // hintsStorage is the engine table holding hints (system.hints).
 const hintsStorage lsm.TableID = 1 << 40
 
@@ -76,7 +93,7 @@ type timeoutError struct {
 	write              bool
 	cl                 primitive.ConsistencyLevel
 	received, blockFor int
-	batch              bool
+	batch, cas         bool
 }
 
 func (e *timeoutError) Error() string {
@@ -121,6 +138,9 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	m.Handle(cluster.VerbReadRange, p.handleReadRange)
 	m.Handle(cluster.VerbExecute, p.handleExecute)
 	m.Handle(cluster.VerbRepair, p.handleRepair)
+	for _, v := range []cluster.Verb{cluster.VerbLWTPrepare, cluster.VerbLWTPropose, cluster.VerbLWTCommit} {
+		m.Handle(v, p.handlePaxos(v))
+	}
 	p.g = cluster.NewGossiper(m, cluster.EndpointState{HostID: d.local.HostID, Epoch: d.schema.Load().Epoch}, o.Seeds)
 	if o.Membership != nil {
 		p.g.SetConfig(*o.Membership)
@@ -131,6 +151,15 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 		members = []string{p.self}
 	}
 	p.cms = cluster.NewCMS(m, members, d.currentMetadata, d.installBytes, metadataInfo)
+	saved, err := d.readFile(cmsStateFileName)
+	if err != nil {
+		m.Close()
+		return err
+	}
+	if err := p.cms.SetPersistence(saved, func(b []byte) error { return d.writeFileAtomic(cmsStateFileName, b) }); err != nil {
+		m.Close()
+		return err
+	}
 	p.g.OnChange(p.membershipChanged)
 	p.g.OnLiveness(func(addr string, up bool) {
 		if up {
@@ -1052,6 +1081,7 @@ type forwarded struct {
 	Null      []bool
 	Unset     []bool
 	CL        uint16
+	Serial    uint16 `json:",omitempty"`
 	Timestamp *int64
 	NowInSec  *int32
 	User      string
@@ -1129,7 +1159,7 @@ func (p *proxy) handleExecute(_ string, payload []byte) ([]byte, error) {
 	if err := json.Unmarshal(payload, &f); err != nil {
 		return nil, err
 	}
-	o := &RequestOptions{Consistency: primitive.ConsistencyLevel(f.CL), Timestamp: f.Timestamp, NowInSec: f.NowInSec,
+	o := &RequestOptions{Consistency: primitive.ConsistencyLevel(f.CL), SerialConsistency: primitive.ConsistencyLevel(f.Serial), Timestamp: f.Timestamp, NowInSec: f.NowInSec,
 		User: f.User, Version: primitive.ProtocolVersion4, forwarded: true, local: f.Local}
 	var res message.Message
 	if f.Batch != nil {
@@ -1159,11 +1189,11 @@ func (p *proxy) handleExecute(_ string, payload []byte) ([]byte, error) {
 func (p *proxy) route(st *prepState, e *execCtx) string {
 	switch s := st.stmt.(type) {
 	case *modification:
-		if s.cond != nil || s.isCounter() {
+		if s.cond == nil && s.isCounter() {
 			return p.partitionLeader(s, e)
 		}
 	case *batchStmt:
-		if len(s.mods) > 0 && (s.conditional || s.mods[0].isCounter()) {
+		if len(s.mods) > 0 && !s.conditional && s.mods[0].isCounter() {
 			return p.partitionLeader(s.mods[0], e)
 		}
 	}

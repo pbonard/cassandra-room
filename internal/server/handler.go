@@ -191,9 +191,13 @@ func (s *Server) handleMessage(
 				return &message.ServerError{ErrorMessage: err.Error()}
 			}
 		}
-		return s.db.ExecuteBatch(m.Type, children, &db.RequestOptions{
+		o := &db.RequestOptions{Consistency: m.Consistency,
 			Timestamp: m.DefaultTimestamp, NowInSec: m.NowInSeconds, Version: version, User: session.User(),
-		})
+		}
+		if m.SerialConsistency != nil {
+			o.SerialConsistency = *m.SerialConsistency
+		}
+		return s.db.ExecuteBatch(m.Type, children, o)
 
 	default:
 		return &message.ProtocolError{

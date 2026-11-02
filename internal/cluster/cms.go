@@ -38,6 +38,38 @@ type CMS struct {
 	mu        sync.Mutex
 	acceptors map[int64]*acceptor // Paxos state per epoch, for members
 	round     int64
+	// persist, if set, makes the acceptor state durable before a promise
+	// or acceptance is answered (TCM keeps it in system tables): a member
+	// that restarts must not forget what it promised.
+	persist func([]byte) error
+}
+
+// SetPersistence restores the acceptor state saved by persist and makes
+// every later change go through it. Call before the messaging starts.
+func (c *CMS) SetPersistence(saved []byte, persist func([]byte) error) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(saved) > 0 {
+		if err := json.Unmarshal(saved, &c.acceptors); err != nil {
+			return fmt.Errorf("cluster: corrupt metadata service state: %w", err)
+		}
+		if c.acceptors == nil {
+			c.acceptors = map[int64]*acceptor{}
+		}
+	}
+	c.persist = persist
+	return nil
+}
+
+func (c *CMS) persistLocked() error {
+	if c.persist == nil {
+		return nil
+	}
+	b, err := json.Marshal(c.acceptors)
+	if err != nil {
+		return err
+	}
+	return c.persist(b)
 }
 
 type ballot struct {
@@ -120,6 +152,9 @@ func (c *CMS) handlePrepare(_ string, payload []byte) ([]byte, error) {
 	}
 	if a.Promised.less(r.Ballot) {
 		a.Promised = r.Ballot
+		if err := c.persistLocked(); err != nil {
+			return nil, err
+		}
 	}
 	return json.Marshal(paxosResp{OK: true, Accepted: a.Accepted, Value: a.Value})
 }
@@ -139,6 +174,9 @@ func (c *CMS) handleAccept(_ string, payload []byte) ([]byte, error) {
 		return json.Marshal(paxosResp{Promised: a.Promised})
 	}
 	a.Promised, a.Accepted, a.Value = r.Ballot, r.Ballot, r.Value
+	if err := c.persistLocked(); err != nil {
+		return nil, err
+	}
 	return json.Marshal(paxosResp{OK: true})
 }
 

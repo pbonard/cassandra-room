@@ -159,6 +159,7 @@ type execCtx struct {
 	json    map[*jsonSource]map[string]any // INSERT JSON objects, decoded
 	user    string                         // the logged-in role
 	cl      primitive.ConsistencyLevel
+	serial  primitive.ConsistencyLevel // for conditional updates
 	// local restricts reads to this node (replica-side reads).
 	local bool
 }
@@ -193,8 +194,10 @@ type RequestOptions struct {
 	Version          primitive.ProtocolVersion
 	// User is the session's logged-in role, checked by the authorizer.
 	User string
-	// Consistency is the request's consistency level.
-	Consistency primitive.ConsistencyLevel
+	// Consistency is the request's consistency level; SerialConsistency
+	// the Paxos one of conditional updates (SERIAL if unset).
+	Consistency       primitive.ConsistencyLevel
+	SerialConsistency primitive.ConsistencyLevel
 	// forwarded marks a statement another node sent to run here; local
 	// restricts its reads to this node.
 	forwarded, local bool
@@ -208,13 +211,16 @@ func OptionsOf(o *message.QueryOptions, v primitive.ProtocolVersion) *RequestOpt
 	}
 	out.Values, out.Named = o.PositionalValues, o.NamedValues
 	out.Consistency = o.Consistency
+	if o.SerialConsistency != nil {
+		out.SerialConsistency = *o.SerialConsistency
+	}
 	out.PageSize, out.PagingState = o.PageSize, o.PagingState
 	out.Timestamp, out.NowInSec, out.SkipMeta = o.DefaultTimestamp, o.NowInSeconds, o.SkipMetadata
 	return out
 }
 
 func (d *DB) newCtx(o *RequestOptions, st *prepState) (*execCtx, error) {
-	e := &execCtx{d: d, now: d.opts.Now(), page: int(o.PageSize), paging: o.PagingState, noMeta: o.SkipMeta, version: o.Version, user: o.User, cl: o.Consistency, local: o.local}
+	e := &execCtx{d: d, now: d.opts.Now(), page: int(o.PageSize), paging: o.PagingState, noMeta: o.SkipMeta, version: o.Version, user: o.User, cl: o.Consistency, serial: o.SerialConsistency, local: o.local}
 	e.nowSec = e.now.Unix()
 	if o.NowInSec != nil {
 		e.nowSec = int64(*o.NowInSec)
@@ -314,7 +320,7 @@ func (d *DB) ExecuteBatch(typ primitive.BatchType, children []BatchChild, o *Req
 	}
 	var mods []boundModification
 	conditional := false
-	ctx := &execCtx{d: d, now: d.opts.Now(), cl: o.Consistency, user: o.User}
+	ctx := &execCtx{d: d, now: d.opts.Now(), cl: o.Consistency, serial: o.SerialConsistency, user: o.User}
 	ctx.nowSec = ctx.now.Unix()
 	if o.NowInSec != nil {
 		ctx.nowSec = int64(*o.NowInSec)
@@ -350,9 +356,9 @@ func (d *DB) ExecuteBatch(typ primitive.BatchType, children []BatchChild, o *Req
 		child.values = c.Values
 		mods = append(mods, boundModification{m: m, e: &child})
 	}
-	if d.proxy != nil && !o.forwarded && (conditional || mods[0].m.isCounter()) {
+	if d.proxy != nil && !o.forwarded && !conditional && mods[0].m.isCounter() {
 		if to := d.proxy.partitionLeader(mods[0].m, mods[0].e); to != "" {
-			f := &forwarded{CL: uint16(o.Consistency), Timestamp: o.Timestamp, NowInSec: o.NowInSec, User: o.User, BatchType: uint8(typ)}
+			f := &forwarded{CL: uint16(o.Consistency), Serial: uint16(o.SerialConsistency), Timestamp: o.Timestamp, NowInSec: o.NowInSec, User: o.User, BatchType: uint8(typ)}
 			for _, c := range children {
 				vals, null, unset := packValues(c.Values)
 				f.Batch = append(f.Batch, forwardedChild{Keyspace: c.Prepared.Keyspace, Query: c.Prepared.Query, Values: vals, Null: null, Unset: unset})

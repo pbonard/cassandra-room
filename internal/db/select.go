@@ -15,6 +15,7 @@ import (
 	"github.com/cassandra-room/cassandra-room/internal/storage/row"
 	"github.com/cassandra-room/cassandra-room/internal/types"
 	"github.com/datastax/go-cassandra-native-protocol/message"
+	"github.com/datastax/go-cassandra-native-protocol/primitive"
 )
 
 // selectStmt is a prepared SELECT (SelectStatement).
@@ -546,6 +547,24 @@ func (s *selectStmt) execute(e *execCtx) (message.Message, error) {
 	if s.t.virtual != nil {
 		src = newVirtualSource(d, s.t)
 	} else {
+		serial := e.cl == primitive.ConsistencyLevelSerial || e.cl == primitive.ConsistencyLevelLocalSerial
+		if serial && d.proxy != nil && !e.local {
+			// A SERIAL read first finishes any Paxos round in progress on the
+			// partition, so it sees every decided update (readWithPaxos).
+			var pks [][]byte
+			if s.where.pkComplete() {
+				var err error
+				if pks, err = s.where.partitionKeys(e, s.t); err != nil {
+					return nil, err
+				}
+			}
+			if len(pks) != 1 {
+				return nil, invalidf("SERIAL/LOCAL_SERIAL consistency may only be requested for one partition at a time")
+			}
+			if err := d.proxy.serialReadBegin(s.t, pks[0], e.cl); err != nil {
+				return nil, err
+			}
+		}
 		d.tableMu.RLock()
 		defer d.tableMu.RUnlock()
 		var err error

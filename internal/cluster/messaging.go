@@ -35,6 +35,9 @@ const (
 	VerbPaxosAccept
 	VerbMetadataFetch
 	VerbMetadataPush
+	VerbLWTPrepare
+	VerbLWTPropose
+	VerbLWTCommit
 )
 
 // Handler handles a request and returns the response payload.

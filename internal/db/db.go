@@ -309,7 +309,13 @@ func (d *DB) saveSchema(s *Schema) error {
 	if err != nil {
 		return err
 	}
-	tmp := d.fs.PathJoin(d.dir, schemaFileName+".tmp")
+	return d.writeFileAtomic(schemaFileName, b)
+}
+
+// writeFileAtomic replaces a file of the data directory durably: a synced
+// temporary file renamed over it, then the directory synced.
+func (d *DB) writeFileAtomic(name string, b []byte) error {
+	tmp := d.fs.PathJoin(d.dir, name+".tmp")
 	f, err := d.fs.Create(tmp, vfs.WriteCategoryUnspecified)
 	if err != nil {
 		return err
@@ -325,7 +331,7 @@ func (d *DB) saveSchema(s *Schema) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := d.fs.Rename(tmp, d.fs.PathJoin(d.dir, schemaFileName)); err != nil {
+	if err := d.fs.Rename(tmp, d.fs.PathJoin(d.dir, name)); err != nil {
 		return err
 	}
 	dir, err := d.fs.OpenDir(d.dir)

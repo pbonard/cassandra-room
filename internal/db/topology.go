@@ -389,4 +389,3 @@ func (d *DB) Status() string {
 	}
 	return b.String()
 }
-

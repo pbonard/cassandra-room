@@ -276,3 +276,29 @@ func TestRingReplicas(t *testing.T) {
 		require.NotEqual(t, reps[0].Addr, reps[1].Addr)
 	}
 }
+
+// TestCMSPersistence checks that a member that restarts still refuses a
+// ballot older than one it promised before.
+func TestCMSPersistence(t *testing.T) {
+	m, err := NewMessaging("127.0.0.1:0")
+	require.NoError(t, err)
+	defer m.Close()
+	cur := func() (int64, []byte) { return 0, []byte("{}") }
+	var saved []byte
+	c := NewCMS(m, []string{m.Addr()}, cur, func([]byte) error { return nil }, func([]byte, string) (int64, bool, error) { return 0, false, nil })
+	require.NoError(t, c.SetPersistence(nil, func(b []byte) error { saved = b; return nil }))
+	prepare := func(c *CMS, round int64) bool {
+		b, _ := json.Marshal(paxosReq{Epoch: 1, Ballot: ballot{Round: round, Node: "x"}})
+		out, err := c.handlePrepare("", b)
+		require.NoError(t, err)
+		var r paxosResp
+		require.NoError(t, json.Unmarshal(out, &r))
+		return r.OK
+	}
+	require.True(t, prepare(c, 10))
+	require.NotEmpty(t, saved)
+	restarted := NewCMS(m, []string{m.Addr()}, cur, func([]byte) error { return nil }, func([]byte, string) (int64, bool, error) { return 0, false, nil })
+	require.NoError(t, restarted.SetPersistence(saved, func(b []byte) error { saved = b; return nil }))
+	require.False(t, prepare(restarted, 5), "a lower ballot than the one promised before the restart")
+	require.True(t, prepare(restarted, 11))
+}

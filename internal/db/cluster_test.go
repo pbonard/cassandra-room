@@ -6,6 +6,9 @@ import (
 	"github.com/cassandra-room/cassandra-room/internal/cluster"
 	"net"
 	"sort"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -353,4 +356,93 @@ func testMembership() *cluster.Config {
 	c.GossipInterval, c.PushPullInterval = 30*time.Millisecond, 500*time.Millisecond
 	c.MinSuspicionTimeout = 300 * time.Millisecond
 	return &c
+}
+
+// TestClusterPaxos runs compare-and-set increments of one cell from every
+// coordinator at once: with Paxos, every applied update is based on the
+// previous one, so the final value is the number applied. It then checks
+// that a round accepted by a quorum but never committed is finished by the
+// next SERIAL read.
+func TestClusterPaxos(t *testing.T) {
+	c := newTestCluster(t, 3)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}")
+	c.ok(0, quorum, "CREATE TABLE ks.c (k int PRIMARY KEY, v int)")
+	c.ok(1, quorum, "INSERT INTO ks.c (k, v) VALUES (1, 0) IF NOT EXISTS")
+	serial := primitive.ConsistencyLevelSerial
+	var applied, unknown atomic.Int64
+	var wg sync.WaitGroup
+	for w := 0; w < 6; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 10; i++ {
+				res := c.exec(w%3, serial, "SELECT v FROM ks.c WHERE k = 1")
+				rows, ok := res.(*message.RowsResult)
+				if !ok {
+					continue // a timeout under contention
+				}
+				cur := int(int32(be32(rows.Data[0][0])))
+				res = c.exec(w%3, quorum, "UPDATE ks.c SET v = ? WHERE k = 1 IF v = ?", cur+1, cur)
+				switch r := res.(type) {
+				case *message.RowsResult:
+					if r.Data[0][0][0] == 1 {
+						applied.Add(1)
+					}
+				case *message.WriteTimeout:
+					// The outcome of a CAS that timed out is unknown: it may
+					// be completed by a later round.
+					require.Equal(t, primitive.WriteTypeCas, r.WriteType)
+					unknown.Add(1)
+				default:
+					t.Errorf("unexpected %T %v", res, res)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	require.Positive(t, applied.Load())
+	final := c.values(2, serial, "SELECT v FROM ks.c WHERE k = 1")
+	v, err := strconv.Atoi(final[0])
+	require.NoError(t, err)
+	t.Logf("applied %d, unknown outcome %d, final %d", applied.Load(), unknown.Load(), v)
+	require.GreaterOrEqual(t, int64(v), applied.Load())
+	require.LessOrEqual(t, int64(v), applied.Load()+unknown.Load())
+	for i := range c.nodes {
+		require.Equal(t, final, c.values(i, one, "SELECT v FROM ks.c WHERE k = 1"), "node %d", i)
+	}
+
+	// A coordinator that died after its proposal was accepted by two
+	// replicas: the next serial read completes the round.
+	d := c.nodes[0]
+	tbl := d.schema.Load().Keyspaces["ks"].Tables["c"]
+	pk := []byte{0, 0, 0, 1}
+	pr := mustPrepare(t, d, "UPDATE ks.c SET v = 1000 WHERE k = 1")
+	b := newBallot(time.Now().UnixMicro())
+	e := &execCtx{d: d, now: time.Now(), ts: b.micros()}
+	e.nowSec = e.now.Unix()
+	mu := &mutation{}
+	require.NoError(t, pr.state.Load().stmt.(*modification).addMutations(e, mu))
+	for _, n := range c.nodes[:2] {
+		r := &paxosRequest{Table: uint64(tbl.Storage), Key: pk, Ballot: b}
+		resp, err := n.paxosPrepare(r)
+		require.NoError(t, err)
+		require.True(t, resp.OK)
+		r.Update = encodeWrites(mu.writes)
+		resp, err = n.paxosAccept(r)
+		require.NoError(t, err)
+		require.True(t, resp.OK)
+	}
+	require.Equal(t, final, c.values(2, one, "SELECT v FROM ks.c WHERE k = 1"), "not committed yet")
+	require.Equal(t, []string{"1000"}, c.values(2, serial, "SELECT v FROM ks.c WHERE k = 1"))
+	require.Equal(t, []string{"1000"}, c.values(2, one, "SELECT v FROM ks.c WHERE k = 1"), "committed everywhere")
+
+	// One replica down: quorum still decides; two down: unavailable.
+	c.stop(2)
+	require.Eventually(t, func() bool { return !c.nodes[0].proxy.g.IsAlive(c.addrs[2]) }, 5*time.Second, 20*time.Millisecond)
+	res := c.ok(0, quorum, "UPDATE ks.c SET v = 1001 WHERE k = 1 IF v = 1000").(*message.RowsResult)
+	require.Equal(t, []byte{1}, []byte(res.Data[0][0]))
+	c.stop(1)
+	require.Eventually(t, func() bool { return !c.nodes[0].proxy.g.IsAlive(c.addrs[1]) }, 5*time.Second, 20*time.Millisecond)
+	_, ok := c.exec(0, quorum, "UPDATE ks.c SET v = 1002 WHERE k = 1 IF v = 1001").(*message.Unavailable)
+	require.True(t, ok)
 }
