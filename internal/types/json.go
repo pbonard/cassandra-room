@@ -55,7 +55,7 @@ func ToJSON(t *Type, v []byte) string {
 		case math.IsInf(f, -1):
 			return "-Infinity"
 		}
-		return strconv.FormatFloat(f, 'g', -1, bits)
+		return JavaFloatString(f, bits)
 	case Varint:
 		return VarintValue(v).String()
 	case Decimal:
@@ -104,6 +104,16 @@ func ToJSON(t *Type, v []byte) string {
 			parts = append(parts, k+": "+ToJSON(t.Elems[1], elems[i+1]))
 		}
 		return "{" + strings.Join(parts, ", ") + "}"
+	case Vector:
+		elems, err := SplitVector(t, v)
+		if err != nil {
+			return "null"
+		}
+		parts := make([]string, len(elems))
+		for i, e := range elems {
+			parts[i] = ToJSON(t.Elems[0], e)
+		}
+		return "[" + strings.Join(parts, ", ") + "]"
 	case Tuple, UDT:
 		fields, err := SplitTuple(v)
 		if err != nil {
@@ -308,6 +318,20 @@ func FromJSON(t *Type, v any) ([]byte, error) {
 			out = append(out, entries[i].k, entries[i].v)
 		}
 		return BuildCollection(len(out)/2, out), nil
+	case Vector:
+		arr, ok := v.([]any)
+		if !ok || len(arr) != t.Dim {
+			return bad()
+		}
+		elems := make([][]byte, len(arr))
+		for i, x := range arr {
+			e, err := FromJSON(t.Elems[0], x)
+			if err != nil {
+				return nil, err
+			}
+			elems[i] = e
+		}
+		return BuildVector(t, elems), nil
 	case Tuple:
 		arr, ok := v.([]any)
 		if !ok || len(arr) > len(t.Elems) {
@@ -397,3 +421,30 @@ func sortIdx(idx []int, cmp func(a, b int) int) {
 
 var _ = bytes.Equal
 var _ = big.NewInt
+
+// JavaFloatString formats a float as Java's Float/Double.toString, as
+// Cassandra does for JSON: "1.0", "0.001", "1.0E7", "1.234E-5".
+func JavaFloatString(f float64, bits int) string {
+	a := math.Abs(f)
+	if a == 0 || (a >= 1e-3 && a < 1e7) {
+		s := strconv.FormatFloat(f, 'f', -1, bits)
+		if !strings.Contains(s, ".") {
+			s += ".0"
+		}
+		return s
+	}
+	s := strconv.FormatFloat(f, 'e', -1, bits)
+	mant, exp, _ := strings.Cut(s, "e")
+	if !strings.Contains(mant, ".") {
+		mant += ".0"
+	}
+	neg := strings.HasPrefix(exp, "-")
+	exp = strings.TrimLeft(exp, "+-0")
+	if exp == "" {
+		exp = "0"
+	}
+	if neg {
+		exp = "-" + exp
+	}
+	return mant + "E" + exp
+}

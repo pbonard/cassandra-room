@@ -86,6 +86,9 @@ func newIndex(t *Table, st *cql.CreateIndex) (*Index, error) {
 	if c.Type.Kind == types.Counter {
 		return nil, invalidf("Cannot create secondary index on a counter column")
 	}
+	if c.Type.Kind == types.Vector && !ix.sai() {
+		return nil, invalidf("Vector column %s can only be indexed with 'sai' (StorageAttachedIndex)", c.Name)
+	}
 	multi := c.Type.IsMultiCell()
 	switch ix.Target {
 	case "":
@@ -158,6 +161,9 @@ func (ix *Index) entryKey(v, rowKey []byte) ([]byte, error) {
 // addEntries adds the index entries of a row write to b.
 func (t *Table) addEntries(b *mutation, rowKey []byte, cells []row.Cell, nowSec int64) error {
 	for _, ix := range t.Indexes {
+		if ix.col.Type.Kind == types.Vector {
+			continue // ANN queries score the rows themselves
+		}
 		vals, live := ix.indexValues(cells, nowSec)
 		for i, v := range vals {
 			key, err := ix.entryKey(v, rowKey)
@@ -233,7 +239,7 @@ func findIndex(t *Table, filters []filter) *indexPlan {
 			continue
 		}
 		for _, ix := range t.Indexes {
-			if ix.col != f.col {
+			if ix.col != f.col || ix.col.Type.Kind == types.Vector {
 				continue
 			}
 			switch {

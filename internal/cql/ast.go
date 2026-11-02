@@ -83,6 +83,8 @@ type Property struct {
 type Ordering struct {
 	Column string
 	Desc   bool
+	// Ann is the vector of ORDER BY column ANN OF vector.
+	Ann Term
 }
 
 // Relation is a WHERE clause predicate.

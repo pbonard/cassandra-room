@@ -166,9 +166,20 @@ once it is older than `gc_grace_seconds` and no older data of the
 partition (or of the range) remains outside the compaction, in other
 sstables or the memtables.
 
+## Vectors
+
+`vector<float, n>` (any element type; float or double for search) is
+sent to drivers as Cassandra's custom `VectorType(... , n)`. The
+`similarity_cosine`, `similarity_euclidean` and `similarity_dot_product`
+functions score two vectors; `ORDER BY v ANN OF [..] LIMIT k` on a column
+with an SAI index (`similarity_function` option: cosine by default,
+euclidean, dot_product) returns the k most similar rows among those the
+rest of the query selects. Scoring is exact (every candidate row is
+scored), not an approximate graph search.
+
 ## Not supported yet
 
-- vectors, user-defined functions and aggregates, materialized views,
+- user-defined functions and aggregates, materialized views,
   triggers, LIKE, data masking
 
 

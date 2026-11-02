@@ -76,7 +76,7 @@ func TestParseAST(t *testing.T) {
 	require.Equal(t, []string{"c"}, ct.Clustering)
 	require.Equal(t, "frozen<map<text, int>>", ct.Columns[2].Type)
 	require.True(t, ct.Columns[3].Static)
-	require.Equal(t, []Ordering{{"c", true}}, ct.ClusteringOrder)
+	require.Equal(t, []Ordering{{Column: "c", Desc: true}}, ct.ClusteringOrder)
 	require.Len(t, ct.Properties, 2)
 
 	p, err = Parse(`UPDATE t USING TTL 5 SET a = a + 1, b = 'x', c = [1] + c, d -= {2} WHERE k = 1`)

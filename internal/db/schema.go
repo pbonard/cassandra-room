@@ -350,6 +350,8 @@ func buildTable(ks string, resolve func(string) (*types.Type, error), st *cql.Cr
 			return nil, invalidf("counter type is not supported for PRIMARY KEY column '%s'", name)
 		case referencesDuration(typ):
 			return nil, invalidf("duration type is not supported for PRIMARY KEY column '%s'", name)
+		case typ.Kind == types.Vector:
+			return nil, invalidf("vector type is not supported for PRIMARY KEY column '%s'", name)
 		case def.Static:
 			return nil, invalidf("Static column '%s' cannot be part of the PRIMARY KEY", name)
 		}

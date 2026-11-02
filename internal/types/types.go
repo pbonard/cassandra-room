@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -45,6 +46,7 @@ const (
 	Map
 	Tuple
 	UDT
+	Vector
 )
 
 var names = map[Kind]string{
@@ -75,6 +77,8 @@ type Type struct {
 	// A user-defined type's keyspace, name and field names.
 	Keyspace, Name string
 	Fields         []string
+	// Dim is a vector's number of elements.
+	Dim int
 }
 
 // Native types, shared.
@@ -134,6 +138,12 @@ func (t *Type) write(b *strings.Builder) {
 		}
 		return
 	}
+	if t.Kind == Vector {
+		b.WriteString("vector<")
+		t.Elems[0].write(b)
+		fmt.Fprintf(b, ", %d>", t.Dim)
+		return
+	}
 	b.WriteString(names[t.Kind])
 	if len(t.Elems) > 0 {
 		b.WriteByte('<')
@@ -156,6 +166,9 @@ func (t *Type) Equal(o *Type) bool {
 		return false
 	}
 	if t.Kind == UDT && (t.Keyspace != o.Keyspace || t.Name != o.Name) {
+		return false
+	}
+	if t.Kind == Vector && t.Dim != o.Dim {
 		return false
 	}
 	for i := range t.Elems {
@@ -233,7 +246,7 @@ func (p *typeParser) parse(nested bool) (*Type, error) {
 	if k, ok := byName[name]; ok && !p.quoted {
 		return &Type{Kind: k}, nil
 	}
-	if p.quoted || (byName[name] == 0 && name != "frozen" && name != "list" && name != "set" && name != "map" && name != "tuple" && name != "") {
+	if p.quoted || (byName[name] == 0 && name != "frozen" && name != "list" && name != "set" && name != "map" && name != "tuple" && name != "vector" && name != "") {
 		if p.resolve == nil {
 			return nil, fmt.Errorf("unknown type %s", name)
 		}
@@ -294,6 +307,33 @@ func (p *typeParser) parse(nested bool) (*Type, error) {
 			return nil, err
 		}
 		t = &Type{Kind: Map, Elems: []*Type{k, v}}
+	case "vector":
+		if err := p.expect('<'); err != nil {
+			return nil, err
+		}
+		e, err := p.parse(true)
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect(','); err != nil {
+			return nil, err
+		}
+		p.skipSpace()
+		start := p.i
+		for p.i < len(p.s) && p.s[p.i] >= '0' && p.s[p.i] <= '9' {
+			p.i++
+		}
+		dim, err := strconv.Atoi(p.s[start:p.i])
+		if err != nil || dim <= 0 {
+			return nil, fmt.Errorf("vectors must have a dimension greater than 0")
+		}
+		if err := p.expect('>'); err != nil {
+			return nil, err
+		}
+		if e.Kind == Counter || e.Kind == Duration {
+			return nil, fmt.Errorf("vectors may not contain %s", e)
+		}
+		return VectorOf(e, dim), nil
 	case "tuple":
 		if err := p.expect('<'); err != nil {
 			return nil, err
@@ -333,7 +373,7 @@ func (p *typeParser) parse(nested bool) (*Type, error) {
 
 // freeze marks t and every collection inside it frozen.
 func (t *Type) freeze() {
-	t.Frozen = t.IsCollection() || t.Kind == Tuple || t.Kind == UDT
+	t.Frozen = t.IsCollection() || t.Kind == Tuple || t.Kind == UDT || t.Kind == Vector
 	for _, e := range t.Elems {
 		e.freeze()
 	}
@@ -401,6 +441,8 @@ func (t *Type) DataType() datatype.DataType {
 		}
 		dt, _ := datatype.NewUserDefined(t.Keyspace, t.Name, t.Fields, dts)
 		return dt
+	case Vector:
+		return datatype.NewCustom(t.MarshalClass())
 	}
 	panic(fmt.Sprintf("types: unknown kind %d", t.Kind))
 }
@@ -492,6 +534,16 @@ func (t *Type) Validate(v []byte) error {
 				return errors.New("null is not supported inside collections")
 			}
 			if err := t.Elems[i%2].Validate(e); err != nil {
+				return err
+			}
+		}
+	case Vector:
+		elems, err := SplitVector(t, v)
+		if err != nil {
+			return err
+		}
+		for _, e := range elems {
+			if err := t.Elems[0].Validate(e); err != nil {
 				return err
 			}
 		}

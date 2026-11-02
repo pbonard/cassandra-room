@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -110,12 +111,18 @@ func (s *session) rows(q string, args ...any) []string {
 }
 
 func (s *session) colType(c *message.ColumnMetadata) *types.Type {
+	if m := vectorClass.FindStringSubmatch(c.Type.AsCql()); m != nil {
+		t, _ := types.Parse("vector<" + map[string]string{"FloatType": "float", "DoubleType": "double", "Int32Type": "int"}[m[1]] + ", " + m[2] + ">")
+		return t
+	}
 	t, err := types.Parse(strings.ToLower(c.Type.AsCql()))
 	if err != nil {
 		return types.BlobType
 	}
 	return t
 }
+
+var vectorClass = regexp.MustCompile(`VectorType\(org\.apache\.cassandra\.db\.marshal\.(\w+)\s*,\s*(\d+)\)`)
 
 func TestBasicCRUD(t *testing.T) {
 	s := openTest(t, nil)

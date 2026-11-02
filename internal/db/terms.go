@@ -149,6 +149,8 @@ func buildCollection(t *types.Type, vals [][]byte) []byte {
 	switch t.Kind {
 	case types.Tuple, types.UDT:
 		return types.BuildTuple(vals)
+	case types.Vector:
+		return types.BuildVector(t, vals)
 	case types.List:
 		return types.BuildCollection(len(vals), vals)
 	case types.Set:
@@ -178,7 +180,7 @@ func buildCollection(t *types.Type, vals [][]byte) []byte {
 func (vs *vars) prepareTerm(raw cql.Term, name string, typ *types.Type) (term, error) {
 	switch r := raw.(type) {
 	case *cql.Literal:
-		if typ.IsCollection() || typ.Kind == types.Tuple {
+		if typ.IsCollection() || typ.Kind == types.Tuple || typ.Kind == types.Vector {
 			return nil, invalidf("Invalid %s constant (%s) for \"%s\" of type %s", r.Kind, r.Text, name, typ)
 		}
 		v, err := types.FromLiteral(typ, r.Kind, r.Text)
@@ -201,6 +203,12 @@ func (vs *vars) prepareTerm(raw cql.Term, name string, typ *types.Type) (term, e
 	case *cql.Cast:
 		return vs.prepareTerm(r.Term, name, typ)
 	case *cql.ListLiteral:
+		if typ.Kind == types.Vector {
+			if len(r.Elems) != typ.Dim {
+				return nil, invalidf("Invalid vector literal for %s of type %s; expected %d elements, but given %d", name, typ, typ.Dim, len(r.Elems))
+			}
+			return vs.prepareElems(r.Elems, typ, func(int) *types.Type { return typ.Elems[0] }, name)
+		}
 		if typ.Kind != types.List {
 			if typ.Kind == types.Set && len(r.Elems) == 0 {
 				return &constTerm{v: types.BuildCollection(0, nil)}, nil

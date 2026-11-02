@@ -377,6 +377,11 @@ func (p *parser) ordering() (Ordering, error) {
 		return Ordering{}, err
 	}
 	o := Ordering{Column: c}
+	if p.isWord("ann") && p.isWordAt(1, "of") {
+		p.i += 2
+		o.Ann, err = p.term()
+		return o, err
+	}
 	if p.word("desc") {
 		o.Desc = true
 	} else {

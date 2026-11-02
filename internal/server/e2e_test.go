@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"github.com/cassandra-room/cassandra-room/internal/cluster"
+	"math"
 	"net"
 	"strconv"
 	"testing"
@@ -326,4 +328,46 @@ func fastMembership() *cluster.Config {
 	c.GossipInterval, c.PushPullInterval = 30*time.Millisecond, 500*time.Millisecond
 	c.MinSuspicionTimeout = 500 * time.Millisecond
 	return &c
+}
+
+// TestGocqlVectors writes and reads vectors and runs an ANN query through
+// gocql. (gocql v1.7 has no vector codec: values go as the custom type's
+// raw bytes.)
+func TestGocqlVectors(t *testing.T) {
+	host, port := startServer(t)
+	s := connect(t, host, port, 4, "")
+	require.NoError(t, s.Query("CREATE KEYSPACE vec WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}").Exec())
+	s = connect(t, host, port, 4, "vec")
+	require.NoError(t, s.Query("CREATE TABLE docs (id int PRIMARY KEY, emb vector<float, 3>)").Exec())
+	require.NoError(t, s.Query("CREATE INDEX ON docs (emb) USING 'sai'").Exec())
+	vec := func(xs ...float32) rawValue {
+		var b []byte
+		for _, x := range xs {
+			b = binary.BigEndian.AppendUint32(b, math.Float32bits(x))
+		}
+		return b
+	}
+	for i, v := range [][]float32{{1, 0, 0}, {0, 1, 0}, {0.8, 0.2, 0}} {
+		require.NoError(t, s.Query("INSERT INTO docs (id, emb) VALUES (?, ?)", i, vec(v...)).Exec())
+	}
+	var got rawValue
+	require.NoError(t, s.Query("SELECT emb FROM docs WHERE id = 2").Scan(&got))
+	require.Equal(t, vec(0.8, 0.2, 0), got)
+	it := s.Query("SELECT id FROM docs ORDER BY emb ANN OF ? LIMIT 2", vec(1, 0, 0)).Iter()
+	var ids []int
+	var id int
+	for it.Scan(&id) {
+		ids = append(ids, id)
+	}
+	require.NoError(t, it.Close())
+	require.Equal(t, []int{0, 2}, ids)
+}
+
+// rawValue passes a value's serialized bytes through gocql.
+type rawValue []byte
+
+func (r rawValue) MarshalCQL(gocql.TypeInfo) ([]byte, error) { return r, nil }
+func (r *rawValue) UnmarshalCQL(_ gocql.TypeInfo, b []byte) error {
+	*r = append((*r)[:0], b...)
+	return nil
 }

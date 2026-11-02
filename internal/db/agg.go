@@ -164,6 +164,8 @@ func formatValue(t *types.Type, v []byte) string {
 		return fmt.Sprintf("%02d:%02d:%02d.%09d", ns/3600e9, ns/60e9%60, ns/1e9%60, ns%1e9)
 	case types.Inet:
 		return net.IP(v).String()
+	case types.Vector:
+		return formatCQL(t, v)
 	}
 	return "0x" + hex.EncodeToString(v)
 }
@@ -216,6 +218,16 @@ func formatCQL(t *types.Type, v []byte) string {
 			parts = append(parts, formatCQL(t.Elems[0], elems[i])+": "+formatCQL(t.Elems[1], elems[i+1]))
 		}
 		return "{" + strings.Join(parts, ", ") + "}"
+	case types.Vector:
+		elems, err := types.SplitVector(t, v)
+		if err != nil {
+			return "<invalid>"
+		}
+		parts := make([]string, len(elems))
+		for i, e := range elems {
+			parts[i] = formatCQL(t.Elems[0], e)
+		}
+		return "[" + strings.Join(parts, ", ") + "]"
 	case types.Tuple, types.UDT:
 		fields, err := types.SplitTuple(v)
 		if err != nil {

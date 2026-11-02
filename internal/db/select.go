@@ -20,6 +20,7 @@ import (
 
 // selectStmt is a prepared SELECT (SelectStatement).
 type selectStmt struct {
+	ann            *annOrder // ORDER BY ... ANN OF
 	t              *Table
 	where          *where
 	sels           []selector
@@ -54,8 +55,9 @@ const (
 	selSum
 	selAvg
 	selCast
-	selOp     // arithmetic
-	selToJSON // toJson(x)
+	selOp         // arithmetic
+	selToJSON     // toJson(x)
+	selSimilarity // similarity_cosine(x, y), ...
 )
 
 type selector struct {
@@ -66,8 +68,9 @@ type selector struct {
 	cols  []*Column // token()
 	t     term
 	inner *selector // cast, toJson, the left operand of arithmetic
-	right *selector // the right operand of arithmetic
+	right *selector // the right operand of arithmetic, a similarity's second argument
 	op    byte
+	fn    string // the similarity function
 }
 
 func (d *DB) prepareSelect(s *Schema, session string, st *cql.Select, vs *vars) (*selectStmt, error) {
@@ -170,7 +173,11 @@ func (d *DB) prepareSelect(s *Schema, session string, st *cql.Select, vs *vars) 
 			return nil, err
 		}
 	}
-	if len(st.OrderBy) > 0 {
+	if len(st.OrderBy) > 0 && st.OrderBy[0].Ann != nil {
+		if err := sel.prepareANN(st, vs); err != nil {
+			return nil, err
+		}
+	} else if len(st.OrderBy) > 0 {
 		if err := sel.prepareOrdering(st.OrderBy); err != nil {
 			return nil, err
 		}
@@ -361,6 +368,36 @@ func prepareSelector(t *Table, raw cql.Selectable, vs *vars) (selector, error) {
 				return selector{}, err
 			}
 			return selector{kind: selToJSON, name: "system.tojson(" + inner.name + ")", typ: types.TextType, inner: &inner}, nil
+		case "similarity_cosine", "similarity_euclidean", "similarity_dot_product":
+			if len(r.Args) != 2 {
+				return selector{}, invalidf("Invalid number of arguments for function %s", name)
+			}
+			var args [2]selector
+			var vt *types.Type
+			for i, a := range r.Args {
+				if _, ok := a.(*cql.TermSel); ok {
+					continue
+				}
+				x, err := prepareSelector(t, a, vs)
+				if err != nil {
+					return selector{}, err
+				}
+				args[i], vt = x, x.typ
+			}
+			if vt == nil || vt.Kind != types.Vector {
+				return selector{}, invalidf("Function %s requires a float vector argument", name)
+			}
+			for i, a := range r.Args {
+				if ts, ok := a.(*cql.TermSel); ok {
+					tt, err := vs.prepareTerm(ts.Term, name, vt)
+					if err != nil {
+						return selector{}, err
+					}
+					args[i] = selector{kind: selTerm, name: "?", typ: vt, t: tt}
+				}
+			}
+			return selector{kind: selSimilarity, name: "system." + name + "(" + args[0].name + ", " + args[1].name + ")",
+				typ: types.FloatType, inner: &args[0], right: &args[1], fn: strings.TrimPrefix(name, "similarity_")}, nil
 		case "totimestamp", "todate", "tounixtimestamp":
 			return selector{}, invalidf("function %s is not supported in selections", name)
 		}
@@ -582,6 +619,10 @@ type query struct {
 	e   *execCtx
 	src source
 
+	annQuery []float32 // the ANN query vector
+	annLimit int64
+	annRows  []annRow
+
 	limit, perPartition int64
 	pageSize            int
 	resume              *pagingState
@@ -625,6 +666,13 @@ func (q *query) run() (message.Message, error) {
 	q.pageSize = e.page
 	if s.aggregate || s.sortIN || len(s.groupBy) > 0 {
 		q.pageSize = 0
+	}
+	if s.ann != nil {
+		// Every candidate row is scored; the best LIMIT are returned.
+		if q.annQuery, err = s.ann.query(e); err != nil {
+			return nil, err
+		}
+		q.annLimit, q.limit, q.pageSize = q.limit, math.MaxInt64, 0
 	}
 	if s.aggregate || len(s.groupBy) > 0 {
 		q.agg = newAggState(s.sels)
@@ -683,6 +731,9 @@ func (q *query) run() (message.Message, error) {
 	}
 	if s.sortIN {
 		q.sortRows()
+	}
+	if s.ann != nil {
+		q.annFinish()
 	}
 	return q.result()
 }
@@ -1184,6 +1235,9 @@ func (q *query) output(r *rowData, key []byte, staticOnly bool) error {
 		}
 		out[i] = v
 	}
+	if q.s.ann != nil {
+		return q.annAdd(r, out)
+	}
 	q.rows = append(q.rows, out)
 	if q.pageSize > 0 && len(q.rows) >= q.pageSize {
 		q.full = true
@@ -1210,6 +1264,16 @@ func (q *query) evaluate(s *selector, r *rowData) ([]byte, error) {
 	case selTerm:
 		v, _, err := s.t.bind(q.e)
 		return v, err
+	case selSimilarity:
+		x, err := q.evaluate(s.inner, r)
+		if err != nil {
+			return nil, err
+		}
+		y, err := q.evaluate(s.right, r)
+		if err != nil {
+			return nil, err
+		}
+		return similarityFunc(s.fn, s.inner.typ, x, y)
 	case selToJSON:
 		v, err := q.evaluate(s.inner, r)
 		if err != nil {
