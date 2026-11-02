@@ -23,8 +23,10 @@ import (
 // one and tries to get it chosen for the next epoch; if another value was
 // chosen there, it adopts that one and plans its change again.
 type CMS struct {
-	m       *Messaging
-	members []string
+	m *Messaging
+	// members returns the current members: the metadata records them, so
+	// the acceptors of an epoch are the members of the epoch before.
+	members func() []string
 	self    string
 	// current returns the local epoch and metadata; install installs a
 	// newer metadata snapshot (ignoring older ones).
@@ -107,7 +109,7 @@ type paxosResp struct {
 var ErrNoQuorum = errors.New("cluster: no quorum of the cluster metadata service")
 
 // NewCMS creates the metadata service client (and acceptor, on members).
-func NewCMS(m *Messaging, members []string, current func() (int64, []byte), install func([]byte) error,
+func NewCMS(m *Messaging, members func() []string, current func() (int64, []byte), install func([]byte) error,
 	info func(meta []byte, id string) (int64, bool, error)) *CMS {
 	c := &CMS{m: m, members: members, self: m.Addr(), current: current, install: install, info: info, acceptors: map[int64]*acceptor{}}
 	m.Handle(VerbPaxosPrepare, c.handlePrepare)
@@ -118,7 +120,7 @@ func NewCMS(m *Messaging, members []string, current func() (int64, []byte), inst
 }
 
 // Members returns the CMS members.
-func (c *CMS) Members() []string { return c.members }
+func (c *CMS) Members() []string { return c.members() }
 
 func (c *CMS) acceptorLocked(epoch int64) *acceptor {
 	a := c.acceptors[epoch]
@@ -201,14 +203,14 @@ func (c *CMS) CatchUp(from string) error {
 }
 
 // broadcast sends a request to every member, collecting the answers.
-func (c *CMS) broadcast(ctx context.Context, verb Verb, req paxosReq) []paxosResp {
+func (c *CMS) broadcast(ctx context.Context, members []string, verb Verb, req paxosReq) []paxosResp {
 	b, _ := json.Marshal(req)
 	type res struct {
 		r   paxosResp
 		err error
 	}
-	ch := make(chan res, len(c.members))
-	for _, mb := range c.members {
+	ch := make(chan res, len(members))
+	for _, mb := range members {
 		go func() {
 			out, err := c.m.Request(ctx, mb, verb, b)
 			var r paxosResp
@@ -219,7 +221,7 @@ func (c *CMS) broadcast(ctx context.Context, verb Verb, req paxosReq) []paxosRes
 		}()
 	}
 	var out []paxosResp
-	for range c.members {
+	for range members {
 		if r := <-ch; r.err == nil {
 			out = append(out, r.r)
 		}
@@ -232,7 +234,6 @@ func (c *CMS) broadcast(ctx context.Context, verb Verb, req paxosReq) []paxosRes
 // on newer metadata, if other changes win the race). It returns the epoch
 // at which the change is committed.
 func (c *CMS) Commit(ctx context.Context, plan func(current []byte, id string) ([]byte, error)) (int64, error) {
-	quorum := len(c.members)/2 + 1
 	id := fmt.Sprintf("%s/%d/%d", c.self, time.Now().UnixNano(), rand.Int63())
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -252,6 +253,8 @@ func (c *CMS) Commit(ctx context.Context, plan func(current []byte, id string) (
 			return 0, err
 		}
 		slot := epoch + 1
+		members := c.members()
+		quorum := len(members)/2 + 1
 		if e, _, err := c.info(next, id); err != nil || e != slot {
 			return 0, fmt.Errorf("cluster: planned metadata has epoch %d, want %d", e, slot)
 		}
@@ -262,7 +265,7 @@ func (c *CMS) Commit(ctx context.Context, plan func(current []byte, id string) (
 		c.mu.Unlock()
 
 		// Phase 1: prepare.
-		promises := c.broadcast(ctx, VerbPaxosPrepare, paxosReq{Epoch: slot, Ballot: b})
+		promises := c.broadcast(ctx, members, VerbPaxosPrepare, paxosReq{Epoch: slot, Ballot: b})
 		var ok []paxosResp
 		behind := false
 		for _, p := range promises {
@@ -296,7 +299,7 @@ func (c *CMS) Commit(ctx context.Context, plan func(current []byte, id string) (
 			}
 		}
 		// Phase 2: accept.
-		accepts := c.broadcast(ctx, VerbPaxosAccept, paxosReq{Epoch: slot, Ballot: b, Value: value})
+		accepts := c.broadcast(ctx, members, VerbPaxosAccept, paxosReq{Epoch: slot, Ballot: b, Value: value})
 		n := 0
 		for _, a := range accepts {
 			if a.OK {
@@ -320,7 +323,7 @@ func (c *CMS) Commit(ctx context.Context, plan func(current []byte, id string) (
 		if err := c.install(value); err != nil {
 			return 0, err
 		}
-		for _, mb := range c.members {
+		for _, mb := range members {
 			if mb != c.self {
 				go func() {
 					pctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -337,7 +340,7 @@ func (c *CMS) Commit(ctx context.Context, plan func(current []byte, id string) (
 }
 
 func (c *CMS) catchUpFromMembers() {
-	for _, mb := range c.members {
+	for _, mb := range c.members() {
 		if mb != c.self && c.CatchUp(mb) == nil {
 			return
 		}

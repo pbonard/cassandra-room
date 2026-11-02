@@ -171,7 +171,7 @@ func TestCMS(t *testing.T) {
 	var cmss []*CMS
 	for i, m := range ms {
 		state[i], _ = json.Marshal(meta{})
-		cmss = append(cmss, NewCMS(m, members, func() (int64, []byte) {
+		cmss = append(cmss, NewCMS(m, func() []string { return members }, func() (int64, []byte) {
 			mus[i].Lock()
 			defer mus[i].Unlock()
 			var x meta
@@ -285,7 +285,7 @@ func TestCMSPersistence(t *testing.T) {
 	defer m.Close()
 	cur := func() (int64, []byte) { return 0, []byte("{}") }
 	var saved []byte
-	c := NewCMS(m, []string{m.Addr()}, cur, func([]byte) error { return nil }, func([]byte, string) (int64, bool, error) { return 0, false, nil })
+	c := NewCMS(m, func() []string { return []string{m.Addr()} }, cur, func([]byte) error { return nil }, func([]byte, string) (int64, bool, error) { return 0, false, nil })
 	require.NoError(t, c.SetPersistence(nil, func(b []byte) error { saved = b; return nil }))
 	prepare := func(c *CMS, round int64) bool {
 		b, _ := json.Marshal(paxosReq{Epoch: 1, Ballot: ballot{Round: round, Node: "x"}})
@@ -297,7 +297,7 @@ func TestCMSPersistence(t *testing.T) {
 	}
 	require.True(t, prepare(c, 10))
 	require.NotEmpty(t, saved)
-	restarted := NewCMS(m, []string{m.Addr()}, cur, func([]byte) error { return nil }, func([]byte, string) (int64, bool, error) { return 0, false, nil })
+	restarted := NewCMS(m, func() []string { return []string{m.Addr()} }, cur, func([]byte) error { return nil }, func([]byte, string) (int64, bool, error) { return 0, false, nil })
 	require.NoError(t, restarted.SetPersistence(saved, func(b []byte) error { saved = b; return nil }))
 	require.False(t, prepare(restarted, 5), "a lower ballot than the one promised before the restart")
 	require.True(t, prepare(restarted, 11))

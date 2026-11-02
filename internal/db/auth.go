@@ -65,7 +65,7 @@ func (d *DB) defaultRoles() error {
 	if err != nil {
 		return err
 	}
-	_, err = d.change(func(next *Schema) (message.Message, bool, error) {
+	_, err = d.change("ROLES", func(next *Schema) (message.Message, bool, error) {
 		if len(next.Roles) > 0 {
 			return nil, false, nil
 		}
@@ -252,7 +252,7 @@ func (a *authStmt) execute(e *execCtx) (message.Message, error) {
 		}
 		hash = string(h)
 	}
-	return e.d.change(func(next *Schema) (message.Message, bool, error) { return a.plan(e, next, hash) })
+	return e.d.change("ROLES", func(next *Schema) (message.Message, bool, error) { return a.plan(e, next, hash) })
 }
 
 // plan applies a role or permission change to the metadata.

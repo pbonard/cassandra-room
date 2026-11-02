@@ -38,6 +38,7 @@ const (
 	VerbLWTPrepare
 	VerbLWTPropose
 	VerbLWTCommit
+	VerbStreamPush
 )
 
 // Handler handles a request and returns the response payload.

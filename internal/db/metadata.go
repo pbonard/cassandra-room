@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"time"
 
@@ -19,15 +20,32 @@ import (
 // place with side effects: storage is created for new tables and indexes,
 // storage of dropped ones is removed, new indexes are built.
 
-// maxEntries is how many change ids the metadata remembers.
-const maxEntries = 64
+// maxLog is how many changes the metadata log keeps.
+const maxLog = 256
 
 // errNoChange stops a commit whose plan changed nothing.
 var errNoChange = errors.New("db: no change")
 
-// change plans and applies a metadata change. plan modifies next and
-// returns the statement's result; changed false makes it a no-op.
-func (d *DB) change(plan func(next *Schema) (message.Message, bool, error)) (message.Message, error) {
+// change plans and applies a metadata change of a kind (a TCM
+// transformation's name). plan modifies next and returns the statement's
+// result; changed false makes it a no-op.
+func (d *DB) change(kind string, plan func(next *Schema) (message.Message, bool, error)) (message.Message, error) {
+	log := func(next *Schema, id string, res message.Message) {
+		detail := ""
+		if sc, ok := res.(*message.SchemaChangeResult); ok {
+			detail = fmt.Sprintf("%s %s %s", sc.ChangeType, sc.Target, sc.Keyspace)
+			if sc.Object != "" {
+				detail += "." + sc.Object
+			}
+		}
+		if next.logDetail != "" {
+			detail, next.logDetail = next.logDetail, ""
+		}
+		next.Log = append(next.Log, LogEntry{Epoch: next.Epoch, ID: id, Kind: kind, Detail: detail, Time: time.Now().UnixMilli()})
+		if len(next.Log) > maxLog {
+			next.Log = slices.Clone(next.Log[len(next.Log)-maxLog:])
+		}
+	}
 	if d.proxy == nil {
 		d.ddlMu.Lock()
 		defer d.ddlMu.Unlock()
@@ -37,6 +55,7 @@ func (d *DB) change(plan func(next *Schema) (message.Message, bool, error)) (mes
 			return res, err
 		}
 		next.Epoch++
+		log(next, "", res)
 		next.finish()
 		return res, d.installLocked(next)
 	}
@@ -57,10 +76,7 @@ func (d *DB) change(plan func(next *Schema) (message.Message, bool, error)) (mes
 			return nil, errNoChange
 		}
 		next.Epoch++
-		next.Entries = append(next.Entries, id)
-		if len(next.Entries) > maxEntries {
-			next.Entries = slices.Clone(next.Entries[len(next.Entries)-maxEntries:])
-		}
+		log(next, id, r)
 		next.finish()
 		return metadataBytes(next), nil
 	})
@@ -150,5 +166,5 @@ func metadataInfo(b []byte, id string) (int64, bool, error) {
 	if err != nil {
 		return 0, false, err
 	}
-	return s.Epoch, slices.Contains(s.Entries, id), nil
+	return s.Epoch, slices.ContainsFunc(s.Log, func(e LogEntry) bool { return e.ID == id }), nil
 }

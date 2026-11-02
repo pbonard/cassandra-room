@@ -29,6 +29,9 @@ import (
 type ClusterOptions struct {
 	// ListenAddress is the internode address, "host:port" (storage_port).
 	ListenAddress string
+	// ReplaceAddress makes a new node take the place of a dead one, given
+	// by address or host id (replace_address_first_boot).
+	ReplaceAddress string
 	// Seeds are internode addresses of nodes to join through.
 	Seeds []string
 	// NumTokens is the number of vnodes (num_tokens), 16 by default.
@@ -51,6 +54,12 @@ type proxy struct {
 	m      *cluster.Messaging
 	g      *cluster.Gossiper
 	cms    *cluster.CMS
+	// initialCMS are the metadata service's members before the metadata
+	// records any.
+	initialCMS []string
+	// replaced holds the host ids of nodes a joining node replaces: they
+	// count as down.
+	replaced atomic.Pointer[map[string]bool]
 	opts   ClusterOptions
 	ring   atomic.Pointer[cluster.Ring]
 	self   string
@@ -138,6 +147,7 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	m.Handle(cluster.VerbReadRange, p.handleReadRange)
 	m.Handle(cluster.VerbExecute, p.handleExecute)
 	m.Handle(cluster.VerbRepair, p.handleRepair)
+	m.Handle(cluster.VerbStreamPush, p.handleStreamPush)
 	for _, v := range []cluster.Verb{cluster.VerbLWTPrepare, cluster.VerbLWTPropose, cluster.VerbLWTCommit} {
 		m.Handle(v, p.handlePaxos(v))
 	}
@@ -145,12 +155,13 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	if o.Membership != nil {
 		p.g.SetConfig(*o.Membership)
 	}
-	// The seeds form the Cluster Metadata Service (TCM's initial CMS).
-	members := o.Seeds
-	if len(members) == 0 {
-		members = []string{p.self}
+	// The metadata names the Cluster Metadata Service's members; until the
+	// first commit records them, they are the seeds (TCM's initial CMS).
+	p.initialCMS = o.Seeds
+	if len(p.initialCMS) == 0 {
+		p.initialCMS = []string{p.self}
 	}
-	p.cms = cluster.NewCMS(m, members, d.currentMetadata, d.installBytes, metadataInfo)
+	p.cms = cluster.NewCMS(m, p.cmsMembers, d.currentMetadata, d.installBytes, metadataInfo)
 	saved, err := d.readFile(cmsStateFileName)
 	if err != nil {
 		m.Close()
@@ -185,13 +196,40 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	return nil
 }
 
+// up reports whether a node is up: alive, and not being replaced.
+func (p *proxy) up(n *cluster.Node) bool {
+	if r := p.replaced.Load(); r != nil && (*r)[n.HostID] {
+		return false
+	}
+	return n.Addr == p.self || p.g.IsAlive(n.Addr)
+}
+
+// cmsMembers returns the metadata service's members.
+func (p *proxy) cmsMembers() []string {
+	if m := p.d.schema.Load().CMS; len(m) > 0 {
+		return m
+	}
+	return p.initialCMS
+}
+
 // join registers this node in the cluster metadata and, if it joins a
 // cluster with data, bootstraps it: PrepareJoin, streaming, FinishJoin.
+// With ReplaceAddress it takes over a dead node's tokens instead
+// (PrepareReplace, streaming, FinishReplace).
 func (p *proxy) join() error {
 	d := p.d
 	me := &cluster.Node{Addr: p.self, HostID: d.local.HostID, NativeAddr: d.opts.Address.String(), NativePort: d.opts.Port,
 		DataCenter: d.opts.DataCenter, Rack: d.opts.Rack, Tokens: d.local.Tokens, ReleaseVersion: ReleaseVersion}
-	_, err := d.change(func(next *Schema) (message.Message, bool, error) {
+	if r := p.opts.ReplaceAddress; r != "" {
+		if cur := d.schema.Load().Nodes[me.HostID]; cur == nil || cur.Status == cluster.StatusJoining {
+			return p.replace(me, r)
+		}
+	}
+	kind := "REGISTER"
+	_, err := d.change(kind, func(next *Schema) (message.Message, bool, error) {
+		if len(next.CMS) == 0 {
+			next.CMS = slices.Clone(p.initialCMS)
+		}
 		cur := next.Nodes[me.HostID]
 		if cur != nil && cur.Status != cluster.StatusLeft && cur.Addr == me.Addr && cur.NativeAddr == me.NativeAddr && cur.NativePort == me.NativePort {
 			return nil, false, nil
@@ -208,6 +246,7 @@ func (p *proxy) join() error {
 			n.Status = cur.Status // an address change
 		}
 		next.Nodes[me.HostID] = &n
+		next.logDetail = fmt.Sprintf("%s %s as %s", n.HostID, n.Addr, n.Status)
 		return nil, true, nil
 	})
 	if err != nil {
@@ -219,18 +258,91 @@ func (p *proxy) join() error {
 	if err := p.bootstrap(); err != nil {
 		return err
 	}
-	return p.setStatus(cluster.StatusNormal)
+	return p.setNodeStatus("FINISH_JOIN", me.HostID, cluster.StatusNormal)
 }
 
-// setStatus commits a change of this node's state (FinishJoin,
-// PrepareLeave, FinishLeave).
-func (p *proxy) setStatus(status string) error {
-	_, err := p.d.change(func(next *Schema) (message.Message, bool, error) {
-		n := next.Nodes[p.d.local.HostID]
+// replace joins in place of a dead node (by address or host id): this
+// node takes its tokens as JOINING, so it receives the writes of its
+// ranges, streams them from the other replicas, then the dead node leaves
+// and this one becomes NORMAL in one commit.
+func (p *proxy) replace(me *cluster.Node, target string) error {
+	d := p.d
+	var old *cluster.Node
+	for _, n := range d.schema.Load().Nodes {
+		if (n.Addr == target || n.HostID == target) && n.HostID != me.HostID && n.Status == cluster.StatusNormal {
+			old = n
+		}
+	}
+	if old == nil {
+		return fmt.Errorf("db: no normal node %s to replace", target)
+	}
+	// A new node's membership view may not know yet that the node died:
+	// ask it directly.
+	if old.Addr != p.self {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_, err := p.m.Request(ctx, old.Addr, cluster.VerbMetadataFetch, nil)
+		cancel()
+		if err == nil {
+			return fmt.Errorf("db: cannot replace %s: it is alive", target)
+		}
+	}
+	if slices.Contains(p.cmsMembers(), old.Addr) && old.Addr != p.self {
+		return fmt.Errorf("db: cannot replace %s: it is a member of the cluster metadata service; reconfigure it first", target)
+	}
+	_, err := d.change("PREPARE_REPLACE", func(next *Schema) (message.Message, bool, error) {
+		o := next.Nodes[old.HostID]
+		if o == nil || o.Status != cluster.StatusNormal {
+			return nil, false, fmt.Errorf("db: node %s changed while preparing its replacement", target)
+		}
+		n := *me
+		n.Tokens, n.Status, n.Replaces = slices.Clone(o.Tokens), cluster.StatusJoining, o.HostID
+		next.Nodes[me.HostID] = &n
+		next.logDetail = fmt.Sprintf("%s %s replaces %s %s", n.HostID, n.Addr, o.HostID, o.Addr)
+		return nil, true, nil
+	})
+	if err != nil {
+		return fmt.Errorf("db: preparing the replacement of %s: %w", target, err)
+	}
+	d.local.Tokens = slices.Clone(old.Tokens)
+	d.ddlMu.Lock()
+	err = d.saveSchema(d.schema.Load())
+	d.ddlMu.Unlock()
+	if err != nil {
+		return err
+	}
+	if err := p.bootstrap(); err != nil {
+		return err
+	}
+	_, err = d.change("FINISH_REPLACE", func(next *Schema) (message.Message, bool, error) {
+		n, o := next.Nodes[me.HostID], next.Nodes[old.HostID]
+		if n == nil || n.Status != cluster.StatusJoining {
+			return nil, false, nil
+		}
+		n.Status, n.Replaces = cluster.StatusNormal, ""
+		if o != nil {
+			o.Status = cluster.StatusLeft
+		}
+		next.logDetail = fmt.Sprintf("%s replaced %s", n.HostID, old.HostID)
+		return nil, true, nil
+	})
+	return err
+}
+
+// setStatus commits a change of this node's state.
+func (p *proxy) setStatus(kind, status string) error {
+	return p.setNodeStatus(kind, p.d.local.HostID, status)
+}
+
+// setNodeStatus commits a change of a node's state (FinishJoin,
+// PrepareLeave, FinishLeave, and their removenode forms).
+func (p *proxy) setNodeStatus(kind, hostID, status string) error {
+	_, err := p.d.change(kind, func(next *Schema) (message.Message, bool, error) {
+		n := next.Nodes[hostID]
 		if n == nil || n.Status == status {
 			return nil, false, nil
 		}
 		n.Status = status
+		next.logDetail = fmt.Sprintf("%s %s %s", n.HostID, n.Addr, status)
 		return nil, true, nil
 	})
 	return err
@@ -247,6 +359,13 @@ func nodeList(s *Schema) []cluster.Node {
 
 // metadataChanged is called when a new metadata snapshot is installed.
 func (p *proxy) metadataChanged(s *Schema) {
+	replaced := map[string]bool{}
+	for _, n := range s.Nodes {
+		if n.Status == cluster.StatusJoining && n.Replaces != "" {
+			replaced[n.Replaces] = true
+		}
+	}
+	p.replaced.Store(&replaced)
 	p.ring.Store(cluster.NewRing(nodeList(s)))
 	p.g.Update(func(st *cluster.EndpointState) { st.Epoch = s.Epoch })
 }
@@ -313,7 +432,7 @@ func (p *proxy) replicas(k *Keyspace, token int64, cl primitive.ConsistencyLevel
 		if local && r.DataCenter != p.d.opts.DataCenter {
 			continue
 		}
-		if r.Addr == p.self || p.g.IsAlive(r.Addr) {
+		if p.up(r) {
 			up = append(up, r)
 		} else {
 			down = append(down, r)
@@ -463,7 +582,7 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 		}
 		for _, r := range g.reps {
 			nodes[r.Addr] = r
-			if r.Addr == p.self || p.g.IsAlive(r.Addr) {
+			if p.up(r) {
 				perNode[r.Addr] = append(perNode[r.Addr], w)
 			} else {
 				hints = append(hints, hint{hostID: r.HostID, w: w})
@@ -1313,7 +1432,7 @@ func (p *proxy) ownsPrimary(ks string, token int64) bool {
 		return true
 	}
 	for _, r := range p.ring.Load().Replicas(k.Replication, token) {
-		if r.Addr == p.self || p.g.IsAlive(r.Addr) {
+		if p.up(r) {
 			return r.Addr == p.self
 		}
 	}

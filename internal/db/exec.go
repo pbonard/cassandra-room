@@ -399,7 +399,7 @@ func (d *DB) grantCreator(user string, sc *message.SchemaChangeResult) {
 	default:
 		return
 	}
-	_, _ = d.change(func(next *Schema) (message.Message, bool, error) {
+	_, _ = d.change("ROLES", func(next *Schema) (message.Message, bool, error) {
 		r := next.Roles[user]
 		if r == nil || isSuper(next.Roles, user) {
 			return nil, false, nil

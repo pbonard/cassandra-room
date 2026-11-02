@@ -29,6 +29,8 @@ type Node struct {
 	Tokens         []int64
 	Status         string
 	ReleaseVersion string
+	// Replaces is the host id of the dead node a joining node replaces.
+	Replaces string `json:",omitempty"`
 }
 
 // Ring is the token ring (TokenMetadata): each token owns the range
@@ -64,8 +66,17 @@ func NewRing(states []Node) *Ring {
 // NewFutureRing builds the ring as it will be once joining nodes have
 // joined and leaving nodes have left (pending ranges).
 func NewFutureRing(states []Node) *Ring {
+	replaced := map[string]bool{}
+	for _, s := range states {
+		if s.Status == StatusJoining && s.Replaces != "" {
+			replaced[s.Replaces] = true
+		}
+	}
 	var next []Node
 	for _, s := range states {
+		if replaced[s.HostID] {
+			continue
+		}
 		switch s.Status {
 		case StatusJoining:
 			s.Status = StatusNormal

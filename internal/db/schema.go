@@ -179,6 +179,15 @@ func (k *Keyspace) resolve(name string) (*types.Type, error) {
 // Schema is the cluster metadata (TCM's ClusterMetadata): an immutable
 // snapshot of the schema, roles and, in a cluster, the node directory,
 // identified by its epoch. Every change produces a new snapshot.
+// LogEntry is a committed metadata change (system_views.cluster_metadata_log).
+type LogEntry struct {
+	Epoch  int64
+	ID     string
+	Kind   string
+	Detail string `json:",omitempty"`
+	Time   int64  // unix milliseconds
+}
+
 type Schema struct {
 	Keyspaces map[string]*Keyspace
 	Epoch     int64
@@ -187,12 +196,26 @@ type Schema struct {
 	Roles         map[string]*Role
 	// Nodes is the directory of a cluster's nodes, by host id.
 	Nodes map[string]*cluster.Node
-	// Entries are the ids of the latest changes, for idempotent commits.
-	Entries   []string
+	// CMS lists the members of the cluster metadata service (addresses).
+	CMS []string
+	// Log is the latest changes (TCM's metadata log), whose ids also make
+	// commits idempotent.
+	Log       []LogEntry
+	logDetail string // describes the change being planned, for Log
 	Version   [16]byte
 	byStorage map[lsm.TableID]*Table
 	// storage holds every storage table in use: tables' and indexes'.
 	storage map[lsm.TableID]bool
+}
+
+// nodeByAddr returns the directory's live (not LEFT) node at an address.
+func (s *Schema) nodeByAddr(addr string) *cluster.Node {
+	for _, n := range s.Nodes {
+		if n.Addr == addr && n.Status != cluster.StatusLeft {
+			return n
+		}
+	}
+	return nil
 }
 
 func (s *Schema) table(ks, name string) (*Table, error) {
@@ -212,7 +235,7 @@ func (s *Schema) table(ks, name string) (*Table, error) {
 func (s *Schema) clone() *Schema {
 	out := &Schema{Keyspaces: make(map[string]*Keyspace, len(s.Keyspaces)), Epoch: s.Epoch,
 		NextStorageID: s.NextStorageID, Roles: cloneRoles(s.Roles), Nodes: map[string]*cluster.Node{},
-		Entries: slices.Clone(s.Entries)}
+		CMS: slices.Clone(s.CMS), Log: slices.Clone(s.Log)}
 	for id, n := range s.Nodes {
 		c := *n
 		c.Tokens = slices.Clone(n.Tokens)

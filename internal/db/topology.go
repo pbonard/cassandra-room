@@ -14,6 +14,7 @@ import (
 	"github.com/cassandra-room/cassandra-room/internal/cluster"
 	"github.com/cassandra-room/cassandra-room/internal/storage/lsm"
 	"github.com/cassandra-room/cassandra-room/internal/types"
+	"github.com/datastax/go-cassandra-native-protocol/message"
 )
 
 // Topology changes: bootstrap (BootStrapper, RangeStreamer), decommission
@@ -143,7 +144,7 @@ func (p *proxy) bootstrap() error {
 			}
 			var src string
 			for _, n := range cur.Replicas(k.Replication, r[1]) {
-				if n.Addr != p.self && p.g.IsAlive(n.Addr) {
+				if n.Addr != p.self && p.up(n) {
 					src = n.Addr
 					break
 				}
@@ -182,7 +183,8 @@ func (p *proxy) pendingReplicas(k *Keyspace, token int64, current []*cluster.Nod
 	}
 	var out []*cluster.Node
 	for _, n := range cluster.NewFutureRing(states).Replicas(k.Replication, token) {
-		if !containsAddr(current, n.Addr) {
+		// By host id: a replacement may reuse the dead node's address.
+		if !slices.ContainsFunc(current, func(c *cluster.Node) bool { return c.HostID == n.HostID }) {
 			out = append(out, n)
 		}
 	}
@@ -196,7 +198,7 @@ func (d *DB) Decommission() error {
 	if p == nil {
 		return errors.New("db: not a cluster node")
 	}
-	if slices.Contains(p.cms.Members(), p.self) {
+	if slices.Contains(p.cmsMembers(), p.self) {
 		return errors.New("db: a member of the cluster metadata service cannot be decommissioned")
 	}
 	// Like StorageService.decommission, refuse to leave fewer nodes than a
@@ -227,7 +229,7 @@ func (d *DB) Decommission() error {
 	}
 	// PrepareLeave: once committed (and pushed to the live nodes), writes
 	// also go to the nodes taking over this node's ranges.
-	if err := p.setStatus(cluster.StatusLeaving); err != nil {
+	if err := p.setStatus("PREPARE_LEAVE", cluster.StatusLeaving); err != nil {
 		return err
 	}
 	cur := p.ring.Load()
@@ -252,7 +254,7 @@ func (d *DB) Decommission() error {
 	}
 	p.replayHints()
 	// FinishLeave.
-	return p.setStatus(cluster.StatusLeft)
+	return p.setStatus("FINISH_LEAVE", cluster.StatusLeft)
 }
 
 // ---- repair ----
@@ -447,4 +449,139 @@ func (d *DB) Cleanup(keyspace string) (int, error) {
 		cleaned++
 	}
 	return cleaned, nil
+}
+
+// streamRequest asks a node to push a key range of a table to another.
+type streamRequest struct {
+	Table  uint64
+	Lo, Hi []byte
+	To     string
+}
+
+func (p *proxy) handleStreamPush(_ string, payload []byte) ([]byte, error) {
+	var r streamRequest
+	if err := json.Unmarshal(payload, &r); err != nil {
+		return nil, err
+	}
+	n, err := p.pushRange(r.To, lsm.TableID(r.Table), r.Lo, r.Hi)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(n)
+}
+
+// RemoveNode removes a dead node from the cluster (nodetool removenode):
+// it is marked LEAVING, the nodes that become replicas of its ranges get
+// their data from the surviving replicas, then it is LEFT.
+func (d *DB) RemoveNode(target string) error {
+	p := d.proxy
+	if p == nil {
+		return errors.New("db: not a cluster node")
+	}
+	var dead *cluster.Node
+	for _, n := range d.schema.Load().Nodes {
+		if (n.Addr == target || n.HostID == target) && n.Status != cluster.StatusLeft {
+			dead = n
+		}
+	}
+	switch {
+	case dead == nil:
+		return fmt.Errorf("db: no node %s in the cluster", target)
+	case dead.HostID == d.local.HostID:
+		return errors.New("db: a node cannot remove itself; use decommission")
+	case p.g.IsAlive(dead.Addr):
+		return fmt.Errorf("db: node %s is alive; decommission it instead", target)
+	case slices.Contains(p.cmsMembers(), dead.Addr):
+		return fmt.Errorf("db: node %s is a member of the cluster metadata service; reconfigure it first", target)
+	}
+	if err := p.setNodeStatus("PREPARE_REMOVE", dead.HostID, cluster.StatusLeaving); err != nil {
+		return err
+	}
+	cur := p.ring.Load()
+	future := cluster.NewFutureRing(nodeList(d.schema.Load()))
+	for _, t := range d.userTables() {
+		k := d.schema.Load().Keyspaces[t.Keyspace]
+		for _, r := range cur.Ranges() {
+			reps := cur.Replicas(k.Replication, r[1])
+			if !containsAddr(reps, dead.Addr) {
+				continue
+			}
+			var src *cluster.Node
+			for _, n := range reps {
+				if n.HostID != dead.HostID && p.up(n) {
+					src = n
+					break
+				}
+			}
+			for _, n := range future.Replicas(k.Replication, r[1]) {
+				if slices.ContainsFunc(reps, func(c *cluster.Node) bool { return c.HostID == n.HostID }) {
+					continue
+				}
+				if src == nil {
+					return fmt.Errorf("db: no live replica left for range (%d, %d] of %s", r[0], r[1], k.Name)
+				}
+				for _, kr := range keyRangesOf(r[0], r[1]) {
+					if err := p.streamBetween(src.Addr, n.Addr, t.Storage, kr[0], kr[1]); err != nil {
+						return fmt.Errorf("db: removenode streaming from %s to %s: %w", src.Addr, n.Addr, err)
+					}
+				}
+			}
+		}
+	}
+	return p.setNodeStatus("FINISH_REMOVE", dead.HostID, cluster.StatusLeft)
+}
+
+// streamBetween copies a key range of a table from one node to another.
+func (p *proxy) streamBetween(from, to string, id lsm.TableID, lo, hi []byte) error {
+	switch {
+	case to == p.self:
+		_, err := p.fetchRange(from, id, lo, hi)
+		return err
+	case from == p.self:
+		_, err := p.pushRange(to, id, lo, hi)
+		return err
+	}
+	b, _ := json.Marshal(streamRequest{Table: uint64(id), Lo: lo, Hi: hi, To: to})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	_, err := p.m.Request(ctx, from, cluster.VerbStreamPush, b)
+	return err
+}
+
+// ReconfigureCMS sets the members of the cluster metadata service (TCM's
+// nodetool cms reconfigure): they must be normal, live nodes. The change
+// is committed by the current members; the next epochs are decided by the
+// new ones.
+func (d *DB) ReconfigureCMS(members []string) error {
+	p := d.proxy
+	if p == nil {
+		return errors.New("db: not a cluster node")
+	}
+	if len(members) == 0 {
+		return errors.New("db: the metadata service needs at least one member")
+	}
+	s := d.schema.Load()
+	for _, m := range members {
+		ok := false
+		for _, n := range s.Nodes {
+			if n.Addr == m && n.Status == cluster.StatusNormal && p.up(n) {
+				ok = true
+			}
+		}
+		if !ok {
+			return fmt.Errorf("db: %s is not a live normal node", m)
+		}
+	}
+	members = slices.Clone(members)
+	slices.Sort(members)
+	members = slices.Compact(members)
+	_, err := d.change("RECONFIGURE_CMS", func(next *Schema) (message.Message, bool, error) {
+		if slices.Equal(next.CMS, members) {
+			return nil, false, nil
+		}
+		next.CMS = members
+		next.logDetail = strings.Join(members, ",")
+		return nil, true, nil
+	})
+	return err
 }

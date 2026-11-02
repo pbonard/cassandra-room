@@ -36,10 +36,11 @@ func main() {
 		authorizer            = flag.String("authorizer", "AllowAllAuthorizer", "AllowAllAuthorizer or CassandraAuthorizer")
 		listenAddress         = flag.String("listen-address", "", "Internode address host:port (listen_address and storage_port); empty runs a single node")
 		seeds                 = flag.String("seeds", "", "Comma-separated internode addresses of seed nodes")
+		replaceAddress        = flag.String("replace-address", "", "Replace a dead node (its internode address or host id) on first boot")
 		numTokens             = flag.Int("num-tokens", 16, "Number of tokens (vnodes) of this node")
 		dataCenter            = flag.String("dc", "datacenter1", "Data center of this node")
 		rack                  = flag.String("rack", "rack1", "Rack of this node")
-		adminAddress          = flag.String("admin-address", "", "HTTP address for nodetool-style operations: GET /status, POST /repair?keyspace=, POST /cleanup?keyspace=, POST /decommission")
+		adminAddress          = flag.String("admin-address", "", "HTTP address for nodetool-style operations: GET /status, POST /repair?keyspace=, POST /cleanup?keyspace=, POST /removenode?node=, POST /cms/reconfigure?members=, POST /decommission")
 	)
 	flag.Parse()
 
@@ -59,7 +60,7 @@ func main() {
 		Authenticator: *authenticator == "PasswordAuthenticator", Authorizer: *authorizer == "CassandraAuthorizer"}
 	opts.DataCenter, opts.Rack = *dataCenter, *rack
 	if *listenAddress != "" {
-		opts.Cluster = &db.ClusterOptions{ListenAddress: *listenAddress, NumTokens: *numTokens}
+		opts.Cluster = &db.ClusterOptions{ListenAddress: *listenAddress, NumTokens: *numTokens, ReplaceAddress: *replaceAddress}
 		for _, s := range strings.Split(*seeds, ",") {
 			if s = strings.TrimSpace(s); s != "" {
 				opts.Cluster.Seeds = append(opts.Cluster.Seeds, s)
@@ -148,6 +149,26 @@ func serveAdmin(addr string, d *db.DB) {
 			return
 		}
 		fmt.Fprintf(w, "cleaned %d tables\n", n)
+	})
+	mux.HandleFunc("POST /removenode", func(w http.ResponseWriter, r *http.Request) {
+		if err := d.RemoveNode(r.URL.Query().Get("node")); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintln(w, "removed")
+	})
+	mux.HandleFunc("POST /cms/reconfigure", func(w http.ResponseWriter, r *http.Request) {
+		var members []string
+		for _, m := range strings.Split(r.URL.Query().Get("members"), ",") {
+			if m = strings.TrimSpace(m); m != "" {
+				members = append(members, m)
+			}
+		}
+		if err := d.ReconfigureCMS(members); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintln(w, "the metadata service is now", strings.Join(members, ", "))
 	})
 	mux.HandleFunc("POST /decommission", func(w http.ResponseWriter, _ *http.Request) {
 		if err := d.Decommission(); err != nil {

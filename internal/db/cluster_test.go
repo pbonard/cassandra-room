@@ -55,9 +55,19 @@ func newTestCluster(t *testing.T, n int) *testCluster {
 	return c
 }
 
-func (c *testCluster) start(i int) {
+func (c *testCluster) start(i int) { c.startReplacing(i, "") }
+
+// add adds a node (not started).
+func (c *testCluster) add() int {
+	c.fs = append(c.fs, vfs.NewMem())
+	c.addrs = append(c.addrs, freeAddr(c.t))
+	c.nodes = append(c.nodes, nil)
+	return len(c.nodes) - 1
+}
+
+func (c *testCluster) startReplacing(i int, replace string) {
 	d, err := Open("db", Options{FS: c.fs[i], Address: net.IPv4(127, 0, 0, byte(1+i)), Cluster: &ClusterOptions{
-		ListenAddress: c.addrs[i], Seeds: []string{c.addrs[0]}, NumTokens: 8,
+		ListenAddress: c.addrs[i], Seeds: []string{c.addrs[0]}, NumTokens: 8, ReplaceAddress: replace,
 		Membership:   testMembership(),
 		WriteTimeout: time.Second, ReadTimeout: time.Second,
 	}})
@@ -463,4 +473,52 @@ func TestClusterPaxos(t *testing.T) {
 	require.Eventually(t, func() bool { return !c.nodes[0].proxy.g.IsAlive(c.addrs[1]) }, 5*time.Second, 20*time.Millisecond)
 	_, ok := c.exec(0, quorum, "UPDATE ks.c SET v = 1002 WHERE k = 1 IF v = 1001").(*message.Unavailable)
 	require.True(t, ok)
+}
+
+// TestClusterOperations covers the metadata log, reconfiguring the
+// metadata service, removing a dead node and replacing one.
+func TestClusterOperations(t *testing.T) {
+	c := newTestCluster(t, 4)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
+	c.ok(0, quorum, "CREATE TABLE ks.kv (k int PRIMARY KEY, v text)")
+	for i := 0; i < 200; i++ {
+		c.ok(i%4, quorum, "INSERT INTO ks.kv (k, v) VALUES (?, ?)", i, fmt.Sprint("v", i))
+	}
+	kinds := c.values(1, one, "SELECT kind FROM system_views.cluster_metadata_log")
+	require.Contains(t, kinds, "REGISTER")
+	require.Contains(t, kinds, "SCHEMA_CHANGE")
+
+	// A three-member metadata service.
+	require.NoError(t, c.nodes[1].ReconfigureCMS([]string{c.addrs[0], c.addrs[1], c.addrs[2]}))
+	require.Eventually(t, func() bool { return len(c.nodes[3].schema.Load().CMS) == 3 }, 5*time.Second, 10*time.Millisecond)
+	require.Len(t, c.values(3, one, "SELECT host_id FROM system_views.cluster_metadata_directory WHERE cms_member = true ALLOW FILTERING"), 3)
+	c.ok(2, quorum, "CREATE TABLE ks.other (k int PRIMARY KEY)")
+
+	// Node 3 dies and is removed: its ranges get new replicas.
+	c.stop(3)
+	require.Eventually(t, func() bool { return !c.nodes[0].proxy.g.IsAlive(c.addrs[3]) }, 5*time.Second, 10*time.Millisecond)
+	require.Error(t, c.nodes[0].RemoveNode(c.addrs[1]), "a live node")
+	require.NoError(t, c.nodes[0].RemoveNode(c.addrs[3]))
+	c.nodes, c.fs, c.addrs = c.nodes[:3], c.fs[:3], c.addrs[:3]
+	require.Eventually(t, func() bool { return len(c.nodes[2].proxy.ring.Load().Nodes()) == 3 }, 5*time.Second, 10*time.Millisecond)
+	c.checkReplicas(200)
+
+	// Node 2, a metadata service member, dies: the service shrinks to two
+	// members (still a quorum of the three), and a new node replaces it.
+	c.stop(2)
+	require.Eventually(t, func() bool { return !c.nodes[0].proxy.g.IsAlive(c.addrs[2]) }, 5*time.Second, 10*time.Millisecond)
+	require.NoError(t, c.nodes[0].ReconfigureCMS([]string{c.addrs[0], c.addrs[1]}))
+	oldID := c.nodes[0].schema.Load().nodeByAddr(c.addrs[2]).HostID
+	oldTokens := c.nodes[0].schema.Load().nodeByAddr(c.addrs[2]).Tokens
+	n := c.add()
+	c.startReplacing(n, c.addrs[2])
+	c.nodes = []*DB{c.nodes[0], c.nodes[1], c.nodes[n]}
+	c.addrs = []string{c.addrs[0], c.addrs[1], c.addrs[n]}
+	s := c.nodes[0].schema.Load()
+	require.Equal(t, "LEFT", s.Nodes[oldID].Status)
+	me := s.Nodes[c.nodes[2].local.HostID]
+	require.Equal(t, "NORMAL", me.Status)
+	require.ElementsMatch(t, oldTokens, me.Tokens)
+	c.checkReplicas(200)
+	require.Len(t, c.values(2, all, "SELECT k FROM ks.kv"), 200)
 }

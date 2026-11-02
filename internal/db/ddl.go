@@ -76,7 +76,7 @@ func schemaChange(change primitive.SchemaChangeType, ks, table string) *message.
 }
 
 func (s *ddlStmt) execute(e *execCtx) (message.Message, error) {
-	return e.d.change(func(next *Schema) (message.Message, bool, error) { return s.plan(e, next) })
+	return e.d.change("SCHEMA_CHANGE", func(next *Schema) (message.Message, bool, error) { return s.plan(e, next) })
 }
 
 // plan applies the statement to next, a copy of the cluster metadata

@@ -105,7 +105,8 @@ type schemaFile struct {
 	Tables    []json.RawMessage
 	Roles     []*Role         `json:",omitempty"`
 	Nodes     []*cluster.Node `json:",omitempty"`
-	Entries   []string        `json:",omitempty"`
+	CMS       []string        `json:",omitempty"`
+	Log       []LogEntry      `json:",omitempty"`
 }
 
 const schemaFileName = "schema.json"
@@ -267,7 +268,7 @@ func parseSchemaFile(b []byte) (*Schema, *schemaFile, error) {
 		return nil, nil, fmt.Errorf("db: corrupt schema file: %w", err)
 	}
 	s := &Schema{Keyspaces: map[string]*Keyspace{}, Epoch: sf.Epoch, NextStorageID: sf.NextStorageID,
-		Roles: map[string]*Role{}, Nodes: map[string]*cluster.Node{}, Entries: sf.Entries}
+		Roles: map[string]*Role{}, Nodes: map[string]*cluster.Node{}, CMS: sf.CMS, Log: sf.Log}
 	for _, r := range sf.Roles {
 		s.Roles[r.Name] = r
 	}
@@ -360,7 +361,7 @@ func (d *DB) timestamp() int64 {
 
 // file returns the durable form of the metadata.
 func (s *Schema) file() *schemaFile {
-	sf := &schemaFile{Epoch: s.Epoch, NextStorageID: s.NextStorageID, Entries: s.Entries}
+	sf := &schemaFile{Epoch: s.Epoch, NextStorageID: s.NextStorageID, CMS: s.CMS, Log: s.Log}
 	for _, r := range s.Roles {
 		sf.Roles = append(sf.Roles, r)
 	}

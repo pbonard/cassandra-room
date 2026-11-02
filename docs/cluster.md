@@ -113,14 +113,29 @@ node, the coordinator in a cluster.
   indexes) without the rows of ranges this node no longer replicates, as
   nodetool cleanup does after nodes join; refused while nodes are joining
   or leaving.
+- **Removenode** (`POST /removenode?node=`, an address or host id): a dead
+  node is committed LEAVING; for each of its ranges, the nodes that become
+  replicas get the data from a surviving replica (the coordinator asks the
+  source to push it); then it is LEFT.
+- **Replace** (`-replace-address` on a new node's first boot): the new
+  node takes the dead node's tokens as JOINING with `Replaces` set (writes
+  of those ranges reach it as a pending replica, the dead node counts as
+  down even if the address is reused), streams them from the other
+  replicas, then one commit makes it NORMAL and the dead node LEFT.
+- **Metadata service membership** (`POST /cms/reconfigure?members=`) is
+  part of the metadata: the members of epoch N decide epoch N+1, so a
+  reconfiguration is committed by the old members and the following epochs
+  by the new ones. The seeds are the initial members.
+- **Metadata log**: each commit records its epoch, kind (REGISTER,
+  PREPARE_JOIN/FINISH_JOIN, PREPARE_LEAVE/FINISH_LEAVE, PREPARE_REMOVE,
+  PREPARE_REPLACE/FINISH_REPLACE, RECONFIGURE_CMS, SCHEMA_CHANGE, ROLES)
+  and what it did; the last 256 are in `system_views.cluster_metadata_log`,
+  the node directory in `system_views.cluster_metadata_directory`.
 - `GET /status` is nodetool status.
 
 ## Not done
 
-CMS membership changes (it is fixed to
-the seeds), the metadata log itself (only the latest snapshot is kept);
-`removenode` and
-`replace_address`, internode encryption and compression, EACH_QUORUM per
+replaying the metadata log (each epoch's value is a full snapshot); internode encryption and compression, EACH_QUORUM per
 data center (it is approximated as QUORUM), digest reads, speculative
 retry by latency.
 

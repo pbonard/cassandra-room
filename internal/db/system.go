@@ -3,6 +3,7 @@ package db
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"slices"
 	"sort"
@@ -37,6 +38,13 @@ var systemTables = map[string]map[string]string{
 		"peers_v2": `CREATE TABLE peers_v2 (peer inet, peer_port int, data_center text, host_id uuid, preferred_ip inet,
 			preferred_port int, rack text, release_version text, native_address inet, native_port int,
 			schema_version uuid, tokens set<varchar>, PRIMARY KEY ((peer), peer_port))`,
+	},
+	"system_views": {
+		"cluster_metadata_log": `CREATE TABLE cluster_metadata_log (epoch bigint, entry_id text, entry_time timestamp,
+			kind text, transformation text, PRIMARY KEY ((epoch)))`,
+		"cluster_metadata_directory": `CREATE TABLE cluster_metadata_directory (host_id uuid, address text,
+			native_address text, state text, data_center text, rack text, release_version text,
+			tokens set<text>, cms_member boolean, replaces uuid, PRIMARY KEY ((host_id)))`,
 	},
 	"system_schema": {
 		"keyspaces": `CREATE TABLE keyspaces (keyspace_name text, durable_writes boolean,
@@ -125,6 +133,10 @@ func virtualRows(ks, table string) func(d *DB) []map[string][]byte {
 		return typeRows
 	case "system_schema.indexes":
 		return indexRows
+	case "system_views.cluster_metadata_log":
+		return metadataLogRows
+	case "system_views.cluster_metadata_directory":
+		return directoryRows
 	}
 	return func(*DB) []map[string][]byte { return nil }
 }
@@ -476,6 +488,35 @@ func indexRows(d *DB) []map[string][]byte {
 				})
 			}
 		}
+	}
+	return out
+}
+
+func bigintV(n int64) []byte { return binary.BigEndian.AppendUint64(nil, uint64(n)) }
+
+func metadataLogRows(d *DB) []map[string][]byte {
+	var out []map[string][]byte
+	for _, e := range d.schema.Load().Log {
+		out = append(out, map[string][]byte{"epoch": bigintV(e.Epoch), "entry_id": textV(e.ID),
+			"entry_time": bigintV(e.Time), "kind": textV(e.Kind), "transformation": textV(e.Detail)})
+	}
+	return out
+}
+
+func directoryRows(d *DB) []map[string][]byte {
+	s := d.schema.Load()
+	var out []map[string][]byte
+	for _, n := range s.Nodes {
+		id, _ := types.ParseUUID(n.HostID)
+		r := map[string][]byte{"host_id": uuidV(id[:]), "address": textV(n.Addr),
+			"native_address": textV(fmt.Sprintf("%s:%d", n.NativeAddr, n.NativePort)), "state": textV(n.Status),
+			"data_center": textV(n.DataCenter), "rack": textV(n.Rack), "release_version": textV(n.ReleaseVersion),
+			"tokens": textSetV(tokenStrings(n.Tokens)...), "cms_member": boolV(slices.Contains(s.CMS, n.Addr))}
+		if n.Replaces != "" {
+			old, _ := types.ParseUUID(n.Replaces)
+			r["replaces"] = uuidV(old[:])
+		}
+		out = append(out, r)
 	}
 	return out
 }
