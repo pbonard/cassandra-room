@@ -1,6 +1,7 @@
 package db
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"github.com/cassandra-room/cassandra-room/internal/cluster"
@@ -177,9 +178,12 @@ func TestClusterReplication(t *testing.T) {
 		c.ok(i%3, quorum, "INSERT INTO ks.kv (k, v) VALUES (?, ?)", i, fmt.Sprint("v", i))
 	}
 	// Every node holds every row (RF 3): read locally on each.
+	// (QUORUM acknowledges before the third replica has applied a write.)
 	for n := range c.nodes {
-		res := c.nodes[n].Execute(mustPrepare(t, c.nodes[n], "SELECT count(*) FROM ks.kv"), &RequestOptions{Consistency: one, local: true, forwarded: true})
-		require.Equal(t, []byte{0, 0, 0, 0, 0, 0, 0, 100}, []byte(res.(*message.RowsResult).Data[0][0]), "node %d", n)
+		require.Eventually(t, func() bool {
+			res := c.nodes[n].Execute(mustPrepare(t, c.nodes[n], "SELECT count(*) FROM ks.kv"), &RequestOptions{Consistency: one, local: true, forwarded: true})
+			return bytes.Equal([]byte{0, 0, 0, 0, 0, 0, 0, 100}, res.(*message.RowsResult).Data[0][0])
+		}, 5*time.Second, 10*time.Millisecond, "node %d", n)
 	}
 	require.Equal(t, []string{"v42"}, c.values(2, all, "SELECT v FROM ks.kv WHERE k = 42"))
 	require.Len(t, c.values(0, quorum, "SELECT k FROM ks.kv"), 100)
