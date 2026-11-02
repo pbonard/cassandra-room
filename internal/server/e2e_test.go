@@ -157,6 +157,30 @@ func TestGocql(t *testing.T) {
 			require.ErrorAs(t, err, &reqErr)
 			require.Equal(t, gocql.ErrCodeSyntax, reqErr.Code())
 
+			// Multi-cell columns and counters.
+			require.NoError(t, s.Query(`CREATE TYPE addr (street text, zip int)`).Exec())
+			require.NoError(t, s.Query(`CREATE TABLE prof (id int PRIMARY KEY, tags set<text>, hist list<int>, kv map<text, int>, home addr)`).Exec())
+			require.NoError(t, s.Query(`UPDATE prof SET tags = tags + ?, hist = hist + ?, kv = kv + ?, home = ? WHERE id = 1`,
+				[]string{"x", "y"}, []int{1, 2}, map[string]int{"a": 1}, map[string]any{"street": "Main", "zip": 7}).Exec())
+			require.NoError(t, s.Query(`UPDATE prof SET hist = [0] + hist, kv['b'] = 2, home.zip = 8 WHERE id = 1`).Exec())
+			var gotTags []string
+			var hist []int
+			var kv map[string]int
+			home := map[string]any{}
+			require.NoError(t, s.Query(`SELECT tags, hist, kv, home FROM prof WHERE id = 1`).Scan(&gotTags, &hist, &kv, &home))
+			require.Equal(t, []string{"x", "y"}, gotTags)
+			require.Equal(t, []int{0, 1, 2}, hist)
+			require.Equal(t, map[string]int{"a": 1, "b": 2}, kv)
+			require.Equal(t, "Main", home["street"])
+			require.Equal(t, 8, home["zip"])
+			require.NoError(t, s.Query(`CREATE TABLE views (page text PRIMARY KEY, n counter)`).Exec())
+			for i := 0; i < 5; i++ {
+				require.NoError(t, s.Query(`UPDATE views SET n = n + ? WHERE page = ?`, int64(3), "home").Exec())
+			}
+			var views int64
+			require.NoError(t, s.Query(`SELECT n FROM views WHERE page = 'home'`).Scan(&views))
+			require.Equal(t, int64(15), views)
+
 			// Schema metadata through the driver.
 			md, err := s.KeyspaceMetadata(ks)
 			require.NoError(t, err)

@@ -47,6 +47,12 @@ type SetLiteral struct{ Elems []Term }
 // MapLiteral is {k: v, ...}.
 type MapLiteral struct{ Keys, Values []Term }
 
+// UDTLiteral is {field: value, ...} for a user-defined type.
+type UDTLiteral struct {
+	Fields []string
+	Values []Term
+}
+
 // TupleLiteral is (a, b) in a value position.
 type TupleLiteral struct{ Elems []Term }
 
@@ -64,6 +70,7 @@ func (*ListLiteral) term()  {}
 func (*SetLiteral) term()   {}
 func (*MapLiteral) term()   {}
 func (*TupleLiteral) term() {}
+func (*UDTLiteral) term()   {}
 func (*Cast) term()         {}
 
 // Property is name = value in a WITH clause.
@@ -259,6 +266,31 @@ type DropTable struct {
 	Keyspace, Table string
 	IfExists        bool
 }
+
+// CreateType is CREATE TYPE.
+type CreateType struct {
+	Keyspace, Name string
+	IfNotExists    bool
+	Fields         []ColumnDef
+}
+
+// AlterType is ALTER TYPE ... ADD or RENAME.
+type AlterType struct {
+	Keyspace, Name string
+	IfExists       bool
+	Add            []ColumnDef
+	Rename         [][2]string
+}
+
+// DropType is DROP TYPE.
+type DropType struct {
+	Keyspace, Name string
+	IfExists       bool
+}
+
+func (*CreateType) stmt() {}
+func (*AlterType) stmt()  {}
+func (*DropType) stmt()   {}
 
 // Truncate is TRUNCATE.
 type Truncate struct{ Keyspace, Table string }

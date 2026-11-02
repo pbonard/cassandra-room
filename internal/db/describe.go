@@ -78,6 +78,9 @@ func (d *describeStmt) execute(e *execCtx) (message.Message, error) {
 		if only {
 			return
 		}
+		for _, u := range k.UserTypes {
+			element(k.Name, "type", u.Name, typeCQL(k, u))
+		}
 		for _, t := range tables(k) {
 			element(k.Name, "table", t.Name, tableCQL(t))
 		}
@@ -114,7 +117,16 @@ func (d *describeStmt) execute(e *execCtx) (message.Message, error) {
 				list(k.Name, "table", t.Name)
 			}
 		}
-	case "TYPES", "FUNCTIONS", "AGGREGATES":
+	case "TYPES":
+		for _, k := range keyspaces() {
+			if d.session != "" && k.Name != d.session {
+				continue
+			}
+			for _, u := range k.UserTypes {
+				list(k.Name, "type", u.Name)
+			}
+		}
+	case "FUNCTIONS", "AGGREGATES":
 	case "SCHEMA":
 		for _, k := range keyspaces() {
 			if k.virtual && !r.Full {
@@ -273,5 +285,21 @@ func tableCQL(t *Table) string {
 	b.WriteString(" WITH ")
 	b.WriteString(strings.Join(opts, "\n    AND "))
 	b.WriteString(";")
+	return b.String()
+}
+
+// typeCQL is UserType.toCqlString.
+func typeCQL(k *Keyspace, u UserType) string {
+	t := k.types[u.Name]
+	var b strings.Builder
+	fmt.Fprintf(&b, "CREATE TYPE %s.%s (\n", quoteName(k.Name), quoteName(u.Name))
+	for i, f := range u.Fields {
+		sep := ",\n"
+		if i == len(u.Fields)-1 {
+			sep = "\n"
+		}
+		fmt.Fprintf(&b, "    %s %s%s", quoteName(f), t.Elems[i], sep)
+	}
+	b.WriteString(");")
 	return b.String()
 }

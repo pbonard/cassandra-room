@@ -282,3 +282,83 @@ func TestSplitByTimestamp(t *testing.T) {
 	}
 	require.Greater(t, split, 5000)
 }
+
+// randomComplexRow adds multi-cell columns (paths, complex deletions) and
+// counter cells to random rows.
+func randomComplexRow(rng *rand.Rand) []byte {
+	r := Row{Deletion: Deletion{MarkedForDeleteAt: NoTimestamp}}
+	if rng.IntN(6) == 0 {
+		r.Deletion = Deletion{MarkedForDeleteAt: int64(rng.IntN(20)), LocalDeletionTime: int64(rng.IntN(3))}
+	}
+	for col := uint32(0); col < 4; col++ {
+		switch col {
+		case 0: // simple
+			if rng.IntN(2) == 0 {
+				r.Cells = append(r.Cells, live(col, int64(rng.IntN(20)), string(rune('a'+rng.IntN(3)))))
+			}
+		case 1, 2: // multi-cell
+			if rng.IntN(3) == 0 {
+				r.Cells = append(r.Cells, Cell{Column: col, ComplexDeletion: true, Timestamp: int64(rng.IntN(20)), LocalDeletionTime: int64(rng.IntN(3))})
+			}
+			for p := 0; p < 3; p++ {
+				if rng.IntN(2) == 0 {
+					continue
+				}
+				c := live(col, int64(rng.IntN(20)), string(rune('a'+rng.IntN(3))))
+				if rng.IntN(4) == 0 {
+					c = tombstone(col, c.Timestamp, int64(rng.IntN(3)))
+				}
+				c.Path = []byte{byte('k' + p)}
+				r.Cells = append(r.Cells, c)
+			}
+		case 3: // counter
+			if rng.IntN(2) == 0 {
+				var id [16]byte
+				id[0] = byte(rng.IntN(3))
+				ctx := CounterContext(id, int64(rng.IntN(5)), int64(rng.IntN(100)))
+				r.Cells = append(r.Cells, Cell{Column: col, Counter: true, Timestamp: int64(rng.IntN(20)), LocalDeletionTime: NoDeletionTime, Value: ctx})
+			}
+		}
+	}
+	return Append(nil, &r)
+}
+
+func TestMergeAlgebraComplex(t *testing.T) {
+	rng := rand.New(rand.NewPCG(3, 4))
+	for i := 0; i < 20000; i++ {
+		a, b, c := randomComplexRow(rng), randomComplexRow(rng), randomComplexRow(rng)
+		require.True(t, bytes.Equal(mustMerge(t, a, b), mustMerge(t, b, a)), "commutative")
+		l := mustMerge(t, mustMerge(t, a, b), c)
+		r := mustMerge(t, a, mustMerge(t, b, c))
+		require.True(t, bytes.Equal(l, r), "associative")
+		require.True(t, bytes.Equal(mustMerge(t, l, l), l), "idempotent")
+	}
+}
+
+func TestComplexDeletionShadows(t *testing.T) {
+	old := Append(nil, &Row{Deletion: Deletion{MarkedForDeleteAt: NoTimestamp}, Cells: []Cell{
+		{Column: 1, Path: []byte("a"), Timestamp: 5, LocalDeletionTime: NoDeletionTime, Value: []byte("x")},
+		{Column: 1, Path: []byte("b"), Timestamp: 5, LocalDeletionTime: NoDeletionTime, Value: []byte("y")},
+	}})
+	// Overwriting the collection: complex deletion at 9, new element at 10.
+	repl := Append(nil, &Row{Deletion: Deletion{MarkedForDeleteAt: NoTimestamp}, Cells: []Cell{
+		{Column: 1, ComplexDeletion: true, Timestamp: 9, LocalDeletionTime: 100},
+		{Column: 1, Path: []byte("c"), Timestamp: 10, LocalDeletionTime: NoDeletionTime, Value: []byte("z")},
+	}})
+	r := merge(t, old, repl)
+	require.Len(t, r.Cells, 2)
+	require.True(t, r.Cells[0].ComplexDeletion)
+	require.Equal(t, "c", string(r.Cells[1].Path))
+}
+
+func TestCounterContext(t *testing.T) {
+	a, b := [16]byte{1}, [16]byte{2}
+	x := CounterContext(a, 1, 5)
+	y := MergeCounter(CounterContext(b, 1, 7), CounterContext(a, 2, 8))
+	m := MergeCounter(x, y)
+	require.EqualValues(t, 15, CounterValue(m))
+	clock, count, ok := CounterShard(m, a)
+	require.True(t, ok)
+	require.EqualValues(t, 2, clock)
+	require.EqualValues(t, 8, count)
+}

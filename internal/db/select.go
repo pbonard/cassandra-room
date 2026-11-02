@@ -257,6 +257,12 @@ func prepareSelector(t *Table, raw cql.Selectable, vs *vars) (selector, error) {
 			if c.Kind != Regular && c.Kind != Static {
 				return selector{}, invalidf("Cannot use selection function %s on PRIMARY KEY part %s", name, c.Name)
 			}
+			if c.Type.IsMultiCell() {
+				return selector{}, invalidf("Cannot use selection function %s on non-frozen %s %s", name, map[bool]string{true: "UDT", false: "collection"}[c.Type.Kind == types.UDT], c.Name)
+			}
+			if c.Type.Kind == types.Counter {
+				return selector{}, invalidf("Cannot use selection function %s on counter column %s", name, c.Name)
+			}
 			if name == "ttl" {
 				return selector{kind: selTTL, name: "ttl(" + c.Name + ")", typ: types.IntType, col: c}, nil
 			}
@@ -359,6 +365,20 @@ func findCell(cells []row.Cell, id uint32) *row.Cell {
 
 // value returns a column's value in r, nil if null.
 func (r *rowData) value(c *Column) []byte {
+	if c.Type.IsMultiCell() || c.Type.Kind == types.Counter {
+		cells := r.cells
+		if c.Kind == Static {
+			cells = r.statics
+		}
+		cc := columnCells(cells, c.ID)
+		if c.Type.Kind == types.Counter {
+			if len(cc) == 0 || !cc[0].Counter {
+				return nil
+			}
+			return binary.BigEndian.AppendUint64(nil, uint64(row.CounterValue(cc[0].Value)))
+		}
+		return assemble(c.Type, cc)
+	}
 	switch c.Kind {
 	case PartitionKey:
 		return r.pk[c.Position]

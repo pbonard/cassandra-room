@@ -180,6 +180,8 @@ func (p *parser) statement() (Statement, error) {
 		return &Truncate{Keyspace: ks, Table: tbl}, err
 	case "create":
 		switch {
+		case p.isWordAt(1, "type"):
+			return p.createType()
 		case p.isWordAt(1, "keyspace"), p.isWordAt(1, "schema"):
 			return p.createKeyspace()
 		case p.isWordAt(1, "table"), p.isWordAt(1, "columnfamily"):
@@ -187,6 +189,8 @@ func (p *parser) statement() (Statement, error) {
 		}
 	case "alter":
 		switch {
+		case p.isWordAt(1, "type"):
+			return p.alterType()
 		case p.isWordAt(1, "keyspace"), p.isWordAt(1, "schema"):
 			return p.alterKeyspace()
 		case p.isWordAt(1, "table"), p.isWordAt(1, "columnfamily"):
@@ -194,6 +198,14 @@ func (p *parser) statement() (Statement, error) {
 		}
 	case "drop":
 		switch {
+		case p.isWordAt(1, "type"):
+			p.i += 2
+			ifExists, err := p.ifExists()
+			if err != nil {
+				return nil, err
+			}
+			ks, name, err := p.tableName()
+			return &DropType{Keyspace: ks, Name: name, IfExists: ifExists}, err
 		case p.isWordAt(1, "keyspace"), p.isWordAt(1, "schema"):
 			p.i += 2
 			ifExists, err := p.ifExists()
@@ -705,6 +717,27 @@ func (p *parser) mapOrSet() (Term, error) {
 	p.next() // {
 	if p.punct("}") {
 		return &MapLiteral{}, nil
+	}
+	if t := p.peek(); (t.kind == tIdent && t.text != "null" || t.kind == tQuoted) && p.isPunctAt(1, ":") {
+		u := &UDTLiteral{}
+		for {
+			f, err := p.ident()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expectPunct(":"); err != nil {
+				return nil, err
+			}
+			v, err := p.term()
+			if err != nil {
+				return nil, err
+			}
+			u.Fields, u.Values = append(u.Fields, f), append(u.Values, v)
+			if !p.punct(",") {
+				break
+			}
+		}
+		return u, p.expectPunct("}")
 	}
 	first, err := p.term()
 	if err != nil {
@@ -1381,4 +1414,81 @@ func (p *parser) describe() (*Describe, error) {
 		d.Internals = true
 	}
 	return d, nil
+}
+
+func (p *parser) createType() (*CreateType, error) {
+	p.i += 2
+	s := &CreateType{}
+	var err error
+	if s.IfNotExists, err = p.ifNotExists(); err != nil {
+		return nil, err
+	}
+	if s.Keyspace, s.Name, err = p.tableName(); err != nil {
+		return nil, err
+	}
+	if err := p.expectPunct("("); err != nil {
+		return nil, err
+	}
+	for {
+		name, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		typ, err := p.typeText()
+		if err != nil {
+			return nil, err
+		}
+		s.Fields = append(s.Fields, ColumnDef{Name: name, Type: typ})
+		if !p.punct(",") {
+			break
+		}
+	}
+	return s, p.expectPunct(")")
+}
+
+func (p *parser) alterType() (*AlterType, error) {
+	p.i += 2
+	s := &AlterType{}
+	var err error
+	if s.IfExists, err = p.ifExists(); err != nil {
+		return nil, err
+	}
+	if s.Keyspace, s.Name, err = p.tableName(); err != nil {
+		return nil, err
+	}
+	switch {
+	case p.word("add"):
+		p.ifNotExists()
+		name, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		typ, err := p.typeText()
+		if err != nil {
+			return nil, err
+		}
+		s.Add = []ColumnDef{{Name: name, Type: typ}}
+	case p.word("rename"):
+		p.ifExists()
+		for {
+			from, err := p.ident()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expectWord("to"); err != nil {
+				return nil, err
+			}
+			to, err := p.ident()
+			if err != nil {
+				return nil, err
+			}
+			s.Rename = append(s.Rename, [2]string{from, to})
+			if !p.word("and") {
+				break
+			}
+		}
+	default:
+		return nil, &UnsupportedError{Statement: "ALTER TYPE"}
+	}
+	return s, nil
 }

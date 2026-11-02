@@ -7,15 +7,23 @@
 // with Merge, which is commutative and associative, so the storage engine can
 // combine them in any order.
 //
-// Encoding:
+// Encoding (version 2; version 1 has no cell flags, paths or counters):
 //
 //	row  := version(1) | flags(1) | [deletion] | uvarint numCells | cell...
 //	deletion := varint markedForDeleteAt | varint localDeletionTime
-//	cell := uvarint column | varint timestamp | varint localDeletionTime
+//	cell := uvarint (column << 3 | cellFlags) | [uvarint len | path]
+//	        | varint timestamp | varint localDeletionTime
 //	        | uvarint ttl | (live or expiring only) uvarint len | value
 //
 // localDeletionTime is NoDeletionTime for live cells, the expiry time for
 // expiring cells, and the deletion time for tombstones.
+//
+// Multi-cell (complex) columns, such as non-frozen collections, have one
+// cell per element, identified by its path (the element's byte-comparable
+// key), and optionally a complex deletion: a tombstone without path that
+// sorts first in the column and shadows the column's older cells (Cassandra's
+// ComplexColumnData.complexDeletion). Counter cells hold a counter context
+// (see CounterContext) and are merged by context, not by timestamp.
 package row
 
 import (
@@ -28,8 +36,12 @@ import (
 )
 
 const (
-	version         = 1
+	version         = 2
 	flagHasDeletion = 1
+
+	cellHasPath         = 1
+	cellCounter         = 2
+	cellComplexDeletion = 4
 	// NoDeletionTime marks a live cell, as Cassandra's Cell.NO_DELETION_TIME.
 	NoDeletionTime = math.MaxInt64
 	// NoTimestamp means "no deletion" for a row deletion.
@@ -39,13 +51,37 @@ const (
 // ErrCorrupt is returned for a value that is not a valid row.
 var ErrCorrupt = errors.New("row: corrupt value")
 
-// Cell is one column value of a row.
+// Cell is one column value of a row, or one element of a multi-cell column.
 type Cell struct {
-	Column            uint32
+	Column uint32
+	// Path identifies an element of a multi-cell column; nil for a simple
+	// column.
+	Path []byte
+	// ComplexDeletion marks a multi-cell column's deletion (a tombstone).
+	ComplexDeletion bool
+	// Counter marks a counter cell, whose value is a counter context.
+	Counter           bool
 	Timestamp         int64
 	LocalDeletionTime int64 // NoDeletionTime for live cells
 	TTL               uint32
 	Value             []byte
+}
+
+// Compare orders cells within a row: by column, a column's complex
+// deletion first, then by path.
+func Compare(a, b *Cell) int {
+	switch {
+	case a.Column < b.Column:
+		return -1
+	case a.Column > b.Column:
+		return 1
+	case a.ComplexDeletion != b.ComplexDeletion:
+		if a.ComplexDeletion {
+			return -1
+		}
+		return 1
+	}
+	return bytes.Compare(a.Path, b.Path)
 }
 
 // IsTombstone reports whether the cell is a deletion.
@@ -110,23 +146,63 @@ func Append(dst []byte, r *Row) []byte {
 		dst = binary.AppendVarint(dst, r.Deletion.MarkedForDeleteAt)
 		dst = binary.AppendVarint(dst, r.Deletion.LocalDeletionTime)
 	}
+	keep := func(i int, cd *complexShadow) bool {
+		c := &r.Cells[i]
+		if r.Deletion.Deletes(c.Timestamp) || c.Counter && !r.Deletion.IsLive() {
+			return false
+		}
+		return cd.keep(c)
+	}
 	n := 0
+	var cd complexShadow
 	for i := range r.Cells {
-		if !r.Deletion.Deletes(r.Cells[i].Timestamp) {
+		if keep(i, &cd) {
 			n++
 		}
 	}
 	dst = binary.AppendUvarint(dst, uint64(n))
+	cd = complexShadow{}
 	for i := range r.Cells {
-		if !r.Deletion.Deletes(r.Cells[i].Timestamp) {
+		if keep(i, &cd) {
 			dst = appendCell(dst, &r.Cells[i])
 		}
 	}
 	return dst
 }
 
+// complexShadow tracks the complex deletion of the column being written,
+// which shadows the column's cells at or below its timestamp.
+type complexShadow struct {
+	set    bool
+	column uint32
+	ts     int64
+}
+
+// keep notes a complex deletion and reports whether c survives.
+func (s *complexShadow) keep(c *Cell) bool {
+	if c.ComplexDeletion {
+		s.set, s.column, s.ts = true, c.Column, c.Timestamp
+		return true
+	}
+	return !(s.set && s.column == c.Column && c.Path != nil && c.Timestamp <= s.ts)
+}
+
 func appendCell(dst []byte, c *Cell) []byte {
-	dst = binary.AppendUvarint(dst, uint64(c.Column))
+	flags := uint64(0)
+	if c.Path != nil {
+		flags |= cellHasPath
+	}
+	if c.Counter {
+		flags |= cellCounter
+	}
+	if c.ComplexDeletion {
+		flags |= cellComplexDeletion
+	}
+	dst = binary.AppendUvarint(dst, uint64(c.Column)<<3|flags)
+	if c.Path != nil {
+		dst = binary.AppendUvarint(dst, uint64(len(c.Path)))
+		dst = append(dst, c.Path...)
+	}
 	dst = binary.AppendVarint(dst, c.Timestamp)
 	dst = binary.AppendVarint(dst, c.LocalDeletionTime)
 	dst = binary.AppendUvarint(dst, uint64(c.TTL))
@@ -144,14 +220,16 @@ type decoder struct {
 	deletion Deletion
 	n        uint64
 	err      error
+	v1       bool
 }
 
 func newDecoder(b []byte) decoder {
 	d := decoder{deletion: Deletion{MarkedForDeleteAt: NoTimestamp}}
-	if len(b) < 2 || b[0] != version {
+	if len(b) < 2 || b[0] != version && b[0] != 1 {
 		d.err = ErrCorrupt
 		return d
 	}
+	d.v1 = b[0] == 1
 	flags := b[1]
 	d.b = b[2:]
 	if flags&flagHasDeletion != 0 {
@@ -188,7 +266,23 @@ func (d *decoder) next(c *Cell) bool {
 		return false
 	}
 	d.n--
-	c.Column = uint32(d.uvarint())
+	c.Path, c.Counter, c.ComplexDeletion = nil, false, false
+	if d.v1 {
+		c.Column = uint32(d.uvarint())
+	} else {
+		h := d.uvarint()
+		c.Column = uint32(h >> 3)
+		c.Counter, c.ComplexDeletion = h&cellCounter != 0, h&cellComplexDeletion != 0
+		if h&cellHasPath != 0 {
+			l := d.uvarint()
+			if d.err == nil && uint64(len(d.b)) < l {
+				d.err = ErrCorrupt
+				return false
+			}
+			c.Path = d.b[:l:l]
+			d.b = d.b[l:]
+		}
+	}
 	c.Timestamp = d.varint()
 	c.LocalDeletionTime = d.varint()
 	c.TTL = uint32(d.uvarint())
@@ -233,6 +327,22 @@ var rowPool = sync.Pool{New: func() any { return new(Row) }}
 // reconcile returns the cell that wins between two cells of the same column
 // (Cassandra's Cells.resolveRegular).
 func reconcile(l, r *Cell) *Cell {
+	// A counter deletion is final: it wins over live counter cells whatever
+	// their timestamps (Cassandra documents that a deleted counter cannot be
+	// reused), which keeps merging associative with merged contexts.
+	if l.Counter && !l.IsTombstone() && r.IsTombstone() {
+		return r
+	}
+	if r.Counter && !r.IsTombstone() && l.IsTombstone() {
+		return l
+	}
+	if l.Counter && r.Counter && !l.IsTombstone() && !r.IsTombstone() {
+		// Live counter cells merge their contexts (Cells.resolveCounter).
+		out := *l
+		out.Timestamp = max(l.Timestamp, r.Timestamp)
+		out.Value = MergeCounter(l.Value, r.Value)
+		return &out
+	}
 	if l.Timestamp != r.Timestamp {
 		if l.Timestamp > r.Timestamp {
 			return l
@@ -300,8 +410,11 @@ func Merge(dst, a, b []byte) ([]byte, error) {
 	countAt := len(dst)
 	dst = append(dst, make([]byte, binary.MaxVarintLen32)...)
 	var count uint64
+	var cd complexShadow
 	emit := func(c *Cell) {
-		if del.Deletes(c.Timestamp) {
+		// A row deletion deletes counters for good, like a counter
+		// tombstone (see reconcile).
+		if del.Deletes(c.Timestamp) || c.Counter && !del.IsLive() || !cd.keep(c) {
 			return
 		}
 		dst = appendCell(dst, c)
@@ -310,11 +423,15 @@ func Merge(dst, a, b []byte) ([]byte, error) {
 	var ca, cb Cell
 	okA, okB := da.next(&ca), db.next(&cb)
 	for okA || okB {
+		var c int
+		if okA && okB {
+			c = Compare(&ca, &cb)
+		}
 		switch {
-		case okA && (!okB || ca.Column < cb.Column):
+		case okA && (!okB || c < 0):
 			emit(&ca)
 			okA = da.next(&ca)
-		case okB && (!okA || cb.Column < ca.Column):
+		case okB && (!okA || c > 0):
 			emit(&cb)
 			okB = db.next(&cb)
 		default:
@@ -625,4 +742,71 @@ func SplitByTimestamp(v []byte, bucket func(ts int64) int64) ([]Part, error) {
 // SplitByTimestamp implements lsm.TimeSplitter.
 func (Merger) SplitByTimestamp(v []byte, bucket func(ts int64) int64) ([]Part, error) {
 	return SplitByTimestamp(v, bucket)
+}
+
+// Counter contexts (CounterContext, with global shards only): one shard per
+// node that updated the counter, sorted by node id, each with a logical
+// clock and the node's total. Two contexts merge shard by shard, the higher
+// clock winning; the counter's value is the sum of the shards' totals.
+//
+//	shard := id (16 bytes) | clock (8 bytes) | count (8 bytes)
+
+const counterShardSize = 32
+
+// CounterContext returns a context with one shard.
+func CounterContext(id [16]byte, clock, count int64) []byte {
+	out := make([]byte, 0, counterShardSize)
+	out = append(out, id[:]...)
+	out = binary.BigEndian.AppendUint64(out, uint64(clock))
+	return binary.BigEndian.AppendUint64(out, uint64(count))
+}
+
+// CounterValue returns a context's value.
+func CounterValue(ctx []byte) int64 {
+	var v int64
+	for i := 0; i+counterShardSize <= len(ctx); i += counterShardSize {
+		v += int64(binary.BigEndian.Uint64(ctx[i+24:]))
+	}
+	return v
+}
+
+// CounterShard returns a node's shard of a context.
+func CounterShard(ctx []byte, id [16]byte) (clock, count int64, ok bool) {
+	for i := 0; i+counterShardSize <= len(ctx); i += counterShardSize {
+		if bytes.Equal(ctx[i:i+16], id[:]) {
+			return int64(binary.BigEndian.Uint64(ctx[i+16:])), int64(binary.BigEndian.Uint64(ctx[i+24:])), true
+		}
+	}
+	return 0, 0, false
+}
+
+// MergeCounter merges two contexts.
+func MergeCounter(a, b []byte) []byte {
+	out := make([]byte, 0, max(len(a), len(b)))
+	for len(a) >= counterShardSize || len(b) >= counterShardSize {
+		var c int
+		switch {
+		case len(a) < counterShardSize:
+			c = 1
+		case len(b) < counterShardSize:
+			c = -1
+		default:
+			c = bytes.Compare(a[:16], b[:16])
+		}
+		switch {
+		case c < 0:
+			out, a = append(out, a[:counterShardSize]...), a[counterShardSize:]
+		case c > 0:
+			out, b = append(out, b[:counterShardSize]...), b[counterShardSize:]
+		default:
+			ca, cb := int64(binary.BigEndian.Uint64(a[16:])), int64(binary.BigEndian.Uint64(b[16:]))
+			win := a
+			if cb > ca || cb == ca && bytes.Compare(b[24:32], a[24:32]) > 0 {
+				win = b
+			}
+			out = append(out, win[:counterShardSize]...)
+			a, b = a[counterShardSize:], b[counterShardSize:]
+		}
+	}
+	return out
 }

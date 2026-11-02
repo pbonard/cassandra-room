@@ -84,7 +84,7 @@ func addSystemKeyspaces(s *Schema) {
 			if err != nil {
 				panic(err)
 			}
-			t, err := buildTable(ksName, p.Statement.(*cql.CreateTable), true)
+			t, err := buildTable(ksName, nil, p.Statement.(*cql.CreateTable), true)
 			if err != nil {
 				panic(err)
 			}
@@ -116,6 +116,8 @@ func virtualRows(ks, table string) func(d *DB) []map[string][]byte {
 		return tableRows
 	case "system_schema.columns":
 		return columnRows
+	case "system_schema.types":
+		return typeRows
 	}
 	return func(*DB) []map[string][]byte { return nil }
 }
@@ -363,3 +365,31 @@ func (it *sliceIter) Error() error  { return nil }
 func (it *sliceIter) Close() error  { return nil }
 
 var _ = strings.ToLower
+
+func textListV(elems []string) []byte {
+	vals := make([][]byte, len(elems))
+	for i, e := range elems {
+		vals[i] = []byte(e)
+	}
+	return types.BuildCollection(len(vals), vals)
+}
+
+func typeRows(d *DB) []map[string][]byte {
+	var out []map[string][]byte
+	for _, k := range sortedKeyspaces(d) {
+		for _, u := range k.UserTypes {
+			t := k.types[u.Name]
+			var ft []string
+			for _, e := range t.Elems {
+				ft = append(ft, e.String())
+			}
+			out = append(out, map[string][]byte{
+				"keyspace_name": textV(k.Name),
+				"type_name":     textV(u.Name),
+				"field_names":   textListV(u.Fields),
+				"field_types":   textListV(ft),
+			})
+		}
+	}
+	return out
+}

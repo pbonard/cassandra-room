@@ -154,7 +154,7 @@ func AppendComparable(dst []byte, t *Type, v []byte) ([]byte, error) {
 			}
 		}
 		return append(dst, Terminator), nil
-	case Tuple:
+	case Tuple, UDT:
 		fields, err := SplitTuple(v)
 		if err != nil {
 			return nil, err
@@ -387,14 +387,14 @@ func (r *reader) value(t *Type) ([]byte, error) {
 		return r.fixed(int(l))
 	case Decimal:
 		return r.decimal()
-	case List, Set, Map, Tuple:
+	case List, Set, Map, Tuple, UDT:
 		var elems [][]byte
 		for r.peek() != Terminator {
 			et := t.Elems[0]
 			switch t.Kind {
 			case Map:
 				et = t.Elems[len(elems)%2]
-			case Tuple:
+			case Tuple, UDT:
 				if len(elems) >= len(t.Elems) {
 					return nil, errBadComparable
 				}
@@ -408,7 +408,7 @@ func (r *reader) value(t *Type) ([]byte, error) {
 		}
 		r.i++
 		switch t.Kind {
-		case Tuple:
+		case Tuple, UDT:
 			return BuildTuple(elems), nil
 		case Map:
 			return BuildCollection(len(elems)/2, elems), nil

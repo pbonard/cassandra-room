@@ -44,6 +44,7 @@ const (
 	Set
 	Map
 	Tuple
+	UDT
 )
 
 var names = map[Kind]string{
@@ -64,12 +65,16 @@ var byName = func() map[string]Kind {
 	return m
 }()
 
-// Type is a CQL type. Collections and tuples have element types; a
-// collection is Frozen when it is stored as one value (tuples always are).
+// Type is a CQL type. Collections, tuples and user types have element
+// types; a collection or user type is Frozen when it is stored as one value
+// (tuples always are).
 type Type struct {
 	Kind   Kind
-	Elems  []*Type // list, set: 1; map: key and value; tuple: the fields
+	Elems  []*Type // list, set: 1; map: key and value; tuple, UDT: the fields
 	Frozen bool
+	// A user-defined type's keyspace, name and field names.
+	Keyspace, Name string
+	Fields         []string
 }
 
 // Native types, shared.
@@ -107,8 +112,8 @@ func MapOf(k, v *Type, frozen bool) *Type {
 func (t *Type) IsCollection() bool { return t.Kind == List || t.Kind == Set || t.Kind == Map }
 
 // IsMultiCell reports whether values of t are stored as several cells: a
-// collection that is not frozen.
-func (t *Type) IsMultiCell() bool { return t.IsCollection() && !t.Frozen }
+// collection or user type that is not frozen.
+func (t *Type) IsMultiCell() bool { return (t.IsCollection() || t.Kind == UDT) && !t.Frozen }
 
 // String returns the type as CQL writes it (CQL3Type.toString): frozen
 // collections and tuples, at any depth, as frozen<...>.
@@ -121,6 +126,13 @@ func (t *Type) String() string {
 func (t *Type) write(b *strings.Builder) {
 	if t.Frozen {
 		b.WriteString("frozen<")
+	}
+	if t.Kind == UDT {
+		b.WriteString(QuoteName(t.Name))
+		if t.Frozen {
+			b.WriteByte('>')
+		}
+		return
 	}
 	b.WriteString(names[t.Kind])
 	if len(t.Elems) > 0 {
@@ -140,7 +152,10 @@ func (t *Type) write(b *strings.Builder) {
 
 // Equal reports whether two types are the same.
 func (t *Type) Equal(o *Type) bool {
-	if t.Kind != o.Kind || len(t.Elems) != len(o.Elems) || (t.IsCollection() && t.Frozen != o.Frozen) {
+	if t.Kind != o.Kind || len(t.Elems) != len(o.Elems) || ((t.IsCollection() || t.Kind == UDT) && t.Frozen != o.Frozen) {
+		return false
+	}
+	if t.Kind == UDT && (t.Keyspace != o.Keyspace || t.Name != o.Name) {
 		return false
 	}
 	for i := range t.Elems {
@@ -154,8 +169,11 @@ func (t *Type) Equal(o *Type) bool {
 // Parse parses a CQL type such as "int", "frozen<map<text, int>>" or
 // "tuple<int, text>". Collections nested in collections or tuples must be
 // frozen, as in Cassandra; Parse freezes them.
-func Parse(s string) (*Type, error) {
-	p := typeParser{s: s}
+func Parse(s string) (*Type, error) { return ParseWith(s, nil) }
+
+// ParseWith parses a type, resolving user-defined type names with resolve.
+func ParseWith(s string, resolve func(name string) (*Type, error)) (*Type, error) {
+	p := typeParser{s: s, resolve: resolve}
 	t, err := p.parse(false)
 	if err != nil {
 		return nil, err
@@ -168,8 +186,10 @@ func Parse(s string) (*Type, error) {
 }
 
 type typeParser struct {
-	s string
-	i int
+	s       string
+	i       int
+	resolve func(string) (*Type, error)
+	quoted  bool
 }
 
 func (p *typeParser) skipSpace() {
@@ -179,6 +199,7 @@ func (p *typeParser) skipSpace() {
 }
 
 func (p *typeParser) ident() string {
+	p.quoted = false
 	p.skipSpace()
 	if p.i < len(p.s) && p.s[p.i] == '"' {
 		j := strings.IndexByte(p.s[p.i+1:], '"')
@@ -187,6 +208,7 @@ func (p *typeParser) ident() string {
 		}
 		id := p.s[p.i+1 : p.i+1+j]
 		p.i += j + 2
+		p.quoted = true
 		return id
 	}
 	j := p.i
@@ -208,8 +230,20 @@ func (p *typeParser) expect(c byte) error {
 
 func (p *typeParser) parse(nested bool) (*Type, error) {
 	name := p.ident()
-	if k, ok := byName[name]; ok {
+	if k, ok := byName[name]; ok && !p.quoted {
 		return &Type{Kind: k}, nil
+	}
+	if p.quoted || (byName[name] == 0 && name != "frozen" && name != "list" && name != "set" && name != "map" && name != "tuple" && name != "") {
+		if p.resolve == nil {
+			return nil, fmt.Errorf("unknown type %s", name)
+		}
+		u, err := p.resolve(name)
+		if err != nil {
+			return nil, err
+		}
+		cp := *u
+		cp.Frozen = nested
+		return &cp, nil
 	}
 	var t *Type
 	switch name {
@@ -299,7 +333,7 @@ func (p *typeParser) parse(nested bool) (*Type, error) {
 
 // freeze marks t and every collection inside it frozen.
 func (t *Type) freeze() {
-	t.Frozen = t.IsCollection() || t.Kind == Tuple
+	t.Frozen = t.IsCollection() || t.Kind == Tuple || t.Kind == UDT
 	for _, e := range t.Elems {
 		e.freeze()
 	}
@@ -360,6 +394,13 @@ func (t *Type) DataType() datatype.DataType {
 			dts[i] = e.DataType()
 		}
 		return datatype.NewTuple(dts...)
+	case UDT:
+		dts := make([]datatype.DataType, len(t.Elems))
+		for i, e := range t.Elems {
+			dts[i] = e.DataType()
+		}
+		dt, _ := datatype.NewUserDefined(t.Keyspace, t.Name, t.Fields, dts)
+		return dt
 	}
 	panic(fmt.Sprintf("types: unknown kind %d", t.Kind))
 }
@@ -454,7 +495,7 @@ func (t *Type) Validate(v []byte) error {
 				return err
 			}
 		}
-	case Tuple:
+	case Tuple, UDT:
 		fields, err := SplitTuple(v)
 		if err != nil {
 			return err
@@ -557,4 +598,30 @@ func BuildTuple(fields [][]byte) []byte {
 		out = append(out, f...)
 	}
 	return out
+}
+
+// QuoteName quotes an identifier if CQL needs it (ColumnIdentifier.maybeQuote).
+func QuoteName(n string) string {
+	plain := n != ""
+	for i := 0; i < len(n); i++ {
+		c := n[i]
+		if !(c >= 'a' && c <= 'z' || c == '_' || i > 0 && c >= '0' && c <= '9') {
+			plain = false
+		}
+	}
+	if plain && !reservedWords[n] {
+		return n
+	}
+	return `"` + strings.ReplaceAll(n, `"`, `""`) + `"`
+}
+
+var reservedWords = map[string]bool{
+	"add": true, "allow": true, "alter": true, "and": true, "apply": true, "asc": true, "authorize": true,
+	"batch": true, "begin": true, "by": true, "columnfamily": true, "create": true, "delete": true, "desc": true,
+	"describe": true, "drop": true, "entries": true, "execute": true, "from": true, "full": true, "grant": true,
+	"if": true, "in": true, "index": true, "infinity": true, "insert": true, "into": true, "keyspace": true,
+	"limit": true, "modify": true, "nan": true, "norecursive": true, "not": true, "null": true, "of": true,
+	"on": true, "or": true, "order": true, "primary": true, "rename": true, "revoke": true, "schema": true,
+	"select": true, "set": true, "table": true, "to": true, "token": true, "truncate": true, "unlogged": true,
+	"update": true, "use": true, "using": true, "where": true, "with": true,
 }

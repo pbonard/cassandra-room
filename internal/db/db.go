@@ -63,6 +63,15 @@ type DB struct {
 	pending atomic.Pointer[Table]
 
 	lastTS atomic.Int64
+
+	// hostID is the node's id, which owns its shard of counters.
+	hostID [16]byte
+	// listSeq and nodeSuffix make list element paths unique.
+	listSeq    atomic.Uint32
+	nodeSuffix [4]byte
+	// counterMu serializes counter updates, which read the node's shard
+	// before writing it (Cassandra's counter locks).
+	counterMu sync.Mutex
 }
 
 // localState is persisted with the schema.
@@ -114,6 +123,8 @@ func Open(dir string, opts Options) (*DB, error) {
 	if err := d.loadSchema(); err != nil {
 		return nil, err
 	}
+	d.hostID, _ = types.ParseUUID(d.local.HostID)
+	copy(d.nodeSuffix[:], d.hostID[12:])
 	eo := opts.Engine
 	eo.FS = d.fs
 	eo.Merger = row.Merger{}
@@ -197,16 +208,23 @@ func (d *DB) loadSchema() error {
 		d.local = sf.Local
 		for _, k := range sf.Keyspaces {
 			k.Tables = map[string]*Table{}
+			if err := k.buildTypes(); err != nil {
+				return fmt.Errorf("db: corrupt schema file: %w", err)
+			}
 			s.Keyspaces[k.Name] = k
 		}
 		for _, raw := range sf.Tables {
-			t, err := unmarshalTable(raw)
-			if err != nil {
+			var head struct{ Keyspace string }
+			if err := json.Unmarshal(raw, &head); err != nil {
 				return fmt.Errorf("db: corrupt schema file: %w", err)
 			}
-			k, ok := s.Keyspaces[t.Keyspace]
+			k, ok := s.Keyspaces[head.Keyspace]
 			if !ok {
-				return fmt.Errorf("db: corrupt schema file: table %s.%s without keyspace", t.Keyspace, t.Name)
+				return fmt.Errorf("db: corrupt schema file: table without keyspace %s", head.Keyspace)
+			}
+			t, err := unmarshalTable(raw, k.resolve)
+			if err != nil {
+				return fmt.Errorf("db: corrupt schema file: %w", err)
 			}
 			k.Tables[t.Name] = t
 		}

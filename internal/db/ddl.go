@@ -38,6 +38,18 @@ func (d *DB) prepareDDL(session string, st cql.Statement) (*ddlStmt, error) {
 		if _, err := keyspaceOf(s.Keyspace, session); err != nil {
 			return nil, err
 		}
+	case *cql.CreateType:
+		if _, err := keyspaceOf(s.Keyspace, session); err != nil {
+			return nil, err
+		}
+	case *cql.AlterType:
+		if _, err := keyspaceOf(s.Keyspace, session); err != nil {
+			return nil, err
+		}
+	case *cql.DropType:
+		if _, err := keyspaceOf(s.Keyspace, session); err != nil {
+			return nil, err
+		}
 	case *cql.CreateKeyspace, *cql.AlterKeyspace, *cql.DropKeyspace:
 	default:
 		return nil, invalidf("unsupported statement %T", st)
@@ -145,7 +157,7 @@ func (s *ddlStmt) execute(e *execCtx) (message.Message, error) {
 			}
 			return nil, alreadyExists(ksName, st.Table)
 		}
-		t, err := newTable(ksName, st)
+		t, err := newTable(k, st)
 		if err != nil {
 			return nil, err
 		}
@@ -180,7 +192,7 @@ func (s *ddlStmt) execute(e *execCtx) (message.Message, error) {
 		if t.virtual != nil {
 			return nil, unauthorizedf("%s keyspace is not user-modifiable", ksName)
 		}
-		nt, err := alterTable(t, st)
+		nt, err := alterTable(cur.Keyspaces[ksName], t, st)
 		if err != nil {
 			return nil, err
 		}
@@ -223,6 +235,14 @@ func (s *ddlStmt) execute(e *execCtx) (message.Message, error) {
 		next.Keyspaces[ksName].Tables[st.Table] = &nt
 		after = func() error { return d.dropStorage(t.Storage) }
 		res = &message.VoidResult{}
+	case *cql.CreateType, *cql.AlterType, *cql.DropType:
+		var err error
+		if res, err = s.typeChange(next); err != nil {
+			return nil, err
+		}
+		if res == nil {
+			return &message.VoidResult{}, nil
+		}
 	}
 	next.finish()
 	if err := d.saveSchema(next); err != nil {
@@ -256,7 +276,7 @@ func (d *DB) dropStorage(ids ...lsm.TableID) error {
 }
 
 // alterTable applies ALTER TABLE to a copy of t (AlterTableStatement).
-func alterTable(t *Table, st *cql.AlterTable) (*Table, error) {
+func alterTable(k *Keyspace, t *Table, st *cql.AlterTable) (*Table, error) {
 	nt := *t
 	nt.PartitionKey = cloneColumns(t.PartitionKey)
 	nt.Clustering = cloneColumns(t.Clustering)
@@ -269,7 +289,7 @@ func alterTable(t *Table, st *cql.AlterTable) (*Table, error) {
 		if nt.byName[def.Name] != nil {
 			return nil, invalidf("Column with name '%s' already exists", def.Name)
 		}
-		typ, err := types.Parse(def.Type)
+		typ, err := types.ParseWith(def.Type, k.resolve)
 		if err != nil {
 			return nil, invalidf("%v", err)
 		}
@@ -320,6 +340,9 @@ func alterTable(t *Table, st *cql.AlterTable) (*Table, error) {
 		}
 	}
 	sort.SliceStable(nt.Columns, func(i, j int) bool { return nt.Columns[i].Name < nt.Columns[j].Name })
+	if err := checkCounters(&nt); err != nil {
+		return nil, err
+	}
 	nt.index()
 	return &nt, nil
 }
@@ -331,4 +354,134 @@ func cloneColumns(cs []*Column) []*Column {
 		out[i] = &cc
 	}
 	return out
+}
+
+// typeChange applies CREATE, ALTER or DROP TYPE to next
+// (CreateTypeStatement, AlterTypeStatement, DropTypeStatement). It returns
+// nil when IF [NOT] EXISTS makes it a no-op.
+func (s *ddlStmt) typeChange(next *Schema) (message.Message, error) {
+	var ksName, name string
+	switch st := s.raw.(type) {
+	case *cql.CreateType:
+		ksName, name = st.Keyspace, st.Name
+	case *cql.AlterType:
+		ksName, name = st.Keyspace, st.Name
+	case *cql.DropType:
+		ksName, name = st.Keyspace, st.Name
+	}
+	ksName, _ = keyspaceOf(ksName, s.session)
+	k0, ok := next.Keyspaces[ksName]
+	if !ok {
+		return nil, invalidf("Keyspace '%s' doesn't exist", ksName)
+	}
+	if k0.virtual {
+		return nil, unauthorizedf("%s keyspace is not user-modifiable", ksName)
+	}
+	k := *k0
+	k.UserTypes = slices.Clone(k0.UserTypes)
+	idx := slices.IndexFunc(k.UserTypes, func(u UserType) bool { return u.Name == name })
+	var change primitive.SchemaChangeType
+	switch st := s.raw.(type) {
+	case *cql.CreateType:
+		if idx >= 0 {
+			if st.IfNotExists {
+				return nil, nil
+			}
+			return nil, invalidf("A user type with name '%s' already exists", name)
+		}
+		if !validName(name) {
+			return nil, invalidf("Type name must not be empty, more than 222 characters long, or contain non-alphanumeric-underscore characters (got \"%s\")", name)
+		}
+		if _, err := types.Parse(name); err == nil {
+			return nil, invalidf("Type name '%s' is reserved", name)
+		}
+		u := UserType{Name: name}
+		for _, f := range st.Fields {
+			if slices.Contains(u.Fields, f.Name) {
+				return nil, invalidf("Duplicate field name '%s' in type '%s'", f.Name, name)
+			}
+			u.Fields = append(u.Fields, f.Name)
+			u.FieldTypes = append(u.FieldTypes, f.Type)
+		}
+		k.UserTypes = append(k.UserTypes, u)
+		change = primitive.SchemaChangeTypeCreated
+	case *cql.AlterType:
+		if idx < 0 {
+			if st.IfExists {
+				return nil, nil
+			}
+			return nil, invalidf("No user type named '%s' exists.", name)
+		}
+		u := k.UserTypes[idx]
+		u.Fields, u.FieldTypes = slices.Clone(u.Fields), slices.Clone(u.FieldTypes)
+		for _, f := range st.Add {
+			if slices.Contains(u.Fields, f.Name) {
+				return nil, invalidf("Cannot add new field %s to type %s.%s: a field with name %s already exists", f.Name, ksName, name, f.Name)
+			}
+			u.Fields = append(u.Fields, f.Name)
+			u.FieldTypes = append(u.FieldTypes, f.Type)
+		}
+		for _, rn := range st.Rename {
+			i := slices.Index(u.Fields, rn[0])
+			if i < 0 {
+				return nil, invalidf("Unknown field %s in user type %s", rn[0], name)
+			}
+			u.Fields[i] = rn[1]
+		}
+		k.UserTypes[idx] = u
+		change = primitive.SchemaChangeTypeUpdated
+	case *cql.DropType:
+		if idx < 0 {
+			if st.IfExists {
+				return nil, nil
+			}
+			return nil, invalidf("Type '%s.%s' doesn't exist", ksName, name)
+		}
+		for _, t := range k0.Tables {
+			for _, c := range t.AllColumns() {
+				if referencesType(c.Type, name) {
+					return nil, invalidf("Cannot drop user type %s.%s as it is still used by table %s", ksName, name, t.Name)
+				}
+			}
+		}
+		for _, u := range k0.types {
+			if u.Name != name && referencesType(u, name) {
+				return nil, invalidf("Cannot drop user type %s.%s as it is still used by user type %s", ksName, name, u.Name)
+			}
+		}
+		k.UserTypes = slices.Delete(k.UserTypes, idx, idx+1)
+		change = primitive.SchemaChangeTypeDropped
+	}
+	if err := k.buildTypes(); err != nil {
+		return nil, err
+	}
+	for _, u := range k.types {
+		for _, f := range u.Elems {
+			if f.Kind == types.Counter {
+				return nil, invalidf("A user type cannot contain counters")
+			}
+		}
+	}
+	// Tables hold copies of the types they use: rebuild them.
+	k.Tables = map[string]*Table{}
+	for tn, t := range k0.Tables {
+		b, err := marshalTable(t)
+		if err != nil {
+			return nil, err
+		}
+		nt, err := unmarshalTable(b, k.resolve)
+		if err != nil {
+			return nil, err
+		}
+		k.Tables[tn] = nt
+	}
+	next.Keyspaces[ksName] = &k
+	return &message.SchemaChangeResult{ChangeType: change, Target: primitive.SchemaChangeTargetType, Keyspace: ksName, Object: name}, nil
+}
+
+func referencesType(t *types.Type, name string) bool {
+	if t.Kind == types.UDT && t.Name == name {
+		return true
+	}
+	return slices.ContainsFunc(t.Elems, func(e *types.Type) bool { return referencesType(e, name) })
 }

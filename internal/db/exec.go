@@ -291,6 +291,12 @@ func (d *DB) ExecuteBatch(typ primitive.BatchType, children []BatchChild, o *Req
 		if m.cond != nil {
 			return ErrorMessage(invalidf("Conditional batches are not supported"))
 		}
+		switch {
+		case m.t.IsCounter() && typ == primitive.BatchTypeLogged:
+			return ErrorMessage(invalidf("Cannot include a counter statement in a logged batch"))
+		case !m.t.IsCounter() && typ == primitive.BatchTypeCounter:
+			return ErrorMessage(invalidf("Cannot include non-counter statement in a counter batch"))
+		}
 		if len(c.Values) != len(st.vars) {
 			return ErrorMessage(invalidf("There were %d markers(?) in CQL but %d bound variables", len(st.vars), len(c.Values)))
 		}

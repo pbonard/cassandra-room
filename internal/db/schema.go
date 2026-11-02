@@ -127,8 +127,46 @@ type Keyspace struct {
 	Name          string
 	Replication   map[string]string
 	DurableWrites bool
-	Tables        map[string]*Table `json:"-"`
-	virtual       bool
+	// UserTypes are the keyspace's user-defined types, in creation order
+	// (a type can use the types before it).
+	UserTypes []UserType        `json:",omitempty"`
+	Tables    map[string]*Table `json:"-"`
+	types     map[string]*types.Type
+	virtual   bool
+}
+
+// UserType is a user-defined type's definition.
+type UserType struct {
+	Name       string
+	Fields     []string
+	FieldTypes []string
+}
+
+// buildTypes resolves the keyspace's user types.
+func (k *Keyspace) buildTypes() error {
+	k.types = map[string]*types.Type{}
+	for _, u := range k.UserTypes {
+		t := &types.Type{Kind: types.UDT, Keyspace: k.Name, Name: u.Name, Fields: u.Fields}
+		for _, ft := range u.FieldTypes {
+			typ, err := types.ParseWith(ft, k.resolve)
+			if err != nil {
+				return err
+			}
+			if typ.IsMultiCell() {
+				typ.Frozen = true
+			}
+			t.Elems = append(t.Elems, typ)
+		}
+		k.types[u.Name] = t
+	}
+	return nil
+}
+
+func (k *Keyspace) resolve(name string) (*types.Type, error) {
+	if t, ok := k.types[name]; ok {
+		return t, nil
+	}
+	return nil, invalidf("Unknown type %s.%s", k.Name, name)
 }
 
 // Schema is an immutable snapshot of all keyspaces; DDL replaces it.
@@ -203,10 +241,12 @@ var nameRE = regexp.MustCompile(`^\w+$`)
 func validName(name string) bool { return nameRE.MatchString(name) && len(name) <= 222 }
 
 // newTable builds a table from CREATE TABLE (CreateTableStatement.builder).
-func newTable(ks string, st *cql.CreateTable) (*Table, error) { return buildTable(ks, st, false) }
+func newTable(k *Keyspace, st *cql.CreateTable) (*Table, error) {
+	return buildTable(k.Name, k.resolve, st, false)
+}
 
 // buildTable builds a table; virtual tables may use every type.
-func buildTable(ks string, st *cql.CreateTable, virtual bool) (*Table, error) {
+func buildTable(ks string, resolve func(string) (*types.Type, error), st *cql.CreateTable, virtual bool) (*Table, error) {
 	if !validName(st.Table) {
 		return nil, invalidf("Table name must not be empty, more than 222 characters long, or contain non-alphanumeric-underscore characters (got \"%s\")", st.Table)
 	}
@@ -225,7 +265,7 @@ func buildTable(ks string, st *cql.CreateTable, virtual bool) (*Table, error) {
 		return nil, invalidf("No PRIMARY KEY specifed for table '%s' (exactly one required)", st.Table)
 	}
 	typeOf := func(c cql.ColumnDef) (*types.Type, error) {
-		typ, err := types.Parse(c.Type)
+		typ, err := types.ParseWith(c.Type, resolve)
 		if err != nil {
 			return nil, invalidf("%v", err)
 		}
@@ -308,8 +348,37 @@ func buildTable(ks string, st *cql.CreateTable, virtual bool) (*Table, error) {
 		t.Columns = append(t.Columns, &Column{Name: name, Type: typ, Kind: kind, Position: -1, ID: t.NextColumnID})
 		t.NextColumnID++
 	}
+	if err := checkCounters(t); err != nil {
+		return nil, err
+	}
 	t.index()
 	return t, nil
+}
+
+// checkCounters enforces counter tables' rules: every non-key column a
+// counter, and no default TTL.
+func checkCounters(t *Table) error {
+	counters := 0
+	for _, c := range t.Columns {
+		if c.Type.Kind == types.Counter {
+			counters++
+		}
+	}
+	if counters == 0 {
+		return nil
+	}
+	if counters != len(t.Columns) {
+		return invalidf("Cannot mix counter and non counter columns in the same table")
+	}
+	if t.Params.DefaultTTL > 0 {
+		return invalidf("Cannot set default_time_to_live on a table with counters")
+	}
+	return nil
+}
+
+// IsCounter reports whether t is a counter table.
+func (t *Table) IsCounter() bool {
+	return len(t.Columns) > 0 && t.Columns[0].Type.Kind == types.Counter
 }
 
 func referencesDuration(t *types.Type) bool {
@@ -319,15 +388,14 @@ func referencesDuration(t *types.Type) bool {
 	return slices.ContainsFunc(t.Elems, referencesDuration)
 }
 
-// supportedColumnType rejects what the storage layer does not implement
-// yet: counters and non-frozen collections (which need multi-cell
-// columns).
+// supportedColumnType checks a regular or static column's type.
 func supportedColumnType(t *types.Type, name string) error {
-	switch {
-	case t.Kind == types.Counter:
-		return invalidf("counter columns are not supported yet (column '%s')", name)
-	case t.IsMultiCell():
-		return invalidf("non-frozen collections are not supported yet: use frozen<%s> for column '%s'", t, name)
+	if t.Kind == types.UDT && t.IsMultiCell() {
+		for _, f := range t.Elems {
+			if f.IsMultiCell() {
+				return invalidf("Non-frozen UDTs with nested non-frozen collections are not supported")
+			}
+		}
 	}
 	return nil
 }
@@ -663,7 +731,7 @@ func marshalTable(t *Table) ([]byte, error) {
 	return json.Marshal(j)
 }
 
-func unmarshalTable(b []byte) (*Table, error) {
+func unmarshalTable(b []byte, resolve func(string) (*types.Type, error)) (*Table, error) {
 	var j tableJSON
 	if err := json.Unmarshal(b, &j); err != nil {
 		return nil, err
@@ -676,7 +744,7 @@ func unmarshalTable(b []byte) (*Table, error) {
 	conv := func(cs []columnJSON, kind ColumnKind) ([]*Column, error) {
 		var out []*Column
 		for i, c := range cs {
-			typ, err := types.Parse(c.Type)
+			typ, err := types.ParseWith(c.Type, resolve)
 			if err != nil {
 				return nil, err
 			}

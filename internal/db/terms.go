@@ -132,7 +132,7 @@ func (c *collTerm) bind(e *execCtx) ([]byte, valState, error) {
 		switch {
 		case st == vUnset:
 			return nil, vSet, invalidf("Invalid unset value in %s literal", c.typ)
-		case st == vNull && c.typ.Kind != types.Tuple:
+		case st == vNull && c.typ.Kind != types.Tuple && c.typ.Kind != types.UDT:
 			return nil, vSet, invalidf("null is not supported inside collections")
 		case st == vNull:
 			v = nil
@@ -147,7 +147,7 @@ func (c *collTerm) bind(e *execCtx) ([]byte, valState, error) {
 // last duplicate winning, as Sets.Value and Maps.Value do.
 func buildCollection(t *types.Type, vals [][]byte) []byte {
 	switch t.Kind {
-	case types.Tuple:
+	case types.Tuple, types.UDT:
 		return types.BuildTuple(vals)
 	case types.List:
 		return types.BuildCollection(len(vals), vals)
@@ -225,6 +225,22 @@ func (vs *vars) prepareTerm(raw cql.Term, name string, typ *types.Type) (term, e
 			elems = append(elems, r.Keys[i], r.Values[i])
 		}
 		return vs.prepareElems(elems, typ, func(i int) *types.Type { return typ.Elems[i%2] }, name)
+	case *cql.UDTLiteral:
+		if typ.Kind != types.UDT {
+			return nil, invalidf("Invalid user type literal for %s of type %s", name, typ)
+		}
+		elems := make([]cql.Term, len(typ.Elems))
+		for i := range elems {
+			elems[i] = &cql.Null{}
+		}
+		for i, f := range r.Fields {
+			j := slices.Index(typ.Fields, f)
+			if j < 0 {
+				return nil, invalidf("Unknown field '%s' in value of user defined type %s", f, typ.Name)
+			}
+			elems[j] = r.Values[i]
+		}
+		return vs.prepareElems(elems, typ, func(i int) *types.Type { return typ.Elems[i] }, name)
 	case *cql.TupleLiteral:
 		if typ.Kind != types.Tuple {
 			return nil, invalidf("Invalid tuple literal for %s of type %s", name, typ)

@@ -183,3 +183,60 @@ func formatFloat(f float64, bits int) string {
 	}
 	return s
 }
+
+// formatCQL renders a value as a CQL literal: strings quoted, collections
+// and user types with their elements (the cqlsh display format).
+func formatCQL(t *types.Type, v []byte) string {
+	if v == nil {
+		return "null"
+	}
+	switch t.Kind {
+	case types.Text, types.Ascii, types.Inet, types.Timestamp, types.Date, types.Time:
+		return "'" + strings.ReplaceAll(formatValue(t, v), "'", "''") + "'"
+	case types.List, types.Set:
+		elems, err := types.SplitCollection(v, 1)
+		if err != nil {
+			return "<invalid>"
+		}
+		parts := make([]string, len(elems))
+		for i, e := range elems {
+			parts[i] = formatCQL(t.Elems[0], e)
+		}
+		if t.Kind == types.List {
+			return "[" + strings.Join(parts, ", ") + "]"
+		}
+		return "{" + strings.Join(parts, ", ") + "}"
+	case types.Map:
+		elems, err := types.SplitCollection(v, 2)
+		if err != nil {
+			return "<invalid>"
+		}
+		var parts []string
+		for i := 0; i < len(elems); i += 2 {
+			parts = append(parts, formatCQL(t.Elems[0], elems[i])+": "+formatCQL(t.Elems[1], elems[i+1]))
+		}
+		return "{" + strings.Join(parts, ", ") + "}"
+	case types.Tuple, types.UDT:
+		fields, err := types.SplitTuple(v)
+		if err != nil {
+			return "<invalid>"
+		}
+		var parts []string
+		for i, e := range t.Elems {
+			var f []byte
+			if i < len(fields) {
+				f = fields[i]
+			}
+			if t.Kind == types.UDT {
+				parts = append(parts, types.QuoteName(t.Fields[i])+": "+formatCQL(e, f))
+			} else {
+				parts = append(parts, formatCQL(e, f))
+			}
+		}
+		if t.Kind == types.UDT {
+			return "{" + strings.Join(parts, ", ") + "}"
+		}
+		return "(" + strings.Join(parts, ", ") + ")"
+	}
+	return formatValue(t, v)
+}
