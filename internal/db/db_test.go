@@ -330,7 +330,7 @@ func TestDescribe(t *testing.T) {
 	s.ok("CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
 	s.ok("USE ks")
 	s.ok(`CREATE TABLE "Mixed" (k int, "C" text, v int static, PRIMARY KEY ((k), "C")) WITH CLUSTERING ORDER BY ("C" DESC) AND comment = 'it''s'`)
-	require.Equal(t, []string{"ks keyspace ks", "system keyspace system", "system_schema keyspace system_schema", "system_views keyspace system_views"}, s.rows("DESCRIBE KEYSPACES"))
+	require.Equal(t, []string{"ks keyspace ks", "system keyspace system", "system_schema keyspace system_schema", "system_traces keyspace system_traces", "system_views keyspace system_views"}, s.rows("DESCRIBE KEYSPACES"))
 	require.Equal(t, []string{`ks table "Mixed"`}, s.rows("DESCRIBE TABLES"))
 	out := s.rows(`DESCRIBE TABLE "Mixed"`)
 	require.Len(t, out, 1)

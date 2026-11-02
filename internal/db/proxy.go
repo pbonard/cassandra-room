@@ -977,9 +977,9 @@ func (p *proxy) source(t *Table, id lsm.TableID, cl primitive.ConsistencyLevel) 
 type distSource struct {
 	trace *Trace
 	p     *proxy
-	k  *Keyspace
-	id lsm.TableID
-	cl primitive.ConsistencyLevel
+	k     *Keyspace
+	id    lsm.TableID
+	cl    primitive.ConsistencyLevel
 }
 
 // policy is the table's speculative_retry option.
