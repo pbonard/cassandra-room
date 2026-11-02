@@ -21,6 +21,12 @@ import (
 // TableOptions configures a table's compaction (Cassandra's per-table
 // compaction options for UnifiedCompactionStrategy).
 type TableOptions struct {
+	// RowFilter, if set, makes a filter for each compaction shard: it sees
+	// every row the shard writes, in key order, after purging, and may
+	// rewrite or drop it. The database uses it for deletions that span
+	// several rows (partition deletions, range tombstones), which the
+	// row-at-a-time merger cannot apply.
+	RowFilter func() RowFilter
 	// ScalingParameters are UCS's W per level; the last one applies to all
 	// further levels. W < 0 is leveled, W > 0 tiered. Defaults to {2}, which
 	// is Cassandra's T4 (scaling_parameters).
@@ -1732,6 +1738,22 @@ func (c *compaction) compactShard(s int) error {
 		inSize += f.size
 	}
 	incremental := fragment > 0 && inSize > fragment
+	var filter RowFilter
+	var filterEnv *FilterEnv
+	if t.opts.RowFilter != nil {
+		filter = t.opts.RowFilter()
+		filterEnv = &FilterEnv{NowSec: nowSec, GCBefore: gcBefore, MaxPurgeable: func(lo, hi []byte, minTS, maxTS int64) (int64, error) {
+			if lookup == nil {
+				lookup = &purgeLookup{e: e, t: t, inputs: c.nums}
+			}
+			return lookup.maxPurgeableRange(lo, hi, minTS, maxTS)
+		}}
+		defer func() {
+			if lookup != nil && !purge {
+				lookup.close()
+			}
+		}()
+	}
 	var purged []byte
 	var contrib []int
 	var hist ldtHistogram // deletion times of the current row, if not split
@@ -1774,6 +1796,34 @@ func (c *compaction) compactShard(s int) error {
 				purged, value = out, out
 			}
 			rs = &st
+		}
+		if filter != nil {
+			out, drop, err := filter.Filter(mi.key, value, filterEnv)
+			if err != nil {
+				return fail(err)
+			}
+			if drop || out != nil {
+				if incremental && len(mi.cur) > 1 {
+					contrib = contrib[:0]
+					for _, ent := range mi.cur {
+						contrib = append(contrib, srcInput[ent.src])
+					}
+					c.tie(contrib)
+				}
+			}
+			if drop {
+				continue
+			}
+			if out != nil {
+				value, rs = out, nil
+				if decode {
+					st, err := e.merger.(Purger).Summarize(value, nil)
+					if err != nil {
+						return fail(err)
+					}
+					rs = &st
+				}
+			}
 		}
 		parts := []row.Part{{Value: value}}
 		if split != nil {
@@ -1825,6 +1875,22 @@ func (c *compaction) compactShard(s int) error {
 		}
 	}
 	return nil
+}
+
+// RowFilter rewrites or drops rows during a compaction (TableOptions).
+type RowFilter interface {
+	// Filter returns the row to write instead of value (nil to keep
+	// value), or drop true to write nothing.
+	Filter(key, value []byte, env *FilterEnv) (out []byte, drop bool, err error)
+}
+
+// FilterEnv is what a RowFilter may consult.
+type FilterEnv struct {
+	NowSec, GCBefore int64
+	// MaxPurgeable is the smallest timestamp of the data in [lo, hi)
+	// outside the compaction: a deletion of that range older than it
+	// shadows nothing that survives the compaction.
+	MaxPurgeable func(lo, hi []byte, minTS, maxTS int64) (int64, error)
 }
 
 // maxPurgeable returns the smallest timestamp of key's data outside a
@@ -1893,6 +1959,74 @@ func (p *purgeLookup) iter(f *fileMeta) (sstable.Iterator, error) {
 	p.iters[f.num] = &lookupIter{f: f, it: it}
 	return it, nil
 }
+
+// maxPurgeableRange is maxPurgeable for every key in [lo, hi) (a whole
+// partition): the smallest timestamp of the range's data outside the
+// compaction. In an sstable it reads up to rangeScanLimit rows of the
+// range, then falls back to the file's smallest timestamp.
+func (p *purgeLookup) maxPurgeableRange(lo, hi []byte, minTS, maxTS int64) (int64, error) {
+	e, t, inputs := p.e, p.t, p.inputs
+	s := t.acquireState()
+	defer s.release()
+	limit := int64(math.MaxInt64)
+	note := func(v []byte) error {
+		lo, _, ok, err := e.merger.Timestamps(v)
+		if ok {
+			limit = min(limit, lo)
+		}
+		return err
+	}
+	for _, m := range s.mems {
+		for n := m.seekGE(lo, math.MaxUint64); n != nil && bytes.Compare(n.key, hi) < 0; n = n.next() {
+			if err := note(n.value); err != nil {
+				return 0, err
+			}
+		}
+		if limit <= minTS {
+			return math.MinInt64, nil
+		}
+	}
+	for _, f := range s.files {
+		if inputs[f.num] || f.minTS >= limit || f.minTS > maxTS ||
+			bytes.Compare(hi, f.smallest.UserKey) <= 0 || bytes.Compare(lo, f.largest.UserKey) > 0 {
+			continue
+		}
+		var src tableSource
+		if err := src.init(f.reader, lo, hi, false); err != nil {
+			return 0, err
+		}
+		n := 0
+		kv := src.it.SeekGE(lo, 0)
+		for ; kv != nil; kv = src.it.Next() {
+			if n++; n > rangeScanLimit {
+				limit = min(limit, f.minTS)
+				break
+			}
+			v, _, err := kv.Value(nil)
+			if err == nil {
+				err = note(v)
+			}
+			if err != nil {
+				_ = src.it.Close()
+				return 0, err
+			}
+		}
+		err := src.it.Error()
+		if cerr := src.it.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return 0, err
+		}
+		if limit <= minTS {
+			return math.MinInt64, nil
+		}
+	}
+	return limit, nil
+}
+
+// rangeScanLimit bounds the rows maxPurgeableRange reads per sstable.
+const rangeScanLimit = 256
 
 func (p *purgeLookup) maxPurgeable(key []byte, minTS, maxTS int64) (int64, error) {
 	e, t, inputs := p.e, p.t, p.inputs

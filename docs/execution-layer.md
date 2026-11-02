@@ -156,6 +156,16 @@ ALTER TABLE take effect when the server restarts.
   ROLES/USERS/PERMISSIONS.
 - **Clusters**: see `docs/cluster.md`.
 
+## Purging deletions
+
+Partition deletions and range tombstones are rows of their own (the
+partition header and tombstone rows). Compaction runs a per-partition
+filter (`purge.go`, an `lsm.RowFilter`): it drops the rows, static cells
+and range tombstones a deletion shadows, and drops the deletion itself
+once it is older than `gc_grace_seconds` and no older data of the
+partition (or of the range) remains outside the compaction, in other
+sstables or the memtables.
+
 ## Not supported yet
 
 - vectors, user-defined functions and aggregates, materialized views,
@@ -163,7 +173,7 @@ ALTER TABLE take effect when the server restarts.
 - `entries()` indexes, indexes on keys or static columns
 - counters in a cluster must update one partition per statement
 - options changed by ALTER TABLE take effect at restart
-- partition and range deletions are never purged
+
 
 ## Tests
 
