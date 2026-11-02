@@ -648,6 +648,13 @@ func compactionOptions(m map[string]string, gcGrace int) (lsm.TableOptions, erro
 			o.TombstoneThreshold, err = strconv.ParseFloat(v, 64)
 		case "unchecked_tombstone_compaction":
 			o.UncheckedTombstoneCompaction = strings.EqualFold(v, "true")
+		case "tombstone_compaction_interval":
+			var secs int
+			secs, err = strconv.Atoi(v)
+			o.TombstoneCompactionInterval = time.Duration(secs) * time.Second
+			if secs == 0 {
+				o.TombstoneCompactionInterval = -1 // (0 means the default to the engine)
+			}
 		}
 		if err != nil {
 			return o, invalidf("Invalid value %s for compaction option %s", v, k)

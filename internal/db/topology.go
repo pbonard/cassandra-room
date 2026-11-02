@@ -409,7 +409,22 @@ func (d *DB) Cleanup(keyspace string) (int, error) {
 		if err != nil {
 			return cleaned, err
 		}
-		if err := lt.Cleanup(func(key []byte) bool { return keep(tokenOf(key)) }); err != nil {
+		// An sstable needs rewriting only if its token span touches a range
+		// this node does not replicate.
+		segs := p.tokenSegments()
+		dirty := func(smallest, largest []byte) bool {
+			if len(smallest) < 8 || len(largest) < 8 {
+				return true
+			}
+			lo, hi := tokenOf(smallest), tokenOf(largest)
+			for _, sg := range segs {
+				if sg[1] >= lo && (sg[0] < hi || sg[0] == math.MinInt64) && !keep(sg[1]) {
+					return true
+				}
+			}
+			return false
+		}
+		if err := lt.Cleanup(func(key []byte) bool { return keep(tokenOf(key)) }, dirty); err != nil {
 			return cleaned, err
 		}
 		for _, ix := range t.Indexes {
@@ -420,7 +435,7 @@ func (d *DB) Cleanup(keyspace string) (int, error) {
 			if err := it.Cleanup(func(key []byte) bool {
 				rest, err := ix.entryRowKey(key)
 				return err != nil || len(rest) < 8 || keep(tokenOf(rest))
-			}); err != nil {
+			}, nil); err != nil {
 				return cleaned, err
 			}
 		}

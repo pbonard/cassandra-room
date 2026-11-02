@@ -19,7 +19,7 @@ import (
 // rather than as a row deletion, because what it shadows lives under other
 // keys: purging it could resurrect them.
 const (
-	deletionColumn = 0xFFFFFFFF
+	deletionColumn = row.DeletionMarkerColumn
 	rtStartColumn  = 0xFFFFFFFE
 	rtEndColumn    = 0xFFFFFFFD
 )

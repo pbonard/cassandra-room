@@ -758,3 +758,39 @@ type modelReader interface {
 	Get(key []byte) ([]byte, error)
 	NewIter(lower, upper []byte) (*Iterator, error)
 }
+
+// TestCleanupSkipsCleanFiles checks that cleanup rewrites only the
+// sstables that may hold rejected keys.
+func TestCleanupSkipsCleanFiles(t *testing.T) {
+	e, err := Open("db", &Options{FS: vfs.NewMem(), MemTableBudget: 64 << 10})
+	require.NoError(t, err)
+	defer e.Close()
+	tbl, _ := e.CreateTable(1)
+	for i := 0; i < 100; i++ {
+		set(t, e, 1, fmt.Sprintf("a%03d", i), "v", NoSync)
+	}
+	require.NoError(t, tbl.Flush())
+	for i := 0; i < 100; i++ {
+		set(t, e, 1, fmt.Sprintf("b%03d", i), "v", NoSync)
+	}
+	require.NoError(t, tbl.Flush())
+	files := func() []uint64 {
+		s := tbl.acquireState()
+		defer s.release()
+		var out []uint64
+		for _, f := range s.files {
+			out = append(out, f.num)
+		}
+		return out
+	}
+	before := files()
+	require.Len(t, before, 2)
+	keep := func(k []byte) bool { return k[0] != 'b' || k[3] != '7' }
+	require.NoError(t, tbl.Cleanup(keep, func(lo, hi []byte) bool { return hi[0] == 'b' }))
+	after := files()
+	aFile, bFile := min(before[0], before[1]), max(before[0], before[1]) // a-keys were flushed first
+	require.Contains(t, after, aFile, "the file of a-keys was not rewritten")
+	require.NotContains(t, after, bFile)
+	got := scanAll(t, tbl, nil, nil)
+	require.Len(t, got, 190)
+}

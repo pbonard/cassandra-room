@@ -128,3 +128,38 @@ func TestAlterTableOptionsLive(t *testing.T) {
 	require.Equal(t, int64(60), lt.Options().GCGraceSeconds)
 	require.Equal(t, []int{-8}, lt.Options().ScalingParameters)
 }
+
+// TestDeletionsTriggerTombstoneCompaction checks that partition deletions
+// count as droppable tombstones, so an sstable of expired ones is
+// compacted (and they are purged) without any other compaction.
+func TestDeletionsTriggerTombstoneCompaction(t *testing.T) {
+	var clock atomic.Int64
+	clock.Store(time.Now().UnixNano())
+	d, err := Open("db", Options{FS: vfs.NewMem(), Now: func() time.Time { return time.Unix(0, clock.Load()) }})
+	require.NoError(t, err)
+	defer d.Close()
+	s := &session{t: t, d: d}
+	s.ok("CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+	s.ok(`CREATE TABLE ks.t (k int, c int, v text, PRIMARY KEY (k, c)) WITH gc_grace_seconds = 60
+		AND compaction = {'class': 'SizeTieredCompactionStrategy', 'tombstone_compaction_interval': '60'}`)
+	for k := 0; k < 20; k++ {
+		s.ok(fmt.Sprintf("DELETE FROM ks.t WHERE k = %d", k))
+	}
+	lt, err := d.engine.Table(d.schema.Load().Keyspaces["ks"].Tables["t"].Storage)
+	require.NoError(t, err)
+	require.NoError(t, lt.Flush())
+	count := func() int {
+		it, err := lt.NewIter(nil, nil)
+		require.NoError(t, err)
+		defer it.Close()
+		n := 0
+		for ok := it.First(); ok; ok = it.Next() {
+			n++
+		}
+		return n
+	}
+	require.Equal(t, 20, count())
+	clock.Add(int64(2 * time.Minute))
+	require.NoError(t, d.engine.WaitForCompactions())
+	require.Zero(t, count(), "the expired deletions were compacted away on their own")
+}

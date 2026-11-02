@@ -532,6 +532,9 @@ func Summarize(v []byte, ldt func(int64)) (Stats, error) {
 		s.MinTS, s.MaxTS, s.HasTS = min(s.MinTS, c.Timestamp), max(s.MaxTS, c.Timestamp), true
 		if c.LocalDeletionTime == NoDeletionTime {
 			s.MaxLDT = NoDeletionTime
+			if t, ok := markerTime(&c); ok {
+				droppable(t)
+			}
 		} else {
 			droppable(c.LocalDeletionTime)
 		}
@@ -593,6 +596,9 @@ func PurgeAndSummarize(dst, v []byte, nowSec, gcBefore int64, maxPurgeable func(
 		st.MinTS, st.MaxTS, st.HasTS = min(st.MinTS, c.Timestamp), max(st.MaxTS, c.Timestamp), true
 		if c.LocalDeletionTime == NoDeletionTime {
 			st.MaxLDT = NoDeletionTime
+			if t, ok := markerTime(&c); ok {
+				droppable(t)
+			}
 			continue
 		}
 		droppable(c.LocalDeletionTime)
@@ -670,11 +676,29 @@ func statsOf(r *Row, ldt func(int64)) Stats {
 		s.MinTS, s.MaxTS, s.HasTS = min(s.MinTS, c.Timestamp), max(s.MaxTS, c.Timestamp), true
 		if c.LocalDeletionTime == NoDeletionTime {
 			s.MaxLDT = NoDeletionTime
+			if t, ok := markerTime(c); ok {
+				droppable(t)
+			}
 		} else {
 			droppable(c.LocalDeletionTime)
 		}
 	}
 	return s
+}
+
+// DeletionMarkerColumn is the column of a deletion marker: a live cell
+// recording a deletion of other rows (a partition deletion, a range
+// tombstone), whose value starts with its local deletion time (8 bytes,
+// big endian). Purge leaves it alone (only the database knows which rows
+// it covers), but summaries count it as a droppable tombstone, so it
+// counts towards the tombstone thresholds that schedule compactions.
+const DeletionMarkerColumn = 0xFFFFFFFF
+
+func markerTime(c *Cell) (int64, bool) {
+	if c.Column != DeletionMarkerColumn || len(c.Value) < 8 {
+		return 0, false
+	}
+	return int64(binary.BigEndian.Uint64(c.Value)), true
 }
 
 // Summarize implements lsm.Purger.

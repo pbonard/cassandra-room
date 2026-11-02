@@ -1200,14 +1200,19 @@ func (e *Engine) runCompaction(t *Table, p *compactionPick) {
 // compact): it flushes, waits for the table's running compactions, then
 // merges all of its sstables, purging what the purge rule allows, into one
 // set of shards. Background compactions of the table pause meanwhile.
-func (t *Table) Compact() error { return t.majorCompaction(nil) }
+func (t *Table) Compact() error { return t.majorCompaction(nil, nil) }
 
 // Cleanup rewrites the table without the rows whose key keep rejects
 // (nodetool cleanup: data of ranges the node no longer replicates). Rows
-// written meanwhile are not affected.
-func (t *Table) Cleanup(keep func(key []byte) bool) error { return t.majorCompaction(keep) }
+// written meanwhile are not affected. If dirty is set, only the sstables
+// it reports may hold rejected keys (given their smallest and largest
+// keys) are rewritten, as Cassandra's cleanup skips sstables fully in the
+// node's ranges.
+func (t *Table) Cleanup(keep func(key []byte) bool, dirty func(smallest, largest []byte) bool) error {
+	return t.majorCompaction(keep, dirty)
+}
 
-func (t *Table) majorCompaction(keep func(key []byte) bool) error {
+func (t *Table) majorCompaction(keep func(key []byte) bool, dirty func(smallest, largest []byte) bool) error {
 	if err := t.Flush(); err != nil {
 		return err
 	}
@@ -1235,6 +1240,9 @@ func (t *Table) majorCompaction(keep func(key []byte) bool) error {
 		e.mu.cond.Wait()
 	}
 	files := slices.Clone(t.files)
+	if dirty != nil {
+		files = slices.DeleteFunc(files, func(f *fileMeta) bool { return !dirty(f.smallest.UserKey, f.largest.UserKey) })
+	}
 	if len(files) == 0 {
 		e.mu.Unlock()
 		return nil
