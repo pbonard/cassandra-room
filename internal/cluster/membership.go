@@ -381,7 +381,7 @@ func (g *Gossiper) probeNode(addr string, inc uint64, interval, timeout time.Dur
 	g.suspect(message{Kind: stateSuspect, Node: addr, Inc: inc, From: g.self})
 }
 
-func (g *Gossiper) handlePing(_ string, payload []byte) ([]byte, error) {
+func (g *Gossiper) handlePing(ctx context.Context, _ string, payload []byte) ([]byte, error) {
 	var p pingMsg
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return nil, err
@@ -391,7 +391,7 @@ func (g *Gossiper) handlePing(_ string, payload []byte) ([]byte, error) {
 }
 
 // handlePingReq pings a target on another node's behalf.
-func (g *Gossiper) handlePingReq(_ string, payload []byte) ([]byte, error) {
+func (g *Gossiper) handlePingReq(ctx context.Context, _ string, payload []byte) ([]byte, error) {
 	var p pingMsg
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return nil, err
@@ -744,7 +744,7 @@ func (g *Gossiper) gossip() {
 	}
 }
 
-func (g *Gossiper) handleBroadcast(_ string, payload []byte) ([]byte, error) {
+func (g *Gossiper) handleBroadcast(ctx context.Context, _ string, payload []byte) ([]byte, error) {
 	var msgs []message
 	if err := json.Unmarshal(payload, &msgs); err != nil {
 		return nil, err
@@ -783,7 +783,7 @@ func (g *Gossiper) pushPull(to string) {
 	g.mergeState(resp)
 }
 
-func (g *Gossiper) handlePushPull(_ string, payload []byte) ([]byte, error) {
+func (g *Gossiper) handlePushPull(ctx context.Context, _ string, payload []byte) ([]byte, error) {
 	g.mergeState(payload)
 	return json.Marshal(g.snapshot())
 }

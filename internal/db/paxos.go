@@ -277,7 +277,7 @@ func (d *DB) paxosCommitLocal(r *paxosRequest) error {
 }
 
 func (p *proxy) handlePaxos(verb cluster.Verb) cluster.Handler {
-	return func(_ string, payload []byte) ([]byte, error) {
+	return func(_ context.Context, _ string, payload []byte) ([]byte, error) {
 		var r paxosRequest
 		if err := json.Unmarshal(payload, &r); err != nil {
 			return nil, err
@@ -374,7 +374,7 @@ func (r *paxosRound) send(verb cluster.Verb, nodes []*cluster.Node, req *paxosRe
 			var out []byte
 			var err error
 			if n.Addr == r.p.self {
-				out, err = r.p.handlePaxos(verb)("", b)
+				out, err = r.p.handlePaxos(verb)(ctx, "", b)
 			} else {
 				out, err = r.p.m.Request(ctx, n.Addr, verb, b)
 			}

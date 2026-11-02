@@ -54,7 +54,7 @@ func TestMessagingTLSAndCompression(t *testing.T) {
 	require.NoError(t, err)
 	b, err := NewMessagingWith("127.0.0.1:0", opts())
 	require.NoError(t, err)
-	b.Handle(VerbMutation, func(_ string, p []byte) ([]byte, error) { return append(p, p...), nil })
+	b.Handle(VerbMutation, func(_ context.Context, _ string, p []byte) ([]byte, error) { return append(p, p...), nil })
 	a.Start()
 	b.Start()
 	defer a.Close()

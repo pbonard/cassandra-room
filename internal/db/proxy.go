@@ -202,6 +202,12 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	return nil
 }
 
+// replacedNode reports whether a joining node is replacing n.
+func (p *proxy) replacedNode(n *cluster.Node) bool {
+	r := p.replaced.Load()
+	return r != nil && (*r)[n.HostID]
+}
+
 // up reports whether a node is up: alive, and not being replaced.
 func (p *proxy) up(n *cluster.Node) bool {
 	if r := p.replaced.Load(); r != nil && (*r)[n.HostID] {
@@ -624,7 +630,7 @@ func decodeWrites(b []byte) ([]write, error) {
 	return out, nil
 }
 
-func (p *proxy) handleMutation(_ string, payload []byte) ([]byte, error) {
+func (p *proxy) handleMutation(ctx context.Context, _ string, payload []byte) ([]byte, error) {
 	ws, err := decodeWrites(payload)
 	if err != nil {
 		return nil, err
@@ -895,7 +901,7 @@ func decodeParts(b []byte, n int) (lsm.TableID, [][]byte, error) {
 	return lsm.TableID(id), out, nil
 }
 
-func (p *proxy) handleReadRow(_ string, payload []byte) ([]byte, error) {
+func (p *proxy) handleReadRow(ctx context.Context, _ string, payload []byte) ([]byte, error) {
 	id, parts, err := decodeParts(payload, 1)
 	if err != nil {
 		return nil, err
@@ -978,8 +984,8 @@ func rowDigest(found bool, v []byte) []byte {
 	return append([]byte{1}, h[:16]...)
 }
 
-func (p *proxy) handleReadDigest(from string, payload []byte) ([]byte, error) {
-	b, err := p.handleReadRow(from, payload)
+func (p *proxy) handleReadDigest(ctx context.Context, from string, payload []byte) ([]byte, error) {
+	b, err := p.handleReadRow(ctx, from, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -1170,7 +1176,7 @@ func (p *proxy) repair(addrs []string, ws []write) {
 
 const rangePage = 512
 
-func (p *proxy) handleReadRange(_ string, payload []byte) ([]byte, error) {
+func (p *proxy) handleReadRange(ctx context.Context, _ string, payload []byte) ([]byte, error) {
 	id, parts, err := decodeParts(payload, 2)
 	if err != nil {
 		return nil, err
@@ -1195,6 +1201,9 @@ func (p *proxy) handleReadRange(_ string, payload []byte) ([]byte, error) {
 		if n == rangePage {
 			more = 1
 			break
+		}
+		if n%64 == 0 && ctx.Err() != nil {
+			return nil, ctx.Err() // the coordinator gave up
 		}
 		out = binary.AppendUvarint(out, uint64(len(it.Key())))
 		out = append(out, it.Key()...)
@@ -1505,7 +1514,7 @@ func (p *proxy) forward(to string, f *forwarded) message.Message {
 	return m
 }
 
-func (p *proxy) handleExecute(_ string, payload []byte) ([]byte, error) {
+func (p *proxy) handleExecute(ctx context.Context, _ string, payload []byte) ([]byte, error) {
 	var f forwarded
 	if err := json.Unmarshal(payload, &f); err != nil {
 		return nil, err
@@ -1618,7 +1627,7 @@ type counterRequest struct {
 	Writes []byte
 }
 
-func (p *proxy) handleCounterMutation(_ string, payload []byte) ([]byte, error) {
+func (p *proxy) handleCounterMutation(ctx context.Context, _ string, payload []byte) ([]byte, error) {
 	var r counterRequest
 	if err := json.Unmarshal(payload, &r); err != nil {
 		return nil, err

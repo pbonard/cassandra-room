@@ -142,20 +142,44 @@ func (p *proxy) bootstrap() error {
 			if !containsAddr(future.Replicas(k.Replication, r[1]), p.self) {
 				continue
 			}
-			var src string
+			// Every current replica is a possible source, the ones known
+			// to be up first: a joining node's membership view may not
+			// know yet who is alive, and skipping a range would lose data.
+			var srcs []*cluster.Node
 			for _, n := range cur.Replicas(k.Replication, r[1]) {
-				if n.Addr != p.self && p.up(n) {
-					src = n.Addr
+				if n.Addr != p.self && !p.replacedNode(n) {
+					srcs = append(srcs, n)
+				}
+			}
+			slices.SortStableFunc(srcs, func(a, b *cluster.Node) int {
+				ua, ub := p.up(a), p.up(b)
+				switch {
+				case ua && !ub:
+					return -1
+				case ub && !ua:
+					return 1
+				}
+				return 0
+			})
+			var errs []error
+			done := len(srcs) == 0
+			for _, src := range srcs {
+				err := func() error {
+					for _, kr := range keyRangesOf(r[0], r[1]) {
+						if _, err := p.fetchRange(src.Addr, t.Storage, kr[0], kr[1]); err != nil {
+							return err
+						}
+					}
+					return nil
+				}()
+				if err == nil {
+					done = true
 					break
 				}
+				errs = append(errs, fmt.Errorf("%s: %w", src.Addr, err))
 			}
-			if src == "" {
-				continue
-			}
-			for _, kr := range keyRangesOf(r[0], r[1]) {
-				if _, err := p.fetchRange(src, t.Storage, kr[0], kr[1]); err != nil {
-					return fmt.Errorf("db: bootstrap streaming from %s: %w", src, err)
-				}
+			if !done {
+				return fmt.Errorf("db: bootstrap streaming of range (%d, %d]: %w", r[0], r[1], errors.Join(errs...))
 			}
 		}
 		for _, ix := range t.Indexes {
@@ -266,7 +290,7 @@ type treeRequest struct {
 	First, Last uint64
 }
 
-func (p *proxy) handleRepair(_ string, payload []byte) ([]byte, error) {
+func (p *proxy) handleRepair(ctx context.Context, _ string, payload []byte) ([]byte, error) {
 	var r treeRequest
 	if err := json.Unmarshal(payload, &r); err != nil {
 		return nil, err
@@ -458,7 +482,7 @@ type streamRequest struct {
 	To     string
 }
 
-func (p *proxy) handleStreamPush(_ string, payload []byte) ([]byte, error) {
+func (p *proxy) handleStreamPush(ctx context.Context, _ string, payload []byte) ([]byte, error) {
 	var r streamRequest
 	if err := json.Unmarshal(payload, &r); err != nil {
 		return nil, err

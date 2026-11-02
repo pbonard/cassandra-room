@@ -17,7 +17,7 @@ func TestMessaging(t *testing.T) {
 	require.NoError(t, err)
 	b, err := NewMessaging("127.0.0.1:0")
 	require.NoError(t, err)
-	b.Handle(VerbMutation, func(from string, p []byte) ([]byte, error) {
+	b.Handle(VerbMutation, func(_ context.Context, from string, p []byte) ([]byte, error) {
 		if string(p) == "fail" {
 			return nil, errors.New("boom")
 		}
@@ -37,7 +37,7 @@ func TestMessaging(t *testing.T) {
 	require.EqualError(t, err, "boom")
 	tctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
-	b.Handle(VerbReadRow, func(string, []byte) ([]byte, error) { time.Sleep(time.Second); return nil, nil })
+	b.Handle(VerbReadRow, func(context.Context, string, []byte) ([]byte, error) { time.Sleep(time.Second); return nil, nil })
 	_, err = a.Request(tctx, b.Addr(), VerbReadRow, nil)
 	require.ErrorIs(t, err, ErrTimeout)
 }
@@ -289,7 +289,7 @@ func TestCMSPersistence(t *testing.T) {
 	require.NoError(t, c.SetPersistence(nil, func(b []byte) error { saved = b; return nil }))
 	prepare := func(c *CMS, round int64) bool {
 		b, _ := json.Marshal(paxosReq{Epoch: 1, Ballot: ballot{Round: round, Node: "x"}})
-		out, err := c.handlePrepare("", b)
+		out, err := c.handlePrepare(context.Background(), "", b)
 		require.NoError(t, err)
 		var r paxosResp
 		require.NoError(t, json.Unmarshal(out, &r))

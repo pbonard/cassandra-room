@@ -17,11 +17,28 @@ as in CEP-21 (Transactional Cluster Metadata, Cassandra 5.1+), the two
 jobs are split: **gossip only says who is alive**, and **cluster metadata
 is a linearized log of epochs**.
 
-- **Messaging** (`MessagingService`): framed request/response over one TCP
-  connection per peer; optionally mutually authenticated TLS
-  (`-internode-cert/-key/-ca`, checking the CA chain, and names with
-  `-internode-verify-hostname`) and LZ4 compression of payloads over
-  512 bytes (`-internode-compression`, on by default).
+- **Messaging** (`MessagingService`, `internal/cluster/messaging.go`):
+  request/response over TCP, with Cassandra 4.0's protections:
+  - up to three connections per peer by message class: urgent
+    (membership, metadata service), small (reads, writes), large
+    (streaming, range reads, repair, and any message over 64 KiB), so a
+    large message never delays a heartbeat or a write;
+  - a handshake agreeing on the protocol version (refusing peers with no
+    common version), then frames carrying a CRC32C of header and payload
+    (a mismatch closes the connection) and the sender's deadline;
+  - queue limits as `internode_application_*_queue_*`: 4 MiB per
+    connection, then 128 MiB per endpoint and 512 MiB in all. Outbound, a
+    request past them fails as overloaded; inbound, a connection past them
+    is not read until requests finish, which pushes back through TCP;
+  - requests past their deadline when they arrive or when a worker frees
+    up are dropped and counted; handlers get the deadline as a context and
+    long ones (range reads) stop when it passes; each kind of work (reads,
+    writes, gossip, metadata, streaming, statements) has a bounded number
+    of workers;
+  - optionally mutually authenticated TLS (`-internode-cert/-key/-ca`,
+    checking the CA chain, and names with `-internode-verify-hostname`)
+    and LZ4 compression of payloads over 512 bytes
+    (`-internode-compression`, on by default).
 - **Membership** (`membership.go`, after hashicorp/memberlist: SWIM with
   the Lifeguard extensions):
   - every probe interval (1 s) a node pings one member, in shuffled

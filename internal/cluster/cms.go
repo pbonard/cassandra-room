@@ -138,7 +138,7 @@ func (c *CMS) acceptorLocked(epoch int64) *acceptor {
 	return a
 }
 
-func (c *CMS) handlePrepare(_ string, payload []byte) ([]byte, error) {
+func (c *CMS) handlePrepare(ctx context.Context, _ string, payload []byte) ([]byte, error) {
 	var r paxosReq
 	if err := json.Unmarshal(payload, &r); err != nil {
 		return nil, err
@@ -161,7 +161,7 @@ func (c *CMS) handlePrepare(_ string, payload []byte) ([]byte, error) {
 	return json.Marshal(paxosResp{OK: true, Accepted: a.Accepted, Value: a.Value})
 }
 
-func (c *CMS) handleAccept(_ string, payload []byte) ([]byte, error) {
+func (c *CMS) handleAccept(ctx context.Context, _ string, payload []byte) ([]byte, error) {
 	var r paxosReq
 	if err := json.Unmarshal(payload, &r); err != nil {
 		return nil, err
@@ -182,12 +182,12 @@ func (c *CMS) handleAccept(_ string, payload []byte) ([]byte, error) {
 	return json.Marshal(paxosResp{OK: true})
 }
 
-func (c *CMS) handleFetch(string, []byte) ([]byte, error) {
+func (c *CMS) handleFetch(context.Context, string, []byte) ([]byte, error) {
 	_, b := c.current()
 	return b, nil
 }
 
-func (c *CMS) handlePush(_ string, payload []byte) ([]byte, error) {
+func (c *CMS) handlePush(ctx context.Context, _ string, payload []byte) ([]byte, error) {
 	return nil, c.install(payload)
 }
 
