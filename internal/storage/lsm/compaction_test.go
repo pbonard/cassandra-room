@@ -281,6 +281,7 @@ func runModel(t *testing.T, seed uint64) {
 				}
 				if seed%5 == 4 {
 					o.TimeWindow = 20 * time.Microsecond // timestamps are 0..99
+					o.TimeWindowCassandra = seed%10 == 9
 				}
 				// Incremental release with small fragments, or none.
 				o.FragmentSize = []int64{-1, 1 << 10, 4 << 10}[(seed/2)%3]

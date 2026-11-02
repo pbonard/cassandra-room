@@ -63,8 +63,9 @@ type fileMeta struct {
 	// Engine.mu.
 	compacting bool
 	// run identifies the files written by one flush or compaction (a run of
-	// non-overlapping fragments): the number of its first file. Zero (files
-	// from before a restart) means the file's own number.
+	// non-overlapping fragments; one per time window in the time-window
+	// mode): the number of its first file, recorded in the manifest. Zero
+	// means the file's own number.
 	run uint64
 }
 
@@ -112,6 +113,7 @@ const (
 	tagFlushedSeq  = 8  // table, seq
 	tagFileStats   = 9  // table, num, fileStats without cells (M5); follows tagAddFile
 	tagFileStats2  = 10 // table, num, fileStats; follows the file's tagAddFile
+	tagFileRun     = 11 // table, num, run; follows the file's tagAddFile
 )
 
 var errCorruptManifest = errors.New("lsm: corrupt manifest")
@@ -144,6 +146,9 @@ func (e *versionEdit) encode() []byte {
 			if f.stats.valid {
 				put(tagFileStats2, id, f.num)
 				b = appendFileStats(b, &f.stats)
+			}
+			if f.run != 0 && f.run != f.num {
+				put(tagFileRun, id, f.num, f.run)
 			}
 		}
 		for _, num := range t.deleted {
@@ -241,6 +246,15 @@ func decodeVersionEdit(b []byte) (*versionEdit, error) {
 			f.smallest = readKey()
 			f.largest = readKey()
 			t.added = append(t.added, f)
+		case tagFileRun:
+			t := tableEditFor(TableID(readNum()))
+			num, run := readNum(), readNum()
+			if l := len(t.added); err == nil && (l == 0 || t.added[l-1].num != num) {
+				err = fmt.Errorf("%w: run for file %d not after it", errCorruptManifest, num)
+			}
+			if err == nil {
+				t.added[len(t.added)-1].run = run
+			}
 		case tagFileStats, tagFileStats2:
 			t := tableEditFor(TableID(readNum()))
 			num := readNum()

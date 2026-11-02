@@ -346,12 +346,12 @@ func TestSTCSBuckets(t *testing.T) {
 	require.Nil(t, mostInterestingBucket(buckets, 6, 32))
 }
 
-// TestTimeWindowCurrentWindow checks TWCS's rules: the newest window ever
+// TestTimeWindowCurrentWindow checks Cassandra's TWCS rules: the newest window ever
 // seen needs min_threshold sstables (size-tiered), an older one only two,
 // and the current window does not move back when newer files disappear.
 func TestTimeWindowCurrentWindow(t *testing.T) {
 	hour := time.Hour
-	tbl := &Table{opts: TableOptions{TimeWindow: hour}}
+	tbl := &Table{opts: TableOptions{TimeWindow: hour, TimeWindowCassandra: true}}
 	tbl.opts.ensureDefaults()
 	h := hour.Microseconds()
 	f := func(window int64, size uint64) *fileMeta {
@@ -653,4 +653,124 @@ func TestRecoveredSeqAfterPurge(t *testing.T) {
 	e, tbl = open(crashed2)
 	defer e.Close()
 	require.True(t, liveAt(t, tbl, "b", clock.Load()), "synced write lost after the second crash")
+}
+
+// TestTimeWindowScyllaRules checks the default time-window rules (from
+// ScyllaDB): a past window is compacted whole while it is recent; once it
+// holds one run it is not, and later stray runs in it get size-tiered
+// compaction from two similar runs instead.
+func TestTimeWindowScyllaRules(t *testing.T) {
+	hour := time.Hour
+	tbl := &Table{opts: TableOptions{TimeWindow: hour}}
+	tbl.opts.ensureDefaults()
+	h := hour.Microseconds()
+	// Above and below STCS's min_sstable_size (50 MiB), which groups all
+	// smaller runs together.
+	const big, small = 100 << 20, 1 << 20
+	num := uint64(0)
+	f := func(window int64, size uint64, run uint64) *fileMeta {
+		num++
+		return &fileMeta{num: num, run: run, maxTS: window*h + 1, size: size, smallest: makeKey("a"), largest: makeKey("z")}
+	}
+	// Window 5 current with 3 runs: below min_threshold.
+	tbl.files = []*fileMeta{f(5, big, 0), f(5, big, 0), f(5, big, 0)}
+	require.Nil(t, tbl.pickCompactionLocked())
+	// Window 6 starts; window 5 is now recent and past: compacted whole.
+	tbl.files = append(tbl.files, f(6, big, 0))
+	p := tbl.pickCompactionLocked()
+	require.Len(t, p, 3)
+	// Window 5 compacted into one run of three fragments: done, and no
+	// longer recent.
+	tbl.files = []*fileMeta{f(5, big, 50), f(5, big, 50), f(5, big, 50), f(6, big, 0)}
+	require.Nil(t, tbl.pickCompactionLocked())
+	require.False(t, tbl.recentWindows[5])
+	// A stray late run lands in window 5: not recent, so no whole-window
+	// rewrite, and a run of very different size is not compacted with it.
+	tbl.files = append(tbl.files, f(5, small, 0))
+	require.Nil(t, tbl.pickCompactionLocked())
+	// Two similar stray runs are compacted together (size-tiered, from 2),
+	// without the window's big run.
+	tbl.files = append(tbl.files, f(5, small, 0))
+	p = tbl.pickCompactionLocked()
+	require.Len(t, p, 2)
+	for _, x := range p {
+		require.EqualValues(t, small, x.size)
+	}
+}
+
+// TestTimeWindowSegregation checks that flushes split late and
+// out-of-order writes by window, so every sstable holds one window's data,
+// and that reads see the same rows.
+func TestTimeWindowSegregation(t *testing.T) {
+	e, err := Open("db", &Options{FS: vfs.NewMem(), DisableCompactions: true,
+		TableOptions: func(TableID) TableOptions { return TableOptions{TimeWindow: time.Hour} }})
+	require.NoError(t, err)
+	defer e.Close()
+	tbl, _ := e.CreateTable(1)
+	h := time.Hour.Microseconds()
+	want := map[string]string{}
+	for i := 0; i < 300; i++ {
+		k := fmt.Sprintf("k%03d", i)
+		// Mostly window 10, some late writes into windows 7-9, and rows
+		// whose cells span two windows.
+		w := int64(10)
+		if i%5 == 0 {
+			w = int64(7 + i%3)
+		}
+		cells := []row.Cell{{Column: 1, Timestamp: w*h + int64(i), LocalDeletionTime: row.NoDeletionTime, Value: []byte(k)}}
+		if i%7 == 0 {
+			cells = append(cells, row.Cell{Column: 2, Timestamp: (w-1)*h + 5, LocalDeletionTime: row.NoDeletionTime, Value: []byte("old")})
+		}
+		require.NoError(t, e.Put(1, []byte(k), row.Append(nil, &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: row.NoTimestamp}, Cells: cells}), NoSync))
+		want[k] = k
+		if i%7 == 0 {
+			want[k] = "old" // scanAll keeps a row's last live cell
+		}
+	}
+	require.NoError(t, tbl.Flush())
+	files := tableFileList(e, tbl)
+	require.Greater(t, len(files), 3)
+	windows := map[int64]bool{}
+	for _, f := range files {
+		require.Equal(t, f.minTS/h, f.maxTS/h, "file %d mixes windows", f.num)
+		windows[f.maxTS/h] = true
+	}
+	require.Len(t, windows, 5) // 6-10: late writes into 7-9, and cells one window back
+	require.Equal(t, want, scanAll(t, tbl, nil, nil))
+	// Cassandra's behaviour keeps one file.
+	e2, err := Open("db2", &Options{FS: vfs.NewMem(), DisableCompactions: true,
+		TableOptions: func(TableID) TableOptions { return TableOptions{TimeWindow: time.Hour, TimeWindowCassandra: true} }})
+	require.NoError(t, err)
+	defer e2.Close()
+	tbl2, _ := e2.CreateTable(1)
+	require.NoError(t, e2.Put(1, []byte("a"), row.Append(nil, &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: row.NoTimestamp},
+		Cells: []row.Cell{{Column: 1, Timestamp: 1, LocalDeletionTime: row.NoDeletionTime}, {Column: 2, Timestamp: 5 * h, LocalDeletionTime: row.NoDeletionTime}}}), NoSync))
+	require.NoError(t, tbl2.Flush())
+	require.Len(t, tableFileList(e2, tbl2), 1)
+}
+
+// TestAggressiveExpiration checks unsafe_aggressive_sstable_expiration: a
+// fully expired sstable overlapping older data is dropped only with it.
+func TestAggressiveExpiration(t *testing.T) {
+	for _, aggressive := range []bool{false, true} {
+		var clock atomic.Int64
+		clock.Store(1_000_000)
+		e, tbl := purgeEngine(t, vfs.NewMem(), &clock, TableOptions{TimeWindow: time.Hour, GCGraceSeconds: -1,
+			ExpiredCheckInterval: -1, UnsafeAggressiveExpiration: aggressive})
+		putCell(t, e, "a", liveCell(1, "old")) // older live data overlapping
+		require.NoError(t, tbl.Flush())
+		putCell(t, e, "a", row.Cell{Column: 1, Timestamp: 2, TTL: 10, LocalDeletionTime: clock.Load() + 10, Value: []byte("ttl")})
+		require.NoError(t, tbl.Flush())
+		clock.Add(20)
+		e.mu.Lock()
+		p := tbl.nextCompactionLocked()
+		e.mu.Unlock()
+		if aggressive {
+			require.NotNil(t, p)
+			require.True(t, p.dropOnly)
+		} else {
+			require.True(t, p == nil || !p.dropOnly)
+		}
+		require.NoError(t, e.Close())
+	}
 }

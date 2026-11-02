@@ -359,7 +359,13 @@ func (t *Table) rewriteImported(ext []*externalTable, alloc func() uint64, creat
 		// nothing here; rows reconcile by timestamp, so use 0.
 		return mi.key, mi.value, uint64(pebble.InternalKeyKindMerge), true, nil
 	}
-	metas, err := writeSharded(e.fs, t.dir, alloc, e.writerOpts, e.merger, next, boundaries, t.opts.fragmentSize(), created)
+	var metas []*fileMeta
+	var err error
+	if split := t.timeSplitter(); split != nil {
+		metas, err = writeByWindow(e.fs, t.dir, alloc, e.writerOpts, e.merger, next, split, t.opts.fragmentSize(), created)
+	} else {
+		metas, err = writeSharded(e.fs, t.dir, alloc, e.writerOpts, e.merger, next, boundaries, t.opts.fragmentSize(), created)
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -794,6 +795,107 @@ func BenchmarkMajorCompactionSpace(b *testing.B) {
 					b.Fatal(err)
 				}
 				b.StartTimer()
+			}
+		})
+	}
+}
+
+// BenchmarkTimeWindow runs a TTL workload through the time-window mode: 30
+// simulated hours, 20k writes per hour, each a cell with a 6-hour TTL
+// (gc_grace_seconds 0, as for TTL-only tables); one write in ten arrives
+// late, timestamped 1-4 hours back (hints, repair). After each hour the
+// clock moves on and compactions settle. It reports bytes written over
+// bytes flushed, average and final sstable bytes, files mixing windows at
+// the end, and fully expired sstables dropped. "cassandra" uses
+// Cassandra's TWCS rules; "scylla" the default rules (output split by
+// window, recent windows); "scylla-aggressive" adds
+// unsafe_aggressive_sstable_expiration (safe here: TTL-only writes).
+// STCS's min_sstable_size is scaled down to the benchmark: at 50 MiB every
+// run of a 1 MiB window would count as small and be compacted together.
+func BenchmarkTimeWindow(b *testing.B) {
+	const hours, perHour, ttlHours = 30, 20000, 6
+	for _, mode := range []string{"cassandra", "scylla", "scylla-aggressive"} {
+		b.Run(mode, func(b *testing.B) {
+			for n := 0; n < b.N; n++ {
+				var clock atomic.Int64
+				start := int64(1_700_000_000)
+				clock.Store(start)
+				e, err := Open("db", &Options{FS: vfs.NewMem(), MemTableBudget: 64 << 20,
+					Now: func() time.Time { return time.Unix(clock.Load(), 0) },
+					TableOptions: func(TableID) TableOptions {
+						return TableOptions{TimeWindow: time.Hour, GCGraceSeconds: -1, ExpiredCheckInterval: -1,
+							TimeWindowCassandra: mode == "cassandra", UnsafeAggressiveExpiration: mode == "scylla-aggressive",
+							// min_sstable_size scaled to the benchmark (a window
+							// holds about 1 MiB, not gigabytes), as UCS's shard
+							// targets are in BenchmarkWriteSustainedTokens.
+							STCSMinSSTableSize: 16 << 10}
+					}})
+				if err != nil {
+					b.Fatal(err)
+				}
+				tbl, err := e.CreateTable(1)
+				if err != nil {
+					b.Fatal(err)
+				}
+				rng := rand.New(rand.NewPCG(1, 2))
+				sizeNow := func() float64 {
+					var n uint64
+					e.mu.Lock()
+					for _, f := range tbl.files {
+						n += f.size
+					}
+					e.mu.Unlock()
+					return float64(n)
+				}
+				var sizeSum float64
+				val := make([]byte, 100)
+				began := time.Now()
+				for h := 0; h < hours; h++ {
+					for i := 0; i < perHour; i++ {
+						ts := clock.Load()
+						if rng.IntN(10) == 0 {
+							ts -= int64(1+rng.IntN(4)) * 3600
+						}
+						ts += int64(rng.IntN(3600))
+						v := row.Append(nil, &row.Row{
+							Deletion: row.Deletion{MarkedForDeleteAt: row.NoTimestamp},
+							Cells: []row.Cell{{Column: 1, Timestamp: ts * 1_000_000, TTL: ttlHours * 3600,
+								LocalDeletionTime: ts + ttlHours*3600, Value: val}},
+						})
+						if err := e.Put(1, tokenBenchKey(h*perHour+i), v, NoSync); err != nil {
+							b.Fatal(err)
+						}
+						if (i+1)%5000 == 0 {
+							if err := tbl.Flush(); err != nil {
+								b.Fatal(err)
+							}
+						}
+					}
+					clock.Add(3600)
+					if err := e.WaitForCompactions(); err != nil {
+						b.Fatal(err)
+					}
+					sizeSum += sizeNow()
+				}
+				elapsed := time.Since(began)
+				m := e.Metrics()
+				mixed := 0
+				e.mu.Lock()
+				for _, f := range tbl.files {
+					if tbl.opts.windowOfTS(f.minTS) != tbl.opts.windowOfTS(f.maxTS) {
+						mixed++
+					}
+				}
+				e.mu.Unlock()
+				b.ReportMetric(float64(elapsed.Nanoseconds())/float64(hours*perHour), "ns/write")
+				b.ReportMetric(m.WriteAmplification, "write-amp")
+				b.ReportMetric(sizeSum/hours/(1<<20), "MiB-avg")
+				b.ReportMetric(sizeNow()/(1<<20), "MiB-end")
+				b.ReportMetric(float64(mixed), "mixed-files")
+				b.ReportMetric(float64(m.ExpiredSSTablesDropped), "expired-dropped")
+				if err := e.Close(); err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 	}

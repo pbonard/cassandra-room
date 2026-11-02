@@ -23,6 +23,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"slices"
 	"sync"
 )
 
@@ -565,4 +566,63 @@ func (Merger) Summarize(v []byte, ldt func(int64)) (Stats, error) { return Summa
 // PurgeAndSummarize implements lsm.Purger.
 func (Merger) PurgeAndSummarize(dst, v []byte, nowSec, gcBefore int64, maxPurgeable func(minTS, maxTS int64) (int64, error), ldt func(int64)) ([]byte, bool, bool, Stats, error) {
 	return PurgeAndSummarize(dst, v, nowSec, gcBefore, maxPurgeable, ldt)
+}
+
+// Part is the share of a row that falls in one bucket.
+type Part struct {
+	Bucket int64
+	Value  []byte
+}
+
+// SplitByTimestamp splits row v by the bucket of each part's timestamp
+// (ScyllaDB's segregate_by_timestamp): every cell goes to the bucket of its
+// timestamp, the row deletion to the bucket of its MarkedForDeleteAt. The
+// parts merge back to v (Merge is commutative and v holds no cell its
+// deletion shadows), so writing them to separate sstables changes nothing
+// reads see. A row within one bucket comes back as a single part holding v
+// itself; an empty row as one part in bucket(math.MinInt64).
+func SplitByTimestamp(v []byte, bucket func(ts int64) int64) ([]Part, error) {
+	lo, hi, ok, err := Timestamps(v)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return []Part{{Bucket: bucket(math.MinInt64), Value: v}}, nil
+	}
+	if bucket(lo) == bucket(hi) {
+		return []Part{{Bucket: bucket(lo), Value: v}}, nil
+	}
+	r, err := Decode(v)
+	if err != nil {
+		return nil, err
+	}
+	rows := map[int64]*Row{}
+	var order []int64
+	get := func(b int64) *Row {
+		p := rows[b]
+		if p == nil {
+			p = &Row{Deletion: Deletion{MarkedForDeleteAt: NoTimestamp}}
+			rows[b] = p
+			order = append(order, b)
+		}
+		return p
+	}
+	if !r.Deletion.IsLive() {
+		get(bucket(r.Deletion.MarkedForDeleteAt)).Deletion = r.Deletion
+	}
+	for _, c := range r.Cells {
+		p := get(bucket(c.Timestamp))
+		p.Cells = append(p.Cells, c)
+	}
+	slices.Sort(order)
+	parts := make([]Part, 0, len(order))
+	for _, b := range order {
+		parts = append(parts, Part{Bucket: b, Value: Append(nil, rows[b])})
+	}
+	return parts, nil
+}
+
+// SplitByTimestamp implements lsm.TimeSplitter.
+func (Merger) SplitByTimestamp(v []byte, bucket func(ts int64) int64) ([]Part, error) {
+	return SplitByTimestamp(v, bucket)
 }

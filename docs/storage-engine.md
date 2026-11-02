@@ -376,8 +376,11 @@ and `unified/Controller.java`.
 
 ### TWCS compared with ScyllaDB's
 
-ScyllaDB's `time_window_compaction_strategy.cc` differs from Cassandra's,
-which the engine follows:
+ScyllaDB's `time_window_compaction_strategy.cc` differs from Cassandra's.
+Time-window mode follows ScyllaDB by default; `TimeWindowCassandra` keeps
+the Cassandra behaviour (no output splitting, past windows compacted to one
+sstable whenever they have more than one). ScyllaDB's rules, as
+implemented:
 
 - past windows are compacted down to one sstable only while they are
   recent (`recent_active_windows`); afterwards stray writes into them
@@ -392,7 +395,33 @@ which the engine follows:
 - a past window's whole-window compaction waits while the table has
   another compaction running.
 
-These are not implemented yet.
+Also as in ScyllaDB:
+
+- a window's files are counted by run, not by file, so the fragments of
+  one compaction output (`FragmentSize`) do not make the window look like
+  it needs compacting again; run ids persist in the manifest;
+- a row whose cells fall in several windows is split cell by cell
+  (`row.SplitByTimestamp`; a row deletion goes with its timestamp), so each
+  window's sstables hold only that window's timestamps and expire whole;
+- `UnsafeAggressiveExpiration` (Scylla's
+  `unsafe_aggressive_sstable_expiration`) drops fully expired sstables
+  without checking that they shadow nothing in other sstables. It is only
+  safe for TTL-only workloads without explicit deletes or overwrites.
+
+`BenchmarkTimeWindow` (30 hourly windows, 6 h TTL, 10 % of writes 1–4 h
+late, one run, `STCSMinSSTableSize` scaled to the ~1 MiB windows):
+
+| mode | ns/write | write-amp | avg disk MiB | end disk MiB | mixed-window files | whole files expired |
+|---|---|---|---|---|---|---|
+| Cassandra | 3981 | 1.99 | 7.24 | 8.52 | 10 | 20 |
+| ScyllaDB rules | 4288 | 2.94 | 4.68 | 5.12 | 0 | 114 |
+| + aggressive expiry | 4512 | 2.94 | 4.68 | 5.12 | 0 | 115 |
+
+Splitting by window costs write amplification (late writes create small
+runs in old windows, which are compacted again), and buys 35–40 % less
+disk because expired data leaves in whole files instead of waiting in
+sstables that mix windows. With the default 50 MiB `min_sstable_size` and
+windows this small, every run counts as small and write-amp was 8.8.
 
 ## 9. Purging (M5)
 

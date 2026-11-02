@@ -34,6 +34,9 @@ type Table struct {
 	// newest seen, never moving back.
 	highestWindowSeen int64
 	windowSeen        bool
+	// recentWindows are past windows not yet compacted into one run since
+	// they were the newest (ScyllaDB's recent_active_windows).
+	recentWindows map[int64]bool
 	// majorPending pauses background compactions while Compact waits.
 	majorPending bool
 }

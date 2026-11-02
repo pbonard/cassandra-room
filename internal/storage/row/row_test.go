@@ -246,3 +246,39 @@ func TestPurgeAndSummarize(t *testing.T) {
 		require.Equal(t, want, got)
 	}
 }
+
+// TestSplitByTimestamp checks that a row's parts land in the buckets of
+// their timestamps and merge back to the row, byte for byte.
+func TestSplitByTimestamp(t *testing.T) {
+	rng := rand.New(rand.NewPCG(11, 12))
+	bucket := func(ts int64) int64 {
+		if ts == math.MinInt64 {
+			return math.MinInt64
+		}
+		return ts / 5
+	}
+	split := 0
+	for i := 0; i < 20000; i++ {
+		v := randomRow(rng)
+		parts, err := SplitByTimestamp(v, bucket)
+		require.NoError(t, err)
+		require.NotEmpty(t, parts)
+		if len(parts) > 1 {
+			split++
+		}
+		merged := parts[0].Value
+		for _, p := range parts {
+			lo, hi, ok, err := Timestamps(p.Value)
+			require.NoError(t, err)
+			if ok {
+				require.Equal(t, p.Bucket, bucket(lo))
+				require.Equal(t, p.Bucket, bucket(hi))
+			}
+		}
+		for _, p := range parts[1:] {
+			merged = mustMerge(t, merged, p.Value)
+		}
+		require.True(t, bytes.Equal(v, merged), "row %d", i)
+	}
+	require.Greater(t, split, 5000)
+}

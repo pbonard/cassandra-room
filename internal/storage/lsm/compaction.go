@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/cassandra-room/cassandra-room/internal/storage/row"
 	"github.com/cockroachdb/pebble/sstable"
 	"math"
 	"math/rand/v2"
@@ -59,6 +60,16 @@ type TableOptions struct {
 	// rules, every older window down to one sstable, so whole files expire
 	// together. Output is not sharded. Cassandra's default window is one day.
 	TimeWindow time.Duration
+	// TimeWindowCassandra selects Cassandra's TWCS behaviour instead of the
+	// default ScyllaDB-derived one: sstables are not split by window, every
+	// past window with two sstables is compacted whole, and no fragments.
+	TimeWindowCassandra bool
+	// UnsafeAggressiveExpiration is TWCS's
+	// unsafe_aggressive_sstable_expiration: in the time-window mode, fully
+	// expired sstables are dropped without checking overlapping data. Only
+	// for tables written with TTLs and never deleted from or overwritten:
+	// otherwise dropped deletions can resurrect data.
+	UnsafeAggressiveExpiration bool
 	// MinThreshold and MaxThreshold are the table's min_threshold and
 	// max_threshold (4 and 32), used by the time-window mode.
 	MinThreshold, MaxThreshold int
@@ -150,10 +161,45 @@ func (o *TableOptions) gcBefore(nowSec int64) int64 { return nowSec - max(o.GCGr
 // mode, whose windows must each end as a single sstable (TWCS compacts a
 // past window until it holds one, so fragments would recompact forever).
 func (o *TableOptions) fragmentSize() int64 {
-	if o.TimeWindow > 0 {
+	if o.TimeWindow > 0 && o.TimeWindowCassandra {
 		return 0
 	}
 	return max(o.FragmentSize, 0)
+}
+
+// TimeSplitter is implemented by Mergers that can split a row by write
+// timestamp (row.Merger does); the time-window mode uses it to keep each
+// sstable within one window.
+type TimeSplitter interface {
+	SplitByTimestamp(v []byte, bucket func(ts int64) int64) ([]row.Part, error)
+}
+
+// windowOfTS returns the time window of timestamp ts (microseconds).
+func (o *TableOptions) windowOfTS(ts int64) int64 {
+	if ts == math.MinInt64 {
+		return math.MinInt64
+	}
+	w := o.TimeWindow.Microseconds()
+	q := ts / w
+	if ts%w < 0 {
+		q--
+	}
+	return q
+}
+
+// timeSplitter returns the function splitting rows by time window, or nil
+// when output is not segregated (outside the time-window mode, in
+// Cassandra's TWCS behaviour, or with a Merger that cannot split).
+func (t *Table) timeSplitter() func(v []byte) ([]row.Part, error) {
+	if t.opts.TimeWindow <= 0 || t.opts.TimeWindowCassandra {
+		return nil
+	}
+	sp, ok := t.e.merger.(TimeSplitter)
+	if !ok {
+		return nil
+	}
+	bucket := t.opts.windowOfTS
+	return func(v []byte) ([]row.Part, error) { return sp.SplitByTimestamp(v, bucket) }
 }
 
 func (o *TableOptions) sstableGrowth() float64 { return min(max(o.SSTableGrowth, 0), 1) }
@@ -509,6 +555,166 @@ func (t *Table) timeWindowPickLocked(files []*fileMeta) []*fileMeta {
 	return nil
 }
 
+// twUnit is a run within a time window: the files one flush or compaction
+// wrote for that window. The time-window mode counts and compacts whole
+// runs, so a window compacted into a run of fragments counts as one.
+type twUnit struct {
+	files []*fileMeta
+	size  uint64
+}
+
+func runUnits(files []*fileMeta) []*twUnit {
+	byRun := map[uint64]*twUnit{}
+	var order []uint64
+	for _, f := range files {
+		r := f.run
+		if r == 0 {
+			r = f.num
+		}
+		u := byRun[r]
+		if u == nil {
+			u = &twUnit{}
+			byRun[r] = u
+			order = append(order, r)
+		}
+		u.files = append(u.files, f)
+		u.size += f.size
+	}
+	slices.Sort(order)
+	units := make([]*twUnit, len(order))
+	for i, r := range order {
+		units[i] = byRun[r]
+	}
+	return units
+}
+
+func unitFiles(units []*twUnit) []*fileMeta {
+	var out []*fileMeta
+	for _, u := range units {
+		out = append(out, u.files...)
+	}
+	return out
+}
+
+// timeWindowPickScyllaLocked follows ScyllaDB's
+// time_window_compaction_strategy (get_compaction_candidates, newest_bucket,
+// compaction_mode, window_min_threshold), over runs rather than sstables:
+//
+//   - the newest window seen (highest_window_seen, never moving back) is
+//     compacted with size-tiered rules once it holds MinThreshold runs;
+//   - a past window still "recent" (it was the newest window, and has not
+//     yet been compacted into one run since) with two or more runs is
+//     compacted whole, its MaxThreshold smallest runs at a time, but only
+//     while the table has no other compaction running;
+//   - any other past window gets size-tiered compaction from two similar
+//     runs, so data arriving late into an old window (repair, hints,
+//     streaming) is not rewritten together with the whole window each time.
+//
+// Windows are visited newest first and the first eligible pick wins.
+func (t *Table) timeWindowPickScyllaLocked(files []*fileMeta) []*fileMeta {
+	windows := map[int64][]*fileMeta{}
+	var keys []int64
+	for _, f := range files {
+		w := t.opts.timeWindow(f)
+		if windows[w] == nil {
+			keys = append(keys, w)
+		}
+		windows[w] = append(windows[w], f)
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	slices.Sort(keys)
+	slices.Reverse(keys)
+	if !t.windowSeen || keys[0] > t.highestWindowSeen {
+		t.highestWindowSeen, t.windowSeen = keys[0], true
+	}
+	if t.recentWindows == nil {
+		t.recentWindows = map[int64]bool{}
+	}
+	now := t.highestWindowSeen
+	ongoing := slices.ContainsFunc(t.files, func(f *fileMeta) bool { return f.compacting })
+	for _, w := range keys {
+		units := runUnits(windows[w])
+		last := w >= now
+		if last {
+			t.recentWindows[w] = true
+		}
+		threshold := 2
+		if last {
+			threshold = t.opts.MinThreshold
+		}
+		switch {
+		case len(units) >= 2 && !last && t.recentWindows[w]:
+			if ongoing {
+				continue // serialized: wait for running compactions
+			}
+			// trim_to_threshold: the smallest runs, up to MaxThreshold.
+			slices.SortStableFunc(units, func(a, b *twUnit) int { return cmp.Compare(a.size, b.size) })
+			return unitFiles(units[:min(len(units), t.opts.MaxThreshold)])
+		case len(units) >= threshold:
+			sizes := make([]uint64, len(units))
+			for i, u := range units {
+				sizes[i] = u.size
+			}
+			var picked []*twUnit
+			for _, i := range mostInterestingBucketIdx(stcsBucketsIdx(sizes, &t.opts), sizes, threshold, t.opts.MaxThreshold) {
+				picked = append(picked, units[i])
+			}
+			if len(picked) > 0 {
+				return unitFiles(picked)
+			}
+		default:
+			// Compacted into one run: no longer needs a whole-window
+			// compaction.
+			if !last {
+				delete(t.recentWindows, w)
+			}
+		}
+	}
+	return nil
+}
+
+// stcsBucketsIdx is stcsBuckets over sizes, returning indexes.
+func stcsBucketsIdx(sizes []uint64, o *TableOptions) [][]int {
+	files := make([]*fileMeta, len(sizes))
+	idx := map[*fileMeta]int{}
+	for i, sz := range sizes {
+		files[i] = &fileMeta{size: sz}
+		idx[files[i]] = i
+	}
+	var out [][]int
+	for _, b := range stcsBuckets(files, o) {
+		var bi []int
+		for _, f := range b {
+			bi = append(bi, idx[f])
+		}
+		out = append(out, bi)
+	}
+	return out
+}
+
+// mostInterestingBucketIdx is mostInterestingBucket over indexes into sizes.
+func mostInterestingBucketIdx(buckets [][]int, sizes []uint64, minThreshold, maxThreshold int) []int {
+	var best []int
+	var bestAvg uint64
+	for _, b := range buckets {
+		b = b[:min(len(b), maxThreshold)]
+		if len(b) < minThreshold {
+			continue
+		}
+		var total uint64
+		for _, i := range b {
+			total += sizes[i]
+		}
+		avg := total / uint64(len(b))
+		if best == nil || avg > bestAvg {
+			best, bestAvg = b, avg
+		}
+	}
+	return best
+}
+
 // stcsBuckets follows SizeTieredCompactionStrategy.getBuckets: sstables
 // sorted by size join the first bucket whose average size is within
 // [bucketLow, bucketHigh] times theirs, or which, like them, is below the
@@ -579,7 +785,10 @@ func (t *Table) pickCompactionLocked() []*fileMeta {
 		}
 	}
 	if t.opts.TimeWindow > 0 {
-		return t.timeWindowPickLocked(candidates)
+		if t.opts.TimeWindowCassandra {
+			return t.timeWindowPickLocked(candidates)
+		}
+		return t.timeWindowPickScyllaLocked(candidates)
 	}
 	return t.ucsPickLocked(candidates)
 }
@@ -736,8 +945,15 @@ func (t *Table) fullyExpiredLocked(nowSec int64) []*fileMeta {
 		return f.stats.valid && f.stats.maxLDT < gcBefore && f.stats.maxLDT <= nowSec
 	}
 	var expired []*fileMeta
+	aggressive := t.opts.TimeWindow > 0 && t.opts.UnsafeAggressiveExpiration
 	for _, c := range t.files {
 		if c.compacting || !expiredBy(c) {
+			continue
+		}
+		if aggressive {
+			// getFullyExpiredSSTables with ignoreOverlaps: no check of the
+			// data the sstable's deletions might shadow elsewhere.
+			expired = append(expired, c)
 			continue
 		}
 		minOther := t.memtableMinTSLocked(c.smallest.UserKey, c.largest.UserKey)
@@ -903,7 +1119,9 @@ func (t *Table) dueFileLocked(nowSec int64) *fileMeta {
 		switch {
 		case best == nil:
 			best = f
-		case t.opts.TimeWindow > 0 && f.size < best.size:
+		case t.opts.TimeWindow > 0 && !t.opts.TimeWindowCassandra && f.minTS < best.minTS:
+			best = f // ScyllaDB's TWCS: the oldest data first
+		case t.opts.TimeWindow > 0 && t.opts.TimeWindowCassandra && f.size < best.size:
 			best = f
 		case t.opts.TimeWindow <= 0 && f.size > best.size:
 			best = f
@@ -1136,7 +1354,8 @@ type compaction struct {
 	nums   map[uint64]bool // input file numbers
 
 	mu sync.Mutex
-	// Per shard: finished, and the largest key of its sealed output.
+	// Per shard: finished, and the key below which all of its output is
+	// sealed.
 	done     []bool
 	progress [][]byte
 	// pending holds sealed outputs not yet installed.
@@ -1148,8 +1367,8 @@ type compaction struct {
 	group []int
 	// installs counts manifest edits made by this compaction.
 	installs int
-	// run is the compaction's run identifier (see fileMeta.run).
-	run uint64
+	// runs maps output buckets to run identifiers (see fileMeta.run).
+	runs map[int64]uint64
 }
 
 func (c *compaction) init() {
@@ -1166,15 +1385,19 @@ func (c *compaction) init() {
 	}
 }
 
-// runID returns the compaction's run identifier, the number of its first
-// output.
-func (c *compaction) runID(num uint64) uint64 {
+// runID returns the run identifier of the compaction's output in bucket
+// (one run per time window, one in all otherwise): the number of its first
+// file.
+func (c *compaction) runID(bucket int64, num uint64) uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.run == 0 {
-		c.run = num
+	if c.runs == nil {
+		c.runs = map[int64]uint64{}
 	}
-	return c.run
+	if c.runs[bucket] == 0 {
+		c.runs[bucket] = num
+	}
+	return c.runs[bucket]
 }
 
 func (c *compaction) find(i int) int {
@@ -1210,20 +1433,22 @@ func (c *compaction) exhaustedLocked(i int) bool {
 		if c.done[s] {
 			continue
 		}
-		if c.progress[s] == nil || bytes.Compare(c.progress[s], f.largest.UserKey) < 0 {
+		// progress[s] is an exclusive bound: every row below it is sealed.
+		if c.progress[s] == nil || bytes.Compare(f.largest.UserKey, c.progress[s]) >= 0 {
 			return false
 		}
 	}
 	return true
 }
 
-// sealed records an output fragment of shard s, whose last key is last, and
-// releases inputs it completes.
-func (c *compaction) sealed(s int, out *fileMeta, last []byte) error {
+// sealed records an output fragment of shard s, after which every row of
+// the shard below bound is in sealed output, and releases inputs it
+// completes.
+func (c *compaction) sealed(s int, out *fileMeta, bound []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.pending = append(c.pending, out)
-	c.progress[s] = last
+	c.progress[s] = bound
 	before := c.installs
 	err := c.installLocked(false)
 	if err == nil && c.installs > before && c.e.testAfterEarlyRelease != nil {
@@ -1430,31 +1655,48 @@ func (c *compaction) compactShard(s int) error {
 		defer lookup.close()
 	}
 
-	var b *sstBuilder
-	var lastKey []byte
-	start := func() error {
+	// Output builders, one per bucket: the time window of the data in the
+	// time-window mode (rows split by timestamp), a single bucket otherwise.
+	split := t.timeSplitter()
+	type outBuilder struct {
+		b                 *sstBuilder
+		firstKey, lastKey []byte
+	}
+	builders := map[int64]*outBuilder{}
+	var buckets []int64 // open buckets, for a deterministic order
+	decode := purge || split != nil
+	start := func(bucket int64) (*outBuilder, error) {
 		e.mu.Lock()
 		num := e.mu.nextFileNum
 		e.mu.nextFileNum++
 		e.mu.Unlock()
-		var err error
-		if b, err = newSSTBuilder(e.fs, t.dir, num, e.writerOpts, e.merger, purge, nowSec); err != nil {
-			return err
+		sb, err := newSSTBuilder(e.fs, t.dir, num, e.writerOpts, e.merger, decode, nowSec)
+		if err != nil {
+			return nil, err
 		}
-		if !purge {
-			b.minTS, b.maxTS = minTS, maxTS
+		if !decode {
+			sb.minTS, sb.maxTS = minTS, maxTS
 			if purger != nil {
-				b.stats = unionStats(nowSec, in)
+				sb.stats = unionStats(nowSec, in)
 			} else {
-				b.stats = fileStats{}
+				sb.stats = fileStats{}
 			}
 		}
-		return nil
+		ob := &outBuilder{b: sb}
+		builders[bucket] = ob
+		buckets = append(buckets, bucket)
+		slices.Sort(buckets)
+		return ob, nil
 	}
-	seal := func() error {
-		out, err := b.finish()
-		path := b.path
-		b = nil
+	// seal finishes bucket's builder. next is the key about to be written
+	// (nil at the end): every row below it, and below the first key of every
+	// other open builder, is then in sealed output.
+	seal := func(bucket int64, next []byte) error {
+		ob := builders[bucket]
+		delete(builders, bucket)
+		buckets = slices.DeleteFunc(buckets, func(x int64) bool { return x == bucket })
+		out, err := ob.b.finish()
+		path := ob.b.path
 		if err != nil || out == nil {
 			return err
 		}
@@ -1462,12 +1704,22 @@ func (c *compaction) compactShard(s int) error {
 			_ = e.fs.Remove(path)
 			return err
 		}
-		out.run = c.runID(out.num)
-		return c.sealed(s, out, slices.Clone(lastKey))
+		out.run = c.runID(bucket, out.num)
+		bound := next
+		for _, o := range builders {
+			if bound == nil || bytes.Compare(o.firstKey, bound) < 0 {
+				bound = o.firstKey
+			}
+		}
+		if bound == nil {
+			// Nothing pending and no next row: everything is sealed.
+			bound = append(slices.Clone(ob.lastKey), 0)
+		}
+		return c.sealed(s, out, slices.Clone(bound))
 	}
 	fail := func(err error) error {
-		if b != nil {
-			b.abort()
+		for _, ob := range builders {
+			ob.b.abort()
 		}
 		return err
 	}
@@ -1482,6 +1734,7 @@ func (c *compaction) compactShard(s int) error {
 	incremental := fragment > 0 && inSize > fragment
 	var purged []byte
 	var contrib []int
+	var hist ldtHistogram // deletion times of the current row, if not split
 	ok := false
 	if lower == nil {
 		ok = mi.first()
@@ -1492,24 +1745,15 @@ func (c *compaction) compactShard(s int) error {
 		if n%1024 == 0 && (e.unusable.Load() || t.dropped.Load()) {
 			return fail(errCompactionAborted)
 		}
-		// Cut a fragment at a partition boundary once it is large enough.
-		if b != nil && fragment > 0 && b.w.EstimatedSize() >= fragment && keyToken(mi.key) != keyToken(lastKey) {
-			if err := seal(); err != nil {
-				return fail(err)
-			}
-		}
-		if b == nil {
-			if err := start(); err != nil {
-				return fail(err)
-			}
-		}
 		value := mi.value
+		var rs *row.Stats
 		if purge {
 			// One decoding purges the row and yields its statistics.
 			key := mi.key
-			out, changed, empty, rs, err := purger.PurgeAndSummarize(purged[:0], value, nowSec, gcBefore, func(minTS, maxTS int64) (int64, error) {
+			hist = ldtHistogram{}
+			out, changed, empty, st, err := purger.PurgeAndSummarize(purged[:0], value, nowSec, gcBefore, func(minTS, maxTS int64) (int64, error) {
 				return lookup.maxPurgeable(key, minTS, maxTS)
-			}, func(ldt int64) { b.stats.hist.add(ldt, 1) })
+			}, func(ldt int64) { hist.add(ldt, 1) })
 			if err != nil {
 				return fail(err)
 			}
@@ -1529,19 +1773,54 @@ func (c *compaction) compactShard(s int) error {
 			if changed {
 				purged, value = out, out
 			}
-			if err := b.addSummarized(mi.key, value, mi.trailer, &rs); err != nil {
+			rs = &st
+		}
+		parts := []row.Part{{Value: value}}
+		if split != nil {
+			var err error
+			if parts, err = split(value); err != nil {
 				return fail(err)
 			}
-		} else if err := b.add(mi.key, value, mi.trailer); err != nil {
-			return fail(err)
+			if len(parts) > 1 {
+				rs = nil // statistics per part, computed by the builders
+			}
 		}
-		lastKey = append(lastKey[:0], mi.key...)
+		for _, part := range parts {
+			ob := builders[part.Bucket]
+			// Cut a fragment at a partition boundary once it is large.
+			if ob != nil && fragment > 0 && ob.b.w.EstimatedSize() >= fragment && keyToken(mi.key) != keyToken(ob.lastKey) {
+				if err := seal(part.Bucket, mi.key); err != nil {
+					return fail(err)
+				}
+				ob = nil
+			}
+			if ob == nil {
+				var err error
+				if ob, err = start(part.Bucket); err != nil {
+					return fail(err)
+				}
+				ob.firstKey = slices.Clone(mi.key)
+			}
+			var err error
+			if rs != nil {
+				for i := range hist.points {
+					ob.b.stats.hist.add(hist.points[i], hist.counts[i])
+				}
+				err = ob.b.addSummarized(mi.key, part.Value, mi.trailer, rs)
+			} else {
+				err = ob.b.add(mi.key, part.Value, mi.trailer)
+			}
+			if err != nil {
+				return fail(err)
+			}
+			ob.lastKey = append(ob.lastKey[:0], mi.key...)
+		}
 	}
 	if mi.e != nil {
 		return fail(mi.e)
 	}
-	if b != nil {
-		if err := seal(); err != nil {
+	for len(buckets) > 0 {
+		if err := seal(buckets[0], nil); err != nil {
 			return fail(err)
 		}
 	}

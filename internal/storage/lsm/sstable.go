@@ -6,6 +6,7 @@ import (
 	"github.com/cassandra-room/cassandra-room/internal/storage/row"
 	"io"
 	"math"
+	"slices"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
@@ -189,10 +190,131 @@ func (b *sstBuilder) abort() {
 // keys; see shardBoundaries), so no sstable crosses one. alloc returns file
 // numbers. It returns no files if the memtable is empty; on error it removes
 // what it wrote.
-func writeTable(fs vfs.FS, dir string, alloc func() uint64, wo sstable.WriterOptions, merger Merger, mem *memTable, boundaries [][]byte, fragment int64, created int64) ([]*fileMeta, error) {
+//
+// With split (the time-window mode), rows are instead split by time window
+// and each window's parts go to their own sstables (writeByWindow).
+func writeTable(fs vfs.FS, dir string, alloc func() uint64, wo sstable.WriterOptions, merger Merger, mem *memTable, boundaries [][]byte, fragment int64, split func([]byte) ([]row.Part, error), created int64) ([]*fileMeta, error) {
 	it := memIter{merger: merger, n: mem.first()}
+	if split != nil {
+		return writeByWindow(fs, dir, alloc, wo, merger, it.next, split, fragment, created)
+	}
 	return writeSharded(fs, dir, alloc, wo, merger, it.next, boundaries, fragment, created)
 }
+
+// writeByWindow writes the rows next returns, in key order, split by time
+// window, to one run of sstables per window (ScyllaDB's
+// segregate_by_timestamp), each cut into fragments of about fragment bytes
+// at partition boundaries. Late or out-of-order writes thus never share an
+// sstable with another window's data, so each window's sstables expire
+// together. At most maxSegregatedWindows windows get their own run; the
+// parts of older windows beyond that share the run of the oldest one kept.
+func writeByWindow(fs vfs.FS, dir string, alloc func() uint64, wo sstable.WriterOptions, merger Merger,
+	next func() (key, value []byte, trailer uint64, ok bool, err error), split func([]byte) ([]row.Part, error), fragment int64, created int64) ([]*fileMeta, error) {
+	type chain struct {
+		b       *sstBuilder
+		lastKey []byte
+		run     uint64
+	}
+	chains := map[int64]*chain{}
+	var out []*fileMeta
+	fail := func(err error) ([]*fileMeta, error) {
+		for _, c := range chains {
+			if c.b != nil {
+				c.b.abort()
+			}
+		}
+		for _, f := range out {
+			_ = fs.Remove(fs.PathJoin(dir, tableFileName(f.num)))
+		}
+		return nil, err
+	}
+	finish := func(c *chain) error {
+		meta, err := c.b.finish()
+		c.b = nil
+		if err != nil {
+			return err
+		}
+		meta.run = c.run
+		out = append(out, meta)
+		return nil
+	}
+	for {
+		key, value, trailer, ok, err := next()
+		if err != nil {
+			return fail(err)
+		}
+		if !ok {
+			break
+		}
+		parts, err := split(value)
+		if err != nil {
+			return fail(err)
+		}
+		for _, p := range parts {
+			w := p.Bucket
+			if chains[w] == nil && len(chains) >= maxSegregatedWindows {
+				// Too many windows: share the oldest kept window's run.
+				oldest := int64(math.MaxInt64)
+				for k := range chains {
+					oldest = min(oldest, k)
+				}
+				if w > oldest {
+					// Newer than the oldest kept: replace nothing, co-locate
+					// with the newest window not after it.
+					best := oldest
+					for k := range chains {
+						if k <= w && k > best {
+							best = k
+						}
+					}
+					w = best
+				} else {
+					w = oldest
+				}
+			}
+			c := chains[w]
+			if c == nil {
+				c = &chain{}
+				chains[w] = c
+			}
+			if c.b != nil && fragment > 0 && c.b.w.EstimatedSize() >= uint64(fragment) && keyToken(key) != keyToken(c.lastKey) {
+				if err := finish(c); err != nil {
+					return fail(err)
+				}
+			}
+			if c.b == nil {
+				num := alloc()
+				if c.run == 0 {
+					c.run = num
+				}
+				if c.b, err = newSSTBuilder(fs, dir, num, wo, merger, true, created); err != nil {
+					return fail(err)
+				}
+			}
+			if err := c.b.add(key, p.Value, trailer); err != nil {
+				return fail(err)
+			}
+			c.lastKey = append(c.lastKey[:0], key...)
+		}
+	}
+	ws := make([]int64, 0, len(chains))
+	for w := range chains {
+		ws = append(ws, w)
+	}
+	slices.Sort(ws)
+	for _, w := range ws {
+		if c := chains[w]; c.b != nil {
+			if err := finish(c); err != nil {
+				return fail(err)
+			}
+		}
+	}
+	return out, nil
+}
+
+// maxSegregatedWindows bounds the windows one flush or compaction writes
+// separate sstables for (ScyllaDB's max_data_segregation_window_count).
+const maxSegregatedWindows = 100
 
 // writeSharded writes the rows next returns, in key order, to sstables, a
 // new one starting at each shard boundary and, with a positive fragment
@@ -236,6 +358,7 @@ func writeSharded(fs vfs.FS, dir string, alloc func() uint64, wo sstable.WriterO
 			if err != nil {
 				return fail(err)
 			}
+			meta.run = out0(out, meta)
 			out = append(out, meta)
 		}
 		if b == nil {
@@ -254,6 +377,7 @@ func writeSharded(fs vfs.FS, dir string, alloc func() uint64, wo sstable.WriterO
 		if err != nil {
 			return fail(err)
 		}
+		meta.run = out0(out, meta)
 		out = append(out, meta)
 	}
 	return out, nil
@@ -326,4 +450,12 @@ func (t *tableReader) getMerged(merger Merger, key, acc []byte) (_ []byte, found
 // mayContain reports whether key is inside the table's key range.
 func (f *fileMeta) mayContain(key []byte) bool {
 	return bytes.Compare(key, f.smallest.UserKey) >= 0 && bytes.Compare(key, f.largest.UserKey) <= 0
+}
+
+// out0 returns the run of a writer's output: the number of its first file.
+func out0(out []*fileMeta, meta *fileMeta) uint64 {
+	if len(out) > 0 {
+		return out[0].num
+	}
+	return meta.num
 }
