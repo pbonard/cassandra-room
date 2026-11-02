@@ -51,24 +51,24 @@ type ClusterOptions struct {
 // by timestamp, so the merge is reconciliation) and repair the replicas
 // that were behind.
 type proxy struct {
-	d      *DB
-	m      *cluster.Messaging
-	g      *cluster.Gossiper
-	cms    *cluster.CMS
-	lat    readLatency
+	d   *DB
+	m   *cluster.Messaging
+	g   *cluster.Gossiper
+	cms *cluster.CMS
+	lat readLatency
 	// initialCMS are the metadata service's members before the metadata
 	// records any.
 	initialCMS []string
 	// replaced holds the host ids of nodes a joining node replaces: they
 	// count as down.
 	replaced atomic.Pointer[map[string]bool]
-	opts   ClusterOptions
-	ring   atomic.Pointer[cluster.Ring]
-	self   string
-	stopCh chan struct{}
-	wg     sync.WaitGroup
-	hintMu sync.Mutex
-	seq    atomic.Uint64
+	opts     ClusterOptions
+	ring     atomic.Pointer[cluster.Ring]
+	self     string
+	stopCh   chan struct{}
+	wg       sync.WaitGroup
+	hintMu   sync.Mutex
+	seq      atomic.Uint64
 }
 
 // cmsStateFileName holds the metadata service's acceptor state.
