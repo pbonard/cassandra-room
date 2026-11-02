@@ -761,3 +761,21 @@ func TestClusterHintWindowAndTTL(t *testing.T) {
 	require.Zero(t, local("SELECT k FROM ks.kv WHERE k = 2"), "no hint once the node was down past the window")
 	require.Zero(t, local("SELECT k FROM ks.short WHERE k = 1"), "the hint expired with gc_grace_seconds")
 }
+
+func TestClusterThreadPools(t *testing.T) {
+	c := newTestCluster(t, 2)
+	rows := c.values(1, one, "SELECT name, active_tasks_limit FROM system_views.thread_pools")
+	require.Contains(t, rows, "ReadStage 64")
+	require.Contains(t, rows, "StreamingStage 4")
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
+	c.ok(0, quorum, "CREATE TABLE ks.kv (k int PRIMARY KEY, v text)")
+	for i := 0; i < 50; i++ {
+		c.ok(0, quorum, "INSERT INTO ks.kv (k, v) VALUES (?, 'x')", i)
+	}
+	// Each node reports its primary ranges: together, the whole ring.
+	total := 0
+	for n := range c.nodes {
+		total += len(c.values(n, one, "SELECT range_start FROM system.size_estimates WHERE keyspace_name = 'ks'"))
+	}
+	require.Equal(t, len(c.nodes[0].proxy.tokenSegments()), total)
+}

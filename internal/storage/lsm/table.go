@@ -380,3 +380,26 @@ func (it *Iterator) Close() error {
 
 // Options returns a copy of the table's options.
 func (t *Table) Options() TableOptions { return *t.o() }
+
+// Size is a table's approximate size: bytes in sstables and memtables, and
+// rows (entries; a row with fragments in several sstables counts once per
+// sstable).
+type Size struct {
+	Bytes, Rows int64
+}
+
+// Size returns the table's approximate size.
+func (t *Table) Size() Size {
+	s := t.acquireState()
+	defer s.release()
+	var out Size
+	for _, f := range s.files {
+		out.Bytes += int64(f.size)
+		out.Rows += int64(f.stats.entries)
+	}
+	for _, m := range s.mems {
+		out.Bytes += m.approximateSize()
+		out.Rows += m.count.Load()
+	}
+	return out
+}

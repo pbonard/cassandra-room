@@ -255,3 +255,30 @@ func TestIndexEntryKeys(t *testing.T) {
 	require.ElementsMatch(t, []string{"2", "3"}, s.rows("SELECT k FROM ks.r WHERE v > 'a'"))
 	require.ElementsMatch(t, []string{"1"}, s.rows("SELECT k FROM ks.r WHERE v = 'a'"))
 }
+
+// TestEstimatesAndViews checks system.size_estimates, table_estimates
+// and the system_views node tables.
+func TestEstimatesAndViews(t *testing.T) {
+	s := openTest(t, nil)
+	s.ok("CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+	s.ok("CREATE TABLE ks.t (k int, c int, v text, PRIMARY KEY (k, c))")
+	for k := 0; k < 100; k++ {
+		for c := 0; c < 5; c++ {
+			s.ok(fmt.Sprintf("INSERT INTO ks.t (k, c, v) VALUES (%d, %d, 'value')", k, c))
+		}
+	}
+	rows := s.rows("SELECT table_name, range_start, range_end, partitions_count FROM system.size_estimates WHERE keyspace_name = 'ks'")
+	require.Len(t, rows, 1)
+	var name, start, end string
+	var parts int
+	_, err := fmt.Sscanf(rows[0], "%s %s %s %d", &name, &start, &end, &parts)
+	require.NoError(t, err)
+	require.Equal(t, "t", name)
+	require.InDelta(t, 100, parts, 15, "about 100 partitions")
+	require.Len(t, s.rows("SELECT range_type FROM system.table_estimates WHERE keyspace_name = 'ks'"), 1)
+	require.Equal(t, []string{"Murmur3Partitioner"}, func() []string {
+		v := s.rows("SELECT value FROM system_views.settings WHERE name = 'partitioner'")
+		return []string{v[0][len("org.apache.cassandra.dht."):]}
+	}())
+	require.Len(t, s.rows("SELECT mebibytes FROM system_views.disk_usage WHERE keyspace_name = 'ks'"), 1)
+}

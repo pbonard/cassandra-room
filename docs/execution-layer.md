@@ -114,6 +114,13 @@ read and served through the same SELECT path, so drivers' metadata queries
 work unchanged. The node reports release version 5.0.4 and owns the whole
 ring.
 
+Also virtual: `system.size_estimates` and `system.table_estimates` (per
+table and primary range, estimated from the engine's row counts and a
+sample of partition sizes, as Spark's connector reads them),
+`system_views.settings`, `disk_usage`, `thread_pools` (the internode
+stages: active, limit, dropped), `cluster_metadata_log` and
+`cluster_metadata_directory`.
+
 ## Configuration
 
 `cmd/cassandra-room`: `-addr`, `-data-dir`, `-commitlog-sync` (`periodic`,

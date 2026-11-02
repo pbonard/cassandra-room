@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"net"
 	"slices"
 	"sort"
@@ -33,6 +34,12 @@ var systemTables = map[string]map[string]string{
 			listen_address inet, listen_port int, native_protocol_version text, partitioner text, rack text,
 			release_version text, rpc_address inet, rpc_port int, schema_version uuid, tokens set<varchar>,
 			truncated_at map<uuid, blob>, PRIMARY KEY ((key)))`,
+		"size_estimates": `CREATE TABLE size_estimates (keyspace_name text, table_name text, range_start text,
+			range_end text, mean_partition_size bigint, partitions_count bigint,
+			PRIMARY KEY ((keyspace_name), table_name, range_start, range_end))`,
+		"table_estimates": `CREATE TABLE table_estimates (keyspace_name text, table_name text, range_type text,
+			range_start text, range_end text, mean_partition_size bigint, partitions_count bigint,
+			PRIMARY KEY ((keyspace_name), table_name, range_type, range_start, range_end))`,
 		"peers": `CREATE TABLE peers (peer inet, data_center text, host_id uuid, preferred_ip inet, rack text,
 			release_version text, rpc_address inet, schema_version uuid, tokens set<varchar>, PRIMARY KEY ((peer)))`,
 		"peers_v2": `CREATE TABLE peers_v2 (peer inet, peer_port int, data_center text, host_id uuid, preferred_ip inet,
@@ -40,6 +47,9 @@ var systemTables = map[string]map[string]string{
 			schema_version uuid, tokens set<varchar>, PRIMARY KEY ((peer), peer_port))`,
 	},
 	"system_views": {
+		"settings":     `CREATE TABLE settings (name text, value text, PRIMARY KEY ((name)))`,
+		"disk_usage":   `CREATE TABLE disk_usage (keyspace_name text, table_name text, mebibytes bigint, PRIMARY KEY ((keyspace_name), table_name))`,
+		"thread_pools": `CREATE TABLE thread_pools (name text, active_tasks int, active_tasks_limit int, dropped_messages bigint, PRIMARY KEY ((name)))`,
 		"cluster_metadata_log": `CREATE TABLE cluster_metadata_log (epoch bigint, entry_id text, entry_time timestamp,
 			kind text, transformation text, PRIMARY KEY ((epoch)))`,
 		"cluster_metadata_directory": `CREATE TABLE cluster_metadata_directory (host_id uuid, address text,
@@ -133,6 +143,16 @@ func virtualRows(ks, table string) func(d *DB) []map[string][]byte {
 		return typeRows
 	case "system_schema.indexes":
 		return indexRows
+	case "system.size_estimates":
+		return func(d *DB) []map[string][]byte { return estimateRows(d, false) }
+	case "system.table_estimates":
+		return func(d *DB) []map[string][]byte { return estimateRows(d, true) }
+	case "system_views.settings":
+		return settingRows
+	case "system_views.disk_usage":
+		return diskUsageRows
+	case "system_views.thread_pools":
+		return threadPoolRows
 	case "system_views.cluster_metadata_log":
 		return metadataLogRows
 	case "system_views.cluster_metadata_directory":
@@ -517,6 +537,145 @@ func directoryRows(d *DB) []map[string][]byte {
 			r["replaces"] = uuidV(old[:])
 		}
 		out = append(out, r)
+	}
+	return out
+}
+
+// ---- estimates and node views ----
+
+// primaryRanges are the token ranges this node is the first replica of
+// for a keyspace (the whole ring on a single node).
+func (d *DB) primaryRanges(k *Keyspace) [][2]int64 {
+	p := d.proxy
+	if p == nil {
+		return [][2]int64{{math.MinInt64, math.MaxInt64}}
+	}
+	var out [][2]int64
+	for _, sg := range p.tokenSegments() {
+		if reps := p.ring.Load().Replicas(k.Replication, sg[1]); len(reps) > 0 && reps[0].Addr == p.self {
+			out = append(out, sg)
+		}
+	}
+	return out
+}
+
+// tableEstimate estimates a table's partitions and mean partition size:
+// rows from the engine's summaries, partitions per row from a sample of
+// the first keys for tables with clustering columns.
+func (d *DB) tableEstimate(t *Table) (partitions, meanSize int64) {
+	lt, err := d.engine.Table(t.Storage)
+	if err != nil {
+		return 0, 0
+	}
+	sz := lt.Size()
+	partitions = sz.Rows
+	if len(t.Clustering) > 0 && sz.Rows > 0 {
+		it, err := lt.NewIter(nil, nil)
+		if err == nil {
+			keys, parts := 0, 0
+			var last []byte
+			for ok := it.First(); ok && keys < 4096; ok = it.Next() {
+				keys++
+				_, _, rest, err := parsePartition(it.Key())
+				if err != nil {
+					continue
+				}
+				p := it.Key()[:len(it.Key())-len(rest)]
+				if !bytes.Equal(p, last) {
+					parts++
+					last = append(last[:0], p...)
+				}
+			}
+			it.Close()
+			if keys > 0 {
+				partitions = max(1, sz.Rows*int64(parts)/int64(keys))
+			}
+		}
+	}
+	if partitions > 0 {
+		meanSize = sz.Bytes / partitions
+	}
+	return partitions, meanSize
+}
+
+// estimateRows are system.size_estimates (or, with rangeType,
+// system.table_estimates' primary ranges): per table and primary range,
+// the share of the table's partitions the range's token span holds.
+func estimateRows(d *DB, rangeType bool) []map[string][]byte {
+	var out []map[string][]byte
+	for _, t := range d.userTables() {
+		k := d.schema.Load().Keyspaces[t.Keyspace]
+		parts, mean := d.tableEstimate(t)
+		for _, r := range d.primaryRanges(k) {
+			share := (float64(r[1]) - float64(r[0])) / math.Pow(2, 64)
+			row := map[string][]byte{"keyspace_name": textV(t.Keyspace), "table_name": textV(t.Name),
+				"range_start": textV(strconv.FormatInt(r[0], 10)), "range_end": textV(strconv.FormatInt(r[1], 10)),
+				"mean_partition_size": bigintV(mean), "partitions_count": bigintV(int64(float64(parts) * share))}
+			if rangeType {
+				row["range_type"] = textV("primary")
+			}
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
+func settingRows(d *DB) []map[string][]byte {
+	o := d.opts
+	set := map[string]string{
+		"cluster_name": o.ClusterName, "native_transport_port": strconv.Itoa(o.Port),
+		"rpc_address": o.Address.String(), "authenticator": map[bool]string{true: "PasswordAuthenticator", false: "AllowAllAuthenticator"}[o.Authenticator],
+		"authorizer":      map[bool]string{true: "CassandraAuthorizer", false: "AllowAllAuthorizer"}[o.Authorizer],
+		"commitlog_sync":  map[bool]string{true: "batch", false: "periodic"}[o.SyncWrites],
+		"endpoint_snitch": "GossipingPropertyFileSnitch",
+		"partitioner":     "org.apache.cassandra.dht.Murmur3Partitioner",
+		"data_center":     o.DataCenter,
+		"rack":            o.Rack,
+	}
+	if p := d.proxy; p != nil {
+		set["listen_address"] = p.self
+		set["num_tokens"] = strconv.Itoa(len(d.local.Tokens))
+		set["seed_provider"] = strings.Join(p.opts.Seeds, ",")
+		set["write_request_timeout"] = p.opts.WriteTimeout.String()
+		set["read_request_timeout"] = p.opts.ReadTimeout.String()
+		set["max_hint_window"] = p.opts.MaxHintWindow.String()
+		set["hinted_handoff_enabled"] = strconv.FormatBool(!p.opts.DisableHints)
+		set["internode_compression"] = map[bool]string{true: "all", false: "none"}[p.opts.Messaging.Compress]
+		set["server_encryption_options.internode_encryption"] = map[bool]string{true: "all", false: "none"}[p.opts.Messaging.TLS != nil]
+	}
+	var out []map[string][]byte
+	for n, v := range set {
+		out = append(out, map[string][]byte{"name": textV(n), "value": textV(v)})
+	}
+	return out
+}
+
+func diskUsageRows(d *DB) []map[string][]byte {
+	var out []map[string][]byte
+	for _, t := range d.userTables() {
+		lt, err := d.engine.Table(t.Storage)
+		if err != nil {
+			continue
+		}
+		b := lt.Size().Bytes
+		for _, ix := range t.Indexes {
+			if it, err := d.engine.Table(ix.Storage); err == nil {
+				b += it.Size().Bytes
+			}
+		}
+		out = append(out, map[string][]byte{"keyspace_name": textV(t.Keyspace), "table_name": textV(t.Name), "mebibytes": bigintV(b >> 20)})
+	}
+	return out
+}
+
+func threadPoolRows(d *DB) []map[string][]byte {
+	if d.proxy == nil {
+		return nil
+	}
+	var out []map[string][]byte
+	for _, s := range d.proxy.m.Stages() {
+		out = append(out, map[string][]byte{"name": textV(s.Name), "active_tasks": intV(s.Active),
+			"active_tasks_limit": intV(s.Limit), "dropped_messages": bigintV(int64(s.Dropped))})
 	}
 	return out
 }

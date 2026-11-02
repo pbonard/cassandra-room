@@ -305,6 +305,27 @@ type Stats struct {
 	Overloaded uint64
 }
 
+// StageStat is a stage's activity (system_views.thread_pools).
+type StageStat struct {
+	Name          string
+	Active, Limit int
+	Dropped       uint64
+}
+
+var stageNames = [numStages]string{"ReadStage", "MutationStage", "GossipStage", "MetadataStage", "StreamingStage", "RequestResponseStage"}
+
+// Stages returns the stages' activity.
+func (m *Messaging) Stages() []StageStat {
+	out := make([]StageStat, numStages)
+	for i := range out {
+		out[i] = StageStat{Name: stageNames[i], Active: len(m.stages[i]), Limit: stageWorkers[i]}
+	}
+	for v := range m.dropped {
+		out[stageOf(Verb(v))].Dropped += m.dropped[v].Load()
+	}
+	return out
+}
+
 // Stats returns the counters.
 func (m *Messaging) Stats() Stats {
 	s := Stats{Dropped: map[Verb]uint64{}, Overloaded: m.overloaded.Load()}
