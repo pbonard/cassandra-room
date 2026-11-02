@@ -76,6 +76,16 @@ func (m *markerTerm) bind(e *execCtx) ([]byte, valState, error) {
 	if err := m.typ.Validate(v.Contents); err != nil {
 		return nil, vSet, invalidf("Exception while binding column %s: %v", m.name, err)
 	}
+	switch m.typ.Kind {
+	case types.Set, types.Map:
+		// Sort and deduplicate, as Sets.Value and Maps.Value fromSerialized.
+		per := 1
+		if m.typ.Kind == types.Map {
+			per = 2
+		}
+		elems, _ := types.SplitCollection(v.Contents, per)
+		return buildCollection(m.typ, elems), vSet, nil
+	}
 	if v.Contents == nil {
 		return []byte{}, vSet, nil
 	}

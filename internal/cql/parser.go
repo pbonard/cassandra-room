@@ -213,7 +213,9 @@ func (p *parser) statement() (Statement, error) {
 		}
 	}
 	switch t.text {
-	case "create", "alter", "drop", "grant", "revoke", "list", "describe", "desc", "comment", "security":
+	case "describe", "desc":
+		return p.describe()
+	case "create", "alter", "drop", "grant", "revoke", "list", "comment", "security":
 		return nil, &UnsupportedError{Statement: strings.ToUpper(t.text)}
 	}
 	return nil, p.errorf("no viable alternative at input '%s'", p.peekText())
@@ -1329,4 +1331,54 @@ func (p *parser) alterTable() (*AlterTable, error) {
 		return nil, &UnsupportedError{Statement: "ALTER TABLE"}
 	}
 	return s, nil
+}
+
+func (p *parser) describe() (*Describe, error) {
+	p.next()
+	d := &Describe{}
+	switch {
+	case p.word("full"):
+		d.Full = true
+		if err := p.expectWord("schema"); err != nil {
+			return nil, err
+		}
+		d.Kind = "SCHEMA"
+	case p.word("schema"):
+		d.Kind = "SCHEMA"
+	case p.word("cluster"):
+		d.Kind = "CLUSTER"
+	case p.isWord("keyspaces"), p.isWord("tables"), p.isWord("types"), p.isWord("functions"), p.isWord("aggregates"):
+		d.Kind = strings.ToUpper(p.next().text)
+	case p.isWord("only") || p.isWord("keyspace"):
+		d.Only = p.word("only")
+		if err := p.expectWord("keyspace"); err != nil {
+			return nil, err
+		}
+		d.Kind = "KEYSPACE"
+		if t := p.peek(); t.kind == tIdent && t.text != "with" || t.kind == tQuoted {
+			ks, err := p.ident()
+			if err != nil {
+				return nil, err
+			}
+			d.Keyspace = ks
+		}
+	case p.word("table"), p.word("columnfamily"):
+		d.Kind = "TABLE"
+		var err error
+		if d.Keyspace, d.Name, err = p.tableName(); err != nil {
+			return nil, err
+		}
+	default:
+		var err error
+		if d.Keyspace, d.Name, err = p.tableName(); err != nil {
+			return nil, err
+		}
+	}
+	if p.word("with") {
+		if err := p.expectWord("internals"); err != nil {
+			return nil, err
+		}
+		d.Internals = true
+	}
+	return d, nil
 }

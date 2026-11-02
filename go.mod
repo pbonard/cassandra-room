@@ -6,7 +6,9 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/cockroachdb/pebble v0.0.0-20261021160554-a995e890c06e
 	github.com/datastax/go-cassandra-native-protocol v0.0.0-20260130100129-9d5b43677a33
+	github.com/gocql/gocql v1.7.0
 	github.com/stretchr/testify v1.9.0
+	gopkg.in/inf.v0 v0.9.1
 )
 
 require (
@@ -28,6 +30,7 @@ require (
 	github.com/golang/protobuf v1.5.3 // indirect
 	github.com/golang/snappy v0.0.5-0.20231225225746-43d5d4cd4e0e // indirect
 	github.com/google/btree v1.1.3 // indirect
+	github.com/hailocab/go-hostpool v0.0.0-20160125115350-e80d13ce29ed // indirect
 	github.com/klauspost/compress v1.17.11 // indirect
 	github.com/klauspost/cpuid/v2 v2.0.9 // indirect
 	github.com/kr/pretty v0.3.1 // indirect

@@ -32,6 +32,7 @@ type selectStmt struct {
 	// partitionFilters are partition key restrictions evaluated as filters
 	// (a partially restricted partition key with ALLOW FILTERING).
 	partitionFilters []filter
+	md               []*message.ColumnMetadata
 }
 
 type selKind uint8
@@ -149,6 +150,7 @@ func (d *DB) prepareSelect(s *Schema, session string, st *cql.Select, vs *vars) 
 		}
 	}
 	sel.pkIndices = pkIndices(t, vs)
+	sel.md = sel.metadata()
 	return sel, nil
 }
 
@@ -321,6 +323,9 @@ func castable(from, to *types.Type) bool {
 }
 
 func (s *selectStmt) metadata() []*message.ColumnMetadata {
+	if s.md != nil {
+		return s.md
+	}
 	out := make([]*message.ColumnMetadata, len(s.sels))
 	for i, sel := range s.sels {
 		out[i] = &message.ColumnMetadata{Keyspace: s.t.Keyspace, Table: s.t.Name, Name: sel.name, Index: int32(i), Type: sel.typ.DataType()}

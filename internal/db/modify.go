@@ -409,7 +409,14 @@ func (m *modification) addMutations(e *execCtx, b *lsm.Batch) error {
 	if wholeRows {
 		deletion = row.Deletion{MarkedForDeleteAt: ts, LocalDeletionTime: e.nowSec}
 	}
-	var buf []byte
+	size := 16
+	for _, c := range cells {
+		size += len(c.Value) + 24
+	}
+	for _, c := range statics {
+		size += len(c.Value) + 24
+	}
+	buf := make([]byte, 0, size)
 	put := func(key []byte, r *row.Row) {
 		buf = row.Append(buf[:0], r)
 		b.Put(t.Storage, key, buf)

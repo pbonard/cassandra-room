@@ -101,6 +101,10 @@ func (d *DB) prepare(keyspace, query string) (*prepState, error) {
 		if m.cond != nil {
 			ps.result = m.cond.metadata()
 		}
+	case *cql.Describe:
+		ds := &describeStmt{raw: st, session: keyspace}
+		ps.stmt = ds
+		ps.result = ds.metadata()
 	case *cql.Batch:
 		b, err := d.prepareBatch(s, keyspace, st, vs)
 		if err != nil {
@@ -248,7 +252,7 @@ func (d *DB) Execute(p *Prepared, o *RequestOptions) message.Message {
 		case o.ResultMetadataID != nil && string(o.ResultMetadataID) != string(st.resultID):
 			rows.Metadata.NewResultMetadataId = st.resultID
 		case o.SkipMeta:
-			rows.Metadata.Columns = nil
+			rows.Metadata = &message.RowsMetadata{ColumnCount: rows.Metadata.ColumnCount, PagingState: rows.Metadata.PagingState}
 		}
 	}
 	return res

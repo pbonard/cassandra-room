@@ -317,3 +317,66 @@ func TestMurmur3(t *testing.T) {
 		require.Equal(t, want[n-1], murmur3(hi[:n]), n)
 	}
 }
+
+func TestDescribe(t *testing.T) {
+	s := openTest(t, nil)
+	s.ok("CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+	s.ok("USE ks")
+	s.ok(`CREATE TABLE "Mixed" (k int, "C" text, v int static, PRIMARY KEY ((k), "C")) WITH CLUSTERING ORDER BY ("C" DESC) AND comment = 'it''s'`)
+	require.Equal(t, []string{"ks keyspace ks", "system keyspace system", "system_schema keyspace system_schema"}, s.rows("DESCRIBE KEYSPACES"))
+	require.Equal(t, []string{`ks table "Mixed"`}, s.rows("DESCRIBE TABLES"))
+	out := s.rows(`DESCRIBE TABLE "Mixed"`)
+	require.Len(t, out, 1)
+	require.Contains(t, out[0], `CREATE TABLE ks."Mixed" (`)
+	require.Contains(t, out[0], `v int static,`)
+	require.Contains(t, out[0], `PRIMARY KEY (k, "C")`)
+	require.Contains(t, out[0], `CLUSTERING ORDER BY ("C" DESC)`)
+	require.Contains(t, out[0], `comment = 'it''s'`)
+	require.Len(t, s.rows("DESCRIBE KEYSPACE ks"), 2)
+	require.Len(t, s.rows("DESCRIBE ONLY KEYSPACE ks"), 1)
+	require.Len(t, s.rows("DESCRIBE SCHEMA"), 2)
+	s.fails("DESCRIBE TABLE nope", "not found")
+}
+
+func BenchmarkExecute(b *testing.B) {
+	d, err := Open("db", Options{FS: vfs.NewMem()})
+	require.NoError(b, err)
+	defer d.Close()
+	run := func(q string) {
+		p, err := d.Prepare("", q)
+		require.NoError(b, err)
+		if e, ok := d.Execute(p, &RequestOptions{}).(message.Error); ok {
+			b.Fatal(e.GetErrorMessage())
+		}
+	}
+	run("CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+	run("CREATE TABLE ks.kv (k blob PRIMARY KEY, c0 blob, c1 blob, c2 blob, c3 blob, c4 blob)")
+	ins, err := d.Prepare("ks", "INSERT INTO kv (k, c0, c1, c2, c3, c4) VALUES (?, ?, ?, ?, ?, ?)")
+	require.NoError(b, err)
+	sel, err := d.Prepare("ks", "SELECT * FROM kv WHERE k = ?")
+	require.NoError(b, err)
+	val := primitive.NewValue(make([]byte, 34))
+	key := func(i int) *primitive.Value { return primitive.NewValue([]byte(fmt.Sprintf("%010d", i))) }
+	const n = 100000
+	b.Run("insert", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			res := d.Execute(ins, &RequestOptions{Values: []*primitive.Value{key(i % n), val, val, val, val, val}})
+			if _, ok := res.(message.Error); ok {
+				b.Fatal(res)
+			}
+		}
+	})
+	for i := 0; i < n; i++ {
+		d.Execute(ins, &RequestOptions{Values: []*primitive.Value{key(i), val, val, val, val, val}})
+	}
+	b.Run("select", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			res := d.Execute(sel, &RequestOptions{Values: []*primitive.Value{key(i % n)}}).(*message.RowsResult)
+			if len(res.Data) != 1 {
+				b.Fatal("missing row")
+			}
+		}
+	})
+}

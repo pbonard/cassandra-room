@@ -33,4 +33,3 @@ func TestIsTimeoutError(t *testing.T) {
 	assert.False(t, isTimeoutError(fakeNetError{timeout: false}))
 	assert.False(t, isTimeoutError(errors.New("other error")))
 }
-

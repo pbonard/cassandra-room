@@ -263,6 +263,17 @@ type DropTable struct {
 // Truncate is TRUNCATE.
 type Truncate struct{ Keyspace, Table string }
 
+// Describe is a DESCRIBE statement (DescribeStatement). Kind is one of
+// SCHEMA, KEYSPACES, TABLES, TYPES, FUNCTIONS, AGGREGATES, KEYSPACE, TABLE,
+// CLUSTER, or "" for DESCRIBE name (a keyspace or a table).
+type Describe struct {
+	Kind           string
+	Keyspace, Name string
+	Full, Only     bool
+	Internals      bool
+}
+
+func (*Describe) stmt()       {}
 func (*Use) stmt()            {}
 func (*Select) stmt()         {}
 func (*Insert) stmt()         {}
