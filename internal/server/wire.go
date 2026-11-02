@@ -151,6 +151,12 @@ func validateRawBodyBounds(hdr *frame.Header, body []byte) error {
 		_, err := skipStringList(body, pos)
 		return err
 
+	case primitive.OpCodeAuthResponse:
+		// [bytes] token: bounded by the body, so a huge claimed length is
+		// rejected before decoding allocates it.
+		_, err := skipBytes(body, pos)
+		return err
+
 	case primitive.OpCodeQuery:
 		var err error
 		pos, err = skipLongString(body, pos)

@@ -105,6 +105,8 @@ func (d *DB) prepare(keyspace, query string) (*prepState, error) {
 		ds := &describeStmt{raw: st, session: keyspace}
 		ps.stmt = ds
 		ps.result = ds.metadata()
+	case *cql.RoleStmt, *cql.GrantStmt, *cql.ListStmt:
+		ps.stmt = &authStmt{raw: st, session: keyspace}
 	case *cql.Batch:
 		b, err := d.prepareBatch(s, keyspace, st, vs)
 		if err != nil {
@@ -155,6 +157,7 @@ type execCtx struct {
 	noMeta  bool
 	version primitive.ProtocolVersion
 	json    map[*jsonSource]map[string]any // INSERT JSON objects, decoded
+	user    string                         // the logged-in role
 }
 
 func (e *execCtx) timestamp() int64 {
@@ -177,6 +180,8 @@ type RequestOptions struct {
 	// the statement's, the result carries the new metadata.
 	ResultMetadataID []byte
 	Version          primitive.ProtocolVersion
+	// User is the session's logged-in role, checked by the authorizer.
+	User string
 }
 
 // OptionsOf converts protocol query options.
@@ -192,7 +197,7 @@ func OptionsOf(o *message.QueryOptions, v primitive.ProtocolVersion) *RequestOpt
 }
 
 func (d *DB) newCtx(o *RequestOptions, st *prepState) (*execCtx, error) {
-	e := &execCtx{d: d, now: d.opts.Now(), page: int(o.PageSize), paging: o.PagingState, noMeta: o.SkipMeta, version: o.Version}
+	e := &execCtx{d: d, now: d.opts.Now(), page: int(o.PageSize), paging: o.PagingState, noMeta: o.SkipMeta, version: o.Version, user: o.User}
 	e.nowSec = e.now.Unix()
 	if o.NowInSec != nil {
 		e.nowSec = int64(*o.NowInSec)
@@ -244,9 +249,17 @@ func (d *DB) Execute(p *Prepared, o *RequestOptions) message.Message {
 	if err != nil {
 		return ErrorMessage(err)
 	}
+	for _, need := range st.required(p.Keyspace) {
+		if err := d.authorize(o.User, need[0], need[1]); err != nil {
+			return ErrorMessage(err)
+		}
+	}
 	res, err := st.stmt.execute(e)
 	if err != nil {
 		return ErrorMessage(err)
+	}
+	if sc, ok := res.(*message.SchemaChangeResult); ok && sc.ChangeType == primitive.SchemaChangeTypeCreated {
+		d.grantCreator(o.User, sc)
 	}
 	if rows, ok := res.(*message.RowsResult); ok {
 		switch {
@@ -297,6 +310,11 @@ func (d *DB) ExecuteBatch(typ primitive.BatchType, children []BatchChild, o *Req
 		case !m.t.IsCounter() && typ == primitive.BatchTypeCounter:
 			return ErrorMessage(invalidf("Cannot include non-counter statement in a counter batch"))
 		}
+		for _, need := range st.required(c.Prepared.Keyspace) {
+			if err := d.authorize(o.User, need[0], need[1]); err != nil {
+				return ErrorMessage(err)
+			}
+		}
 		if len(c.Values) != len(st.vars) {
 			return ErrorMessage(invalidf("There were %d markers(?) in CQL but %d bound variables", len(st.vars), len(c.Values)))
 		}
@@ -321,4 +339,29 @@ type useStmt struct{ keyspace string }
 
 func (u *useStmt) execute(*execCtx) (message.Message, error) {
 	return &message.SetKeyspaceResult{Keyspace: u.keyspace}, nil
+}
+
+// grantCreator gives a non-superuser all permissions on the keyspace or
+// table it created (the authorizer's grant on creation).
+func (d *DB) grantCreator(user string, sc *message.SchemaChangeResult) {
+	if !d.opts.Authorizer || user == "" {
+		return
+	}
+	d.ddlMu.Lock()
+	defer d.ddlMu.Unlock()
+	roles := cloneRoles(*d.roles.Load())
+	r := roles[user]
+	if r == nil || isSuper(roles, user) {
+		return
+	}
+	res := "data/" + sc.Keyspace
+	switch sc.Target {
+	case primitive.SchemaChangeTargetTable:
+		res += "/" + sc.Object
+	case primitive.SchemaChangeTargetKeyspace:
+	default:
+		return
+	}
+	r.Permissions = withPerms(r.Permissions, res, applicable(res))
+	_ = d.saveRoles(roles)
 }

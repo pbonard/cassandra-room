@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,6 +40,9 @@ type Options struct {
 	// clients connect to; Port its native transport port.
 	Address net.IP
 	Port    int
+	// Authenticator requires clients to log in (PasswordAuthenticator);
+	// Authorizer checks permissions (CassandraAuthorizer).
+	Authenticator, Authorizer bool
 	// Now overrides the clock (tests).
 	Now func() time.Time
 }
@@ -72,6 +76,8 @@ type DB struct {
 	// counterMu serializes counter updates, which read the node's shard
 	// before writing it (Cassandra's counter locks).
 	counterMu sync.Mutex
+
+	roles atomic.Pointer[map[string]*Role]
 }
 
 // localState is persisted with the schema.
@@ -86,6 +92,7 @@ type schemaFile struct {
 	Local     localState
 	Keyspaces []*Keyspace
 	Tables    []json.RawMessage
+	Roles     []*Role `json:",omitempty"`
 }
 
 const schemaFileName = "schema.json"
@@ -120,6 +127,8 @@ func Open(dir string, opts Options) (*DB, error) {
 	if err := d.fs.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
+	empty := map[string]*Role{}
+	d.roles.Store(&empty)
 	if err := d.loadSchema(); err != nil {
 		return nil, err
 	}
@@ -152,6 +161,10 @@ func Open(dir string, opts Options) (*DB, error) {
 				return nil, err
 			}
 		}
+	}
+	if err := d.defaultRoles(); err != nil {
+		e.Close()
+		return nil, err
 	}
 	if !d.local.Bootstrapped {
 		d.local.Bootstrapped = true
@@ -206,6 +219,11 @@ func (d *DB) loadSchema() error {
 			return fmt.Errorf("db: corrupt schema file: %w", err)
 		}
 		d.local = sf.Local
+		roles := map[string]*Role{}
+		for _, r := range sf.Roles {
+			roles[r.Name] = r
+		}
+		d.roles.Store(&roles)
 		for _, k := range sf.Keyspaces {
 			k.Tables = map[string]*Table{}
 			if err := k.buildTypes(); err != nil {
@@ -249,6 +267,12 @@ func oserrorIsNotExist(err error) bool { return errors.Is(err, os.ErrNotExist) }
 // renamed over the old one.
 func (d *DB) saveSchema(s *Schema) error {
 	sf := schemaFile{Local: d.local}
+	if r := d.roles.Load(); r != nil {
+		for _, role := range *r {
+			sf.Roles = append(sf.Roles, role)
+		}
+		sort.Slice(sf.Roles, func(i, j int) bool { return sf.Roles[i].Name < sf.Roles[j].Name })
+	}
 	for _, k := range s.Keyspaces {
 		if k.virtual {
 			continue

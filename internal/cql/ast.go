@@ -348,3 +348,35 @@ func (*CreateTable) stmt()    {}
 func (*AlterTable) stmt()     {}
 func (*DropTable) stmt()      {}
 func (*Truncate) stmt()       {}
+
+// RoleStmt is CREATE, ALTER or DROP ROLE (or USER).
+type RoleStmt struct {
+	Op                    string // CREATE, ALTER, DROP
+	User                  bool   // the legacy USER form
+	Name                  string
+	IfExists, IfNotExists bool
+	Password              *string
+	Login, Superuser      *bool
+}
+
+// GrantStmt is GRANT or REVOKE of permissions on a resource, or of a role.
+type GrantStmt struct {
+	Revoke      bool
+	Permissions []string // nil for a role grant
+	Resource    string   // data, data/ks, data/ks/t, roles, roles/r
+	Role        string   // the role granted (role grants)
+	Grantee     string
+}
+
+// ListStmt is LIST ROLES, LIST USERS or LIST PERMISSIONS.
+type ListStmt struct {
+	What        string // ROLES, USERS, PERMISSIONS
+	Of          string
+	NoRecursive bool
+	Permissions []string
+	Resource    string
+}
+
+func (*RoleStmt) stmt()  {}
+func (*GrantStmt) stmt() {}
+func (*ListStmt) stmt()  {}

@@ -24,6 +24,7 @@ type Session struct {
 	pendingModernLayout bool
 	modernLayout        bool
 	keyspace            string
+	user                string
 	throwOnOverload     bool
 	compressionAlgo     string
 	compressor          compression.Compressor
@@ -160,4 +161,20 @@ func (s *Session) setCompression(algo string, comp compression.Compressor) {
 	defer s.mu.Unlock()
 	s.compressionAlgo = algo
 	s.compressor = comp
+}
+
+// User returns the role the session logged in as, or "".
+func (s *Session) User() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.user
+}
+
+func (s *Session) setUser(u string) {
+	s.mu.Lock()
+	s.user = u
+	s.mu.Unlock()
 }

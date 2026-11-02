@@ -118,7 +118,7 @@ func TestParseInvalid(t *testing.T) {
 		var se *SyntaxError
 		require.True(t, errors.As(err, &se), "%q: %v", q, err)
 	}
-	_, err := Parse(`CREATE ROLE bob`)
+	_, err := Parse(`CREATE FUNCTION f (a int) RETURNS NULL ON NULL INPUT RETURNS int LANGUAGE java AS $$return a;$$`)
 	var ue *UnsupportedError
 	require.True(t, errors.As(err, &ue))
 }
@@ -129,4 +129,27 @@ func BenchmarkParse(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+func TestParseAuth(t *testing.T) {
+	for _, q := range []string{
+		`CREATE ROLE IF NOT EXISTS alice WITH PASSWORD = 'pw' AND LOGIN = true AND SUPERUSER = false`,
+		`ALTER ROLE alice WITH PASSWORD = 'x'`,
+		`DROP ROLE IF EXISTS alice`,
+		`CREATE USER bob WITH PASSWORD 'pw' NOSUPERUSER`,
+		`GRANT SELECT ON KEYSPACE ks TO alice`,
+		`GRANT ALL PERMISSIONS ON ks.t TO alice`,
+		`REVOKE MODIFY ON ALL KEYSPACES FROM alice`,
+		`GRANT admin TO alice`,
+		`LIST ROLES OF alice NORECURSIVE`,
+		`LIST ALL PERMISSIONS OF alice`,
+		`LIST SELECT ON TABLE ks.t`,
+		`LIST USERS`,
+	} {
+		_, err := Parse(q)
+		require.NoError(t, err, q)
+	}
+	p, err := Parse(`GRANT SELECT ON ks.t TO alice`)
+	require.NoError(t, err)
+	require.Equal(t, &GrantStmt{Permissions: []string{"SELECT"}, Resource: "data/ks/t", Grantee: "alice"}, p.Statement)
 }

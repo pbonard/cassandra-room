@@ -198,3 +198,41 @@ func columnNames(cols []*gocql.ColumnMetadata) []string {
 	}
 	return out
 }
+
+func TestGocqlAuth(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := ln.Addr().(*net.TCPAddr).Port
+	d, err := db.Open("db", db.Options{FS: vfs.NewMem(), Port: port, Authenticator: true, Authorizer: true})
+	require.NoError(t, err)
+	srv := New(d)
+	go func() { _ = srv.Serve(ln) }()
+	defer func() {
+		_ = srv.Shutdown(context.Background())
+		_ = d.Close()
+	}()
+	login := func(user, pass string) (*gocql.Session, error) {
+		cluster := gocql.NewCluster("127.0.0.1:" + strconv.Itoa(port))
+		cluster.ProtoVersion = 4
+		cluster.Timeout = 5 * time.Second
+		cluster.Authenticator = gocql.PasswordAuthenticator{Username: user, Password: pass}
+		return cluster.CreateSession()
+	}
+	_, err = login("cassandra", "wrong")
+	require.Error(t, err)
+	admin, err := login("cassandra", "cassandra")
+	require.NoError(t, err)
+	defer admin.Close()
+	require.NoError(t, admin.Query("CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}").Exec())
+	require.NoError(t, admin.Query("CREATE TABLE ks.t (k int PRIMARY KEY)").Exec())
+	require.NoError(t, admin.Query("CREATE ROLE app WITH PASSWORD = 'secret' AND LOGIN = true").Exec())
+	app, err := login("app", "secret")
+	require.NoError(t, err)
+	defer app.Close()
+	err = app.Query("SELECT * FROM ks.t").Exec()
+	var reqErr gocql.RequestError
+	require.ErrorAs(t, err, &reqErr)
+	require.Equal(t, gocql.ErrCodeUnauthorized, reqErr.Code())
+	require.NoError(t, admin.Query("GRANT SELECT ON ks.t TO app").Exec())
+	require.NoError(t, app.Query("SELECT * FROM ks.t").Exec())
+}

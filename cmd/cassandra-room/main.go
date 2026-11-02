@@ -29,6 +29,8 @@ func main() {
 		commitlogSyncPeriod   = flag.Duration("commitlog-sync-period", 10*time.Second, "Commit log fsync period in periodic mode (commitlog_sync_period)")
 		memtableSpace         = flag.Int64("memtable-space", 0, "Memtable space in bytes across all tables (memtable_heap_space); 0 uses the default")
 		clusterName           = flag.String("cluster-name", "Test Cluster", "Cluster name reported in system.local")
+		authenticator         = flag.String("authenticator", "AllowAllAuthenticator", "AllowAllAuthenticator or PasswordAuthenticator (default superuser cassandra/cassandra)")
+		authorizer            = flag.String("authorizer", "AllowAllAuthorizer", "AllowAllAuthorizer or CassandraAuthorizer")
 	)
 	flag.Parse()
 
@@ -44,7 +46,8 @@ func main() {
 	if ip == nil || ip.IsUnspecified() {
 		ip = net.IPv4(127, 0, 0, 1)
 	}
-	opts := db.Options{SyncWrites: *commitlogSync == "batch", ClusterName: *clusterName, Address: ip, Port: port}
+	opts := db.Options{SyncWrites: *commitlogSync == "batch", ClusterName: *clusterName, Address: ip, Port: port,
+		Authenticator: *authenticator == "PasswordAuthenticator", Authorizer: *authorizer == "CassandraAuthorizer"}
 	opts.Engine.WALSyncPeriod = *commitlogSyncPeriod
 	opts.Engine.MemTableBudget = *memtableSpace
 	database, err := db.Open(*dataDir, opts)

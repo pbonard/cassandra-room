@@ -237,6 +237,15 @@ func (p *parser) statement() (Statement, error) {
 	switch t.text {
 	case "describe", "desc":
 		return p.describe()
+	case "grant", "revoke":
+		return p.grant()
+	case "list":
+		return p.list()
+	}
+	if (t.text == "create" || t.text == "alter" || t.text == "drop") && (p.isWordAt(1, "role") || p.isWordAt(1, "user")) {
+		return p.role()
+	}
+	switch t.text {
 	case "create", "alter", "drop", "grant", "revoke", "list", "comment", "security":
 		return nil, &UnsupportedError{Statement: strings.ToUpper(t.text)}
 	}
@@ -1635,5 +1644,214 @@ func (p *parser) createIndex() (*CreateIndex, error) {
 	} else if custom {
 		return nil, p.errorf("CUSTOM index requires USING")
 	}
+	return s, nil
+}
+
+// roleName reads a role name: an identifier or a string.
+func (p *parser) roleName() (string, error) {
+	if t := p.peek(); t.kind == tString {
+		p.next()
+		return t.text, nil
+	}
+	return p.ident()
+}
+
+func (p *parser) boolValue() (bool, error) {
+	t := p.next()
+	if t.kind != tBoolean {
+		return false, p.errorf("mismatched input '%s' expecting BOOLEAN", t.text)
+	}
+	return t.text == "true", nil
+}
+
+func (p *parser) role() (*RoleStmt, error) {
+	s := &RoleStmt{Op: strings.ToUpper(p.next().text), User: p.next().text == "user"}
+	var err error
+	switch s.Op {
+	case "CREATE":
+		s.IfNotExists, err = p.ifNotExists()
+	case "DROP":
+		s.IfExists, err = p.ifExists()
+	}
+	if err != nil {
+		return nil, err
+	}
+	if s.Name, err = p.roleName(); err != nil {
+		return nil, err
+	}
+	if s.Op == "DROP" {
+		return s, nil
+	}
+	if p.word("with") {
+		if s.User {
+			if err := p.expectWord("password"); err != nil {
+				return nil, err
+			}
+			pw := p.next()
+			if pw.kind != tString {
+				return nil, p.errorf("mismatched input '%s' expecting STRING_LITERAL", pw.text)
+			}
+			s.Password = &pw.text
+		} else {
+			for {
+				opt, err := p.ident()
+				if err != nil {
+					return nil, err
+				}
+				if err := p.expectPunct("="); err != nil {
+					return nil, err
+				}
+				switch opt {
+				case "password":
+					pw := p.next()
+					if pw.kind != tString {
+						return nil, p.errorf("mismatched input '%s' expecting STRING_LITERAL", pw.text)
+					}
+					s.Password = &pw.text
+				case "login", "superuser":
+					b, err := p.boolValue()
+					if err != nil {
+						return nil, err
+					}
+					if opt == "login" {
+						s.Login = &b
+					} else {
+						s.Superuser = &b
+					}
+				case "options":
+					if _, err := p.mapOrSet(); err != nil {
+						return nil, err
+					}
+				default:
+					return nil, p.errorf("Invalid role option %s", opt)
+				}
+				if !p.word("and") {
+					break
+				}
+			}
+		}
+	}
+	if s.User {
+		t, f := true, false
+		switch {
+		case p.word("superuser"):
+			s.Superuser = &t
+		case p.word("nosuperuser"):
+			s.Superuser = &f
+		}
+		s.Login = &t
+	}
+	return s, nil
+}
+
+// permissions reads "ALL [PERMISSIONS]" or "PERM [PERMISSION]".
+func (p *parser) permissions() ([]string, error) {
+	if p.word("all") {
+		p.word("permissions")
+		return []string{"ALL"}, nil
+	}
+	t := p.next()
+	perm := strings.ToUpper(t.text)
+	switch perm {
+	case "CREATE", "ALTER", "DROP", "SELECT", "MODIFY", "AUTHORIZE", "DESCRIBE", "EXECUTE", "UNMASK", "SELECT_MASKED":
+	default:
+		return nil, &SyntaxError{Pos: t.pos, Msg: fmt.Sprintf("no viable alternative at input '%s'", t.text)}
+	}
+	p.word("permission")
+	return []string{perm}, nil
+}
+
+// resource reads a resource (Resources.fromName forms: data, data/ks,
+// data/ks/t, roles, roles/r).
+func (p *parser) resource() (string, error) {
+	switch {
+	case p.word("all"):
+		switch {
+		case p.word("keyspaces"):
+			return "data", nil
+		case p.word("roles"):
+			return "roles", nil
+		case p.word("functions"):
+			return "functions", nil
+		}
+		return "", p.errorf("no viable alternative at input '%s'", p.peekText())
+	case p.word("keyspace"):
+		ks, err := p.ident()
+		return "data/" + ks, err
+	case p.word("role"):
+		r, err := p.roleName()
+		return "roles/" + r, err
+	}
+	p.word("table")
+	ks, t, err := p.tableName()
+	if err != nil {
+		return "", err
+	}
+	if ks == "" {
+		return "data//" + t, nil // keyspace from the session
+	}
+	return "data/" + ks + "/" + t, nil
+}
+
+func (p *parser) grant() (*GrantStmt, error) {
+	s := &GrantStmt{Revoke: p.next().text == "revoke"}
+	to := "to"
+	if s.Revoke {
+		to = "from"
+	}
+	t := p.peek()
+	isPerm := t.kind == tIdent && (t.text == "all" || p.isWordAt(1, "on") || p.isWordAt(1, "permission") || p.isWordAt(1, "permissions"))
+	if !isPerm {
+		r, err := p.roleName()
+		if err != nil {
+			return nil, err
+		}
+		s.Role = r
+	} else {
+		var err error
+		if s.Permissions, err = p.permissions(); err != nil {
+			return nil, err
+		}
+		if err := p.expectWord("on"); err != nil {
+			return nil, err
+		}
+		if s.Resource, err = p.resource(); err != nil {
+			return nil, err
+		}
+	}
+	if err := p.expectWord(to); err != nil {
+		return nil, err
+	}
+	var err error
+	s.Grantee, err = p.roleName()
+	return s, err
+}
+
+func (p *parser) list() (*ListStmt, error) {
+	p.next()
+	s := &ListStmt{}
+	var err error
+	switch {
+	case p.word("roles"):
+		s.What = "ROLES"
+	case p.word("users"):
+		return &ListStmt{What: "USERS"}, nil
+	default:
+		s.What = "PERMISSIONS"
+		if s.Permissions, err = p.permissions(); err != nil {
+			return nil, err
+		}
+		if p.word("on") {
+			if s.Resource, err = p.resource(); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if p.word("of") {
+		if s.Of, err = p.roleName(); err != nil {
+			return nil, err
+		}
+	}
+	s.NoRecursive = p.word("norecursive")
 	return s, nil
 }

@@ -3,8 +3,10 @@ package db
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/datastax/go-cassandra-native-protocol/message"
 
 	"github.com/stretchr/testify/require"
@@ -117,4 +119,89 @@ func TestSecondaryIndex(t *testing.T) {
 	s.fails("SELECT id FROM users WHERE tags CONTAINS 't0'", "ALLOW FILTERING")
 	s.ok("TRUNCATE users")
 	require.Empty(t, ids("SELECT id FROM users WHERE email = 'u2@x'"))
+}
+
+func TestAuth(t *testing.T) {
+	d, err := Open("db", Options{FS: vfs.NewMem(), Authenticator: true, Authorizer: true})
+	require.NoError(t, err)
+	defer d.Close()
+	require.NoError(t, d.Authenticate("cassandra", "cassandra"))
+	require.Error(t, d.Authenticate("cassandra", "wrong"))
+	as := func(user string) *authSession { return &authSession{t: t, d: d, user: user} }
+	admin := as("cassandra")
+	admin.ok("CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+	admin.ok("CREATE TABLE ks.t (k int PRIMARY KEY, v int)")
+	admin.ok("CREATE ROLE alice WITH PASSWORD = 'pw' AND LOGIN = true")
+	admin.ok("CREATE ROLE readers")
+	require.NoError(t, d.Authenticate("alice", "pw"))
+	alice := as("alice")
+	alice.fails("SELECT * FROM ks.t", "User alice has no SELECT permission on <table ks.t> or any of its parents")
+	alice.ok("SELECT * FROM system.local") // drivers' system tables are readable
+	admin.ok("GRANT SELECT ON KEYSPACE ks TO readers")
+	admin.ok("GRANT readers TO alice")
+	alice.ok("SELECT * FROM ks.t")
+	alice.fails("INSERT INTO ks.t (k, v) VALUES (1, 1)", "no MODIFY permission")
+	admin.ok("GRANT MODIFY ON ks.t TO alice")
+	alice.ok("INSERT INTO ks.t (k, v) VALUES (1, 1)")
+	alice.fails("CREATE ROLE bob", "no CREATE permission on <all roles>")
+	alice.fails("CREATE KEYSPACE k2 WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}", "no CREATE permission on <all keyspaces>")
+	admin.ok("GRANT CREATE ON ALL KEYSPACES TO alice")
+	alice.ok("CREATE KEYSPACE k2 WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+	alice.ok("CREATE TABLE k2.x (k int PRIMARY KEY)") // the creator owns k2
+	alice.ok("DROP TABLE k2.x")
+	require.Equal(t, []string{"alice false true", "cassandra true true", "readers false false"}, rowsOf(t, admin.run("LIST ROLES")))
+	require.Equal(t, []string{"alice false true", "readers false false"}, rowsOf(t, admin.run("LIST ROLES OF alice")))
+	require.Contains(t, rowsOf(t, admin.run("LIST ALL PERMISSIONS OF alice")), "alice alice <table ks.t> MODIFY")
+	admin.ok("REVOKE readers FROM alice")
+	alice.fails("SELECT * FROM ks.t", "no SELECT permission")
+	admin.ok("ALTER ROLE alice WITH PASSWORD = 'new'")
+	require.NoError(t, d.Authenticate("alice", "new"))
+	admin.ok("DROP ROLE alice")
+	require.Error(t, d.Authenticate("alice", "new"))
+}
+
+type authSession struct {
+	t    *testing.T
+	d    *DB
+	user string
+}
+
+func (s *authSession) run(q string) message.Message {
+	p, err := s.d.Prepare("", q)
+	if err != nil {
+		return ErrorMessage(err)
+	}
+	return s.d.Execute(p, &RequestOptions{User: s.user})
+}
+
+func (s *authSession) ok(q string) {
+	s.t.Helper()
+	if e, ok := s.run(q).(message.Error); ok {
+		s.t.Fatalf("%s: %s", q, e.GetErrorMessage())
+	}
+}
+
+func (s *authSession) fails(q, substr string) {
+	s.t.Helper()
+	e, ok := s.run(q).(message.Error)
+	require.True(s.t, ok, q)
+	require.Contains(s.t, e.GetErrorMessage(), substr)
+}
+
+func rowsOf(t *testing.T, m message.Message) []string {
+	res, ok := m.(*message.RowsResult)
+	require.True(t, ok, "%v", m)
+	var out []string
+	for _, r := range res.Data {
+		var cols []string
+		for i, v := range r {
+			if res.Metadata.Columns[i].Type.AsCql() == "boolean" {
+				cols = append(cols, fmt.Sprint(v[0] == 1))
+			} else {
+				cols = append(cols, string(v))
+			}
+		}
+		out = append(out, strings.Join(cols, " "))
+	}
+	return out
 }

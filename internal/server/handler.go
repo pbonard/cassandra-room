@@ -89,8 +89,34 @@ func (s *Server) handleMessage(
 				session.setPendingModernLayout(true)
 			}
 		}
+		if s.db.AuthEnabled() {
+			return &message.Authenticate{Authenticator: "org.apache.cassandra.auth.PasswordAuthenticator"}
+		}
 		return &message.Ready{}
 
+	case *message.AuthResponse:
+		if !s.db.AuthEnabled() {
+			return &message.ProtocolError{ErrorMessage: "Unexpected AUTH_RESPONSE: authentication is not enabled"}
+		}
+		// SASL PLAIN: [authzid] NUL authcid NUL password.
+		parts := strings.Split(string(m.Token), "\x00")
+		if len(parts) != 3 {
+			return &message.AuthenticationError{ErrorMessage: "Authentication failed: malformed PLAIN token"}
+		}
+		if err := s.db.Authenticate(parts[1], parts[2]); err != nil {
+			return &message.AuthenticationError{ErrorMessage: err.Error()}
+		}
+		if session != nil {
+			session.setUser(parts[1])
+		}
+		return &message.AuthSuccess{}
+	}
+
+	if s.db.AuthEnabled() && session != nil && session.User() == "" {
+		return &message.Unauthorized{ErrorMessage: "You have not logged in"}
+	}
+
+	switch m := msg.(type) {
 	case *message.Register:
 		return &message.Ready{}
 
@@ -166,7 +192,7 @@ func (s *Server) handleMessage(
 			}
 		}
 		return s.db.ExecuteBatch(m.Type, children, &db.RequestOptions{
-			Timestamp: m.DefaultTimestamp, NowInSec: m.NowInSeconds, Version: version,
+			Timestamp: m.DefaultTimestamp, NowInSec: m.NowInSeconds, Version: version, User: session.User(),
 		})
 
 	default:
@@ -182,6 +208,9 @@ func (s *Server) execute(ctx context.Context, session *Session, p *db.Prepared, 
 		if err := s.testHook(ctx, p.Query); err != nil {
 			return &message.ServerError{ErrorMessage: err.Error()}
 		}
+	}
+	if session != nil {
+		o.User = session.User()
 	}
 	res := s.db.Execute(p, o)
 	if sk, ok := res.(*message.SetKeyspaceResult); ok && session != nil {
