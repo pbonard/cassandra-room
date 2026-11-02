@@ -154,6 +154,7 @@ type execCtx struct {
 	paging  []byte
 	noMeta  bool
 	version primitive.ProtocolVersion
+	json    map[*jsonSource]map[string]any // INSERT JSON objects, decoded
 }
 
 func (e *execCtx) timestamp() int64 {
@@ -271,6 +272,7 @@ func (d *DB) ExecuteBatch(typ primitive.BatchType, children []BatchChild, o *Req
 		return &message.VoidResult{}
 	}
 	var mods []boundModification
+	conditional := false
 	ctx := &execCtx{d: d, now: d.opts.Now()}
 	ctx.nowSec = ctx.now.Unix()
 	if o.NowInSec != nil {
@@ -288,9 +290,7 @@ func (d *DB) ExecuteBatch(typ primitive.BatchType, children []BatchChild, o *Req
 		if !ok {
 			return ErrorMessage(invalidf("Invalid statement in batch: only UPDATE, INSERT and DELETE statements are allowed."))
 		}
-		if m.cond != nil {
-			return ErrorMessage(invalidf("Conditional batches are not supported"))
-		}
+		conditional = conditional || m.cond != nil
 		switch {
 		case m.t.IsCounter() && typ == primitive.BatchTypeLogged:
 			return ErrorMessage(invalidf("Cannot include a counter statement in a logged batch"))
@@ -303,6 +303,13 @@ func (d *DB) ExecuteBatch(typ primitive.BatchType, children []BatchChild, o *Req
 		child := *ctx
 		child.values = c.Values
 		mods = append(mods, boundModification{m: m, e: &child})
+	}
+	if conditional {
+		res, err := d.executeCAS(mods, ctx)
+		if err != nil {
+			return ErrorMessage(err)
+		}
+		return res
 	}
 	if err := d.applyModifications(mods, ctx); err != nil {
 		return ErrorMessage(err)

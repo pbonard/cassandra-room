@@ -3,6 +3,7 @@ package db
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"math"
 	"math/big"
@@ -33,6 +34,8 @@ type selectStmt struct {
 	// (a partially restricted partition key with ALLOW FILTERING).
 	partitionFilters []filter
 	md               []*message.ColumnMetadata
+	json             bool
+	groupBy          []*Column // a prefix of the primary key
 }
 
 type selKind uint8
@@ -49,6 +52,8 @@ const (
 	selSum
 	selAvg
 	selCast
+	selOp     // arithmetic
+	selToJSON // toJson(x)
 )
 
 type selector struct {
@@ -58,7 +63,9 @@ type selector struct {
 	col   *Column
 	cols  []*Column // token()
 	t     term
-	inner *selector // cast, aggregates of non-column arguments
+	inner *selector // cast, toJson, the left operand of arithmetic
+	right *selector // the right operand of arithmetic
+	op    byte
 }
 
 func (d *DB) prepareSelect(s *Schema, session string, st *cql.Select, vs *vars) (*selectStmt, error) {
@@ -71,13 +78,24 @@ func (d *DB) prepareSelect(s *Schema, session string, st *cql.Select, vs *vars) 
 		return nil, err
 	}
 	vs.ks, vs.table = ks, st.Table
-	if st.JSON {
-		return nil, invalidf("SELECT JSON is not supported")
+	sel := &selectStmt{t: t, distinct: st.Distinct, allowFiltering: st.AllowFiltering, json: st.JSON}
+	keyCols := append(slices.Clone(t.PartitionKey), t.Clustering...)
+	for i, name := range st.GroupBy {
+		c := t.byName[name]
+		if c == nil {
+			return nil, invalidf("Undefined column name %s in table %s.%s", name, ks, st.Table)
+		}
+		if c.Kind != PartitionKey && c.Kind != Clustering {
+			return nil, invalidf("Group by is currently only supported on the columns of the PRIMARY KEY, got %s", name)
+		}
+		if i >= len(keyCols) || keyCols[i] != c {
+			return nil, invalidf("Group by currently only support groups of columns following their declared order in the PRIMARY KEY")
+		}
+		sel.groupBy = append(sel.groupBy, c)
 	}
-	if len(st.GroupBy) > 0 {
-		return nil, invalidf("GROUP BY is not supported")
+	if len(sel.groupBy) > 0 && len(sel.groupBy) < len(t.PartitionKey) {
+		return nil, invalidf("Group by currently only support groups of columns following their declared order in the PRIMARY KEY")
 	}
-	sel := &selectStmt{t: t, distinct: st.Distinct, allowFiltering: st.AllowFiltering}
 	if st.Selectors == nil {
 		for _, c := range t.AllColumns() {
 			sel.sels = append(sel.sels, selector{kind: selColumn, name: c.Name, typ: c.Type, col: c})
@@ -216,6 +234,27 @@ func prepareSelector(t *Table, raw cql.Selectable, vs *vars) (selector, error) {
 			return selector{}, err
 		}
 		return selector{kind: selTerm, name: lit.Text, typ: typ, t: tt}, nil
+	case *cql.OpSel:
+		l, err := prepareSelector(t, r.Left, vs)
+		if err != nil {
+			return selector{}, err
+		}
+		if r.Op == 'n' {
+			if !isNumeric(l.typ) {
+				return selector{}, invalidf("Unsupported operation: -%s", l.name)
+			}
+			zero := selector{kind: selTerm, name: "0", typ: l.typ, t: &constTerm{v: fromRat(l.typ, new(big.Rat))}}
+			return selector{kind: selOp, op: '-', name: "-" + l.name, typ: l.typ, inner: &zero, right: &l}, nil
+		}
+		rr, err := prepareSelector(t, r.Right, vs)
+		if err != nil {
+			return selector{}, err
+		}
+		typ, err := arithmeticType(l.typ, rr.typ, r.Op)
+		if err != nil {
+			return selector{}, err
+		}
+		return selector{kind: selOp, op: r.Op, name: l.name + " " + string(r.Op) + " " + rr.name, typ: typ, inner: &l, right: &rr}, nil
 	case *cql.FuncSel:
 		name := strings.TrimPrefix(strings.ToLower(r.Name), "system.")
 		argColumn := func() (*Column, error) {
@@ -305,6 +344,15 @@ func prepareSelector(t *Table, raw cql.Selectable, vs *vars) (selector, error) {
 				return selector{}, invalidf("%s cannot be cast to %s", inner.typ, to)
 			}
 			return selector{kind: selCast, name: "cast(" + inner.name + " as " + to.String() + ")", typ: to, inner: &inner}, nil
+		case "tojson":
+			if len(r.Args) != 1 {
+				return selector{}, invalidf("toJson() takes exactly 1 argument")
+			}
+			inner, err := prepareSelector(t, r.Args[0], vs)
+			if err != nil {
+				return selector{}, err
+			}
+			return selector{kind: selToJSON, name: "system.tojson(" + inner.name + ")", typ: types.TextType, inner: &inner}, nil
 		case "totimestamp", "todate", "tounixtimestamp":
 			return selector{}, invalidf("function %s is not supported in selections", name)
 		}
@@ -331,6 +379,9 @@ func castable(from, to *types.Type) bool {
 func (s *selectStmt) metadata() []*message.ColumnMetadata {
 	if s.md != nil {
 		return s.md
+	}
+	if s.json {
+		return []*message.ColumnMetadata{{Keyspace: s.t.Keyspace, Table: s.t.Name, Name: "[json]", Type: types.TextType.DataType()}}
 	}
 	out := make([]*message.ColumnMetadata, len(s.sels))
 	for i, sel := range s.sels {
@@ -520,6 +571,7 @@ type query struct {
 	full      bool // the page is full
 	exhausted bool
 	part      partState
+	groupKey  []byte
 }
 
 func (q *query) run() (message.Message, error) {
@@ -545,10 +597,10 @@ func (q *query) run() (message.Message, error) {
 		return nil, invalidf("PER PARTITION LIMIT must be strictly positive")
 	}
 	q.pageSize = e.page
-	if s.aggregate || s.sortIN {
+	if s.aggregate || s.sortIN || len(s.groupBy) > 0 {
 		q.pageSize = 0
 	}
-	if s.aggregate {
+	if s.aggregate || len(s.groupBy) > 0 {
 		q.agg = newAggState(s.sels)
 	}
 	if len(e.paging) > 0 && q.pageSize > 0 {
@@ -1050,6 +1102,24 @@ func (f *filter) matches(e *execCtx, r *rowData) (bool, error) {
 
 // output adds a result row (or folds it into the aggregates).
 func (q *query) output(r *rowData, key []byte, staticOnly bool) error {
+	if len(q.s.groupBy) > 0 {
+		var gk []byte
+		for _, c := range q.s.groupBy {
+			v := r.value(c)
+			gk = binary.AppendUvarint(gk, uint64(len(v)))
+			gk = append(gk, v...)
+		}
+		if q.groupKey != nil && !bytes.Equal(gk, q.groupKey) {
+			if err := q.flushGroup(); err != nil {
+				return err
+			}
+			if q.count >= q.limit {
+				return nil
+			}
+		}
+		q.groupKey = gk
+		return q.agg.add(q, r)
+	}
 	q.count++
 	q.lastKey, q.lastStat = key, staticOnly
 	if q.agg != nil {
@@ -1089,6 +1159,22 @@ func (q *query) evaluate(s *selector, r *rowData) ([]byte, error) {
 	case selTerm:
 		v, _, err := s.t.bind(q.e)
 		return v, err
+	case selToJSON:
+		v, err := q.evaluate(s.inner, r)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(types.ToJSON(s.inner.typ, v)), nil
+	case selOp:
+		a, err := q.evaluate(s.inner, r)
+		if err != nil {
+			return nil, err
+		}
+		b, err := q.evaluate(s.right, r)
+		if err != nil {
+			return nil, err
+		}
+		return arithmetic(s.op, s.inner.typ, s.right.typ, s.typ, a, b)
 	case selCast:
 		v, err := q.evaluate(s.inner, r)
 		if err != nil || v == nil {
@@ -1127,14 +1213,35 @@ func (q *query) sortRows() {
 	}
 }
 
+// flushGroup outputs the current GROUP BY group.
+func (q *query) flushGroup() error {
+	row, err := q.agg.result(q)
+	if err != nil {
+		return err
+	}
+	q.rows = append(q.rows, row)
+	q.count++
+	q.agg = newAggState(q.s.sels)
+	return nil
+}
+
 func (q *query) result() (message.Message, error) {
-	md := &message.RowsMetadata{ColumnCount: int32(len(q.s.sels)), Columns: q.s.metadata()}
+	md := &message.RowsMetadata{Columns: q.s.metadata()}
+	md.ColumnCount = int32(len(md.Columns))
+	if len(q.s.groupBy) > 0 {
+		if q.agg.seen && q.count < q.limit {
+			if err := q.flushGroup(); err != nil {
+				return nil, err
+			}
+		}
+		q.agg = nil
+	}
 	if q.agg != nil {
 		row, err := q.agg.result(q)
 		if err != nil {
 			return nil, err
 		}
-		return &message.RowsResult{Metadata: md, Data: message.RowSet{row}}, nil
+		return &message.RowsResult{Metadata: md, Data: q.jsonRows(message.RowSet{row})}, nil
 	}
 	if q.full && q.count < q.limit {
 		ps := &pagingState{lastKey: q.lastKey, remaining: q.limit - q.count, partRemain: q.partLeft, staticOnlyPK: q.lastStat}
@@ -1144,7 +1251,31 @@ func (q *query) result() (message.Message, error) {
 	if rows == nil {
 		rows = message.RowSet{}
 	}
-	return &message.RowsResult{Metadata: md, Data: rows}, nil
+	return &message.RowsResult{Metadata: md, Data: q.jsonRows(rows)}, nil
+}
+
+// jsonRows turns rows into one JSON object each, for SELECT JSON.
+func (q *query) jsonRows(rows message.RowSet) message.RowSet {
+	if !q.s.json {
+		return rows
+	}
+	out := make(message.RowSet, len(rows))
+	for i, r := range rows {
+		var b strings.Builder
+		b.WriteByte('{')
+		for j, v := range r {
+			if j > 0 {
+				b.WriteString(", ")
+			}
+			key, _ := json.Marshal(types.JSONName(q.s.sels[j].name))
+			b.Write(key)
+			b.WriteString(": ")
+			b.WriteString(types.ToJSON(q.s.sels[j].typ, v))
+		}
+		b.WriteByte('}')
+		out[i] = message.Row{[]byte(b.String())}
+	}
+	return out
 }
 
 // castValue converts between numeric types, or to text (CastFcts).
@@ -1269,4 +1400,95 @@ func (s *slice) contains(e *execCtx, r *rowData) (bool, error) {
 		}
 	}
 	return true, nil
+}
+
+// numericRank orders the numeric types for arithmetic result types
+// (OperationFcts: the wider operand type wins).
+var numericRank = map[types.Kind]int{types.Tinyint: 1, types.Smallint: 2, types.Int: 3, types.Bigint: 4,
+	types.Counter: 4, types.Varint: 5, types.Float: 6, types.Double: 7, types.Decimal: 8}
+
+func arithmeticType(a, b *types.Type, op byte) (*types.Type, error) {
+	ra, rb := numericRank[a.Kind], numericRank[b.Kind]
+	if ra == 0 || rb == 0 {
+		return nil, invalidf("the '%c' operation is not supported between %s and %s", op, a, b)
+	}
+	t := a
+	if rb > ra {
+		t = b
+	}
+	if t.Kind == types.Counter {
+		t = types.BigintType
+	}
+	// varint mixed with floating point gives decimal.
+	if (a.Kind == types.Varint && (b.Kind == types.Float || b.Kind == types.Double)) ||
+		(b.Kind == types.Varint && (a.Kind == types.Float || a.Kind == types.Double)) {
+		t = types.DecimalType
+	}
+	return t, nil
+}
+
+// arithmetic applies op to two numeric values in the result type typ.
+func arithmetic(op byte, at, bt, typ *types.Type, a, b []byte) ([]byte, error) {
+	if len(a) == 0 || len(b) == 0 {
+		return nil, nil
+	}
+	if typ.Kind == types.Float || typ.Kind == types.Double {
+		x, y := floatOf(at, a), floatOf(bt, b)
+		var r float64
+		switch op {
+		case '+':
+			r = x + y
+		case '-':
+			r = x - y
+		case '*':
+			r = x * y
+		case '/':
+			r = x / y
+		case '%':
+			r = math.Mod(x, y)
+		}
+		if typ.Kind == types.Float {
+			return binary.BigEndian.AppendUint32(nil, math.Float32bits(float32(r))), nil
+		}
+		return binary.BigEndian.AppendUint64(nil, math.Float64bits(r)), nil
+	}
+	x, y := numericValue(at, a), numericValue(bt, b)
+	if x == nil || y == nil {
+		return nil, invalidf("invalid operand")
+	}
+	r := new(big.Rat)
+	integer := typ.Kind != types.Decimal
+	switch op {
+	case '+':
+		r.Add(x, y)
+	case '-':
+		r.Sub(x, y)
+	case '*':
+		r.Mul(x, y)
+	case '/', '%':
+		if y.Sign() == 0 {
+			return nil, invalidf("Cannot divide by zero")
+		}
+		q := new(big.Rat).Quo(x, y)
+		if integer || op == '%' {
+			q.SetInt(new(big.Int).Quo(q.Num(), q.Denom()))
+		}
+		if op == '/' {
+			r = q
+		} else {
+			r.Sub(x, q.Mul(q, y))
+		}
+	}
+	return fromRat(typ, r), nil
+}
+
+func floatOf(t *types.Type, v []byte) float64 {
+	switch t.Kind {
+	case types.Float:
+		return float64(math.Float32frombits(binary.BigEndian.Uint32(v)))
+	case types.Double:
+		return math.Float64frombits(binary.BigEndian.Uint64(v))
+	}
+	f, _ := numericValue(t, v).Float64()
+	return f
 }

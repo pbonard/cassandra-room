@@ -395,7 +395,7 @@ func (p *parser) marker(name string) *Marker {
 }
 
 func (p *parser) selector() (Selector, error) {
-	e, err := p.selectable()
+	e, err := p.additive()
 	if err != nil {
 		return Selector{}, err
 	}
@@ -406,6 +406,63 @@ func (p *parser) selector() (Selector, error) {
 		}
 	}
 	return s, nil
+}
+
+// additive parses selector arithmetic (selectionAddition in Parser.g).
+func (p *parser) additive() (Selectable, error) {
+	l, err := p.multiplicative()
+	if err != nil {
+		return nil, err
+	}
+	for p.isPunct("+") || p.isPunct("-") {
+		op := p.next().text[0]
+		r, err := p.multiplicative()
+		if err != nil {
+			return nil, err
+		}
+		l = &OpSel{Op: op, Left: l, Right: r}
+	}
+	return l, nil
+}
+
+func (p *parser) multiplicative() (Selectable, error) {
+	l, err := p.unary()
+	if err != nil {
+		return nil, err
+	}
+	for p.isPunct("*") || p.isPunct("/") || p.isPunct("%") {
+		op := p.next().text[0]
+		r, err := p.unary()
+		if err != nil {
+			return nil, err
+		}
+		l = &OpSel{Op: op, Left: l, Right: r}
+	}
+	return l, nil
+}
+
+func (p *parser) unary() (Selectable, error) {
+	if p.punct("-") {
+		e, err := p.unary()
+		if err != nil {
+			return nil, err
+		}
+		return &OpSel{Op: 'n', Left: e}, nil
+	}
+	if p.isPunct("(") && !p.isTypeHint() {
+		p.next()
+		e, err := p.additive()
+		if err != nil {
+			return nil, err
+		}
+		return e, p.expectPunct(")")
+	}
+	return p.selectable()
+}
+
+func (p *parser) isTypeHint() bool {
+	t := p.peekAt(1)
+	return t.kind == tIdent && p.isPunctAt(2, ")")
 }
 
 func (p *parser) selectable() (Selectable, error) {
@@ -439,7 +496,7 @@ func (p *parser) selectable() (Selectable, error) {
 		}
 		if !p.punct(")") {
 			for {
-				a, err := p.selectable()
+				a, err := p.additive()
 				if err != nil {
 					return nil, err
 				}

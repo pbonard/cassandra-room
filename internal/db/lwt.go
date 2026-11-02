@@ -57,78 +57,120 @@ var casLocks [256]sync.Mutex
 var casSeed = maphash.MakeSeed()
 
 func (m *modification) executeConditional(e *execCtx) (message.Message, error) {
+	return e.d.executeCAS([]boundModification{{m: m, e: e}}, e)
+}
+
+// casPartition returns the single partition a conditional statement
+// updates.
+func (m *modification) casPartition(e *execCtx) ([]byte, error) {
 	t := m.t
+	what := map[modKind]string{insertKind: "updates", updateKind: "updates", deleteKind: "deletions"}[m.kind]
 	pks, err := m.where.partitionKeys(e, t)
 	if err != nil {
 		return nil, err
 	}
 	if len(pks) != 1 {
-		return nil, invalidf("IN on the partition key is not supported with conditional %s", map[modKind]string{insertKind: "updates", updateKind: "updates", deleteKind: "deletions"}[m.kind])
+		return nil, invalidf("IN on the partition key is not supported with conditional %s", what)
 	}
-	if len(m.where.ck) > 0 {
+	if len(m.where.ck) > 0 && m.cond != nil {
 		ranges, err := m.where.clusteringRanges(e, t)
 		if err != nil {
 			return nil, err
 		}
 		if len(ranges) != 1 || !ranges[0].point {
-			return nil, invalidf("IN on the clustering key columns is not supported with conditional %s", map[modKind]string{insertKind: "updates", updateKind: "updates", deleteKind: "deletions"}[m.kind])
+			return nil, invalidf("IN on the clustering key columns is not supported with conditional %s", what)
 		}
 	}
-	lock := &casLocks[maphash.Bytes(casSeed, pks[0])%uint64(len(casLocks))]
+	return pks[0], nil
+}
+
+// executeCAS runs conditional statements on one partition (one statement,
+// or a conditional batch): under the partition's lock, every condition is
+// checked against the current rows, and the statements are applied only
+// if all hold (ModificationStatement.executeWithCondition, BatchStatement
+// with conditions).
+func (d *DB) executeCAS(mods []boundModification, batchCtx *execCtx) (message.Message, error) {
+	var pk []byte
+	for i, bm := range mods {
+		p, err := bm.m.casPartition(bm.e)
+		if err != nil {
+			return nil, err
+		}
+		if i > 0 && (bm.m.t != mods[0].m.t) {
+			return nil, invalidf("Batch with conditions cannot span multiple tables")
+		}
+		if i > 0 && string(p) != string(pk) {
+			return nil, invalidf("Batch with conditions cannot span multiple partitions")
+		}
+		pk = p
+	}
+	lock := &casLocks[maphash.Bytes(casSeed, pk)%uint64(len(casLocks))]
 	lock.Lock()
 	defer lock.Unlock()
 
-	res, err := m.cond.read.execute(&execCtx{d: e.d, values: e.values, now: e.now, nowSec: e.nowSec})
-	if err != nil {
-		return nil, err
-	}
-	rows := res.(*message.RowsResult).Data
-	var current map[*Column][]byte // the current row, nil if none
-	if len(rows) > 0 {
-		current = map[*Column][]byte{}
-		for i, col := range t.AllColumns() {
-			current[col] = rows[0][i]
+	t := mods[0].m.t
+	md := &message.RowsMetadata{Columns: (&condition{}).metadata()}
+	out := [][]byte{{1}}
+	for _, bm := range mods {
+		m, e := bm.m, bm.e
+		if m.cond == nil {
+			continue
 		}
-	}
-	applied := true
-	switch {
-	case m.cond.ifNotExists:
-		applied = current == nil
-	case m.cond.ifExists:
-		applied = current != nil
-	default:
-		for _, f := range m.cond.conds {
-			ok, err := f.matchesCAS(e, current)
-			if err != nil {
-				return nil, err
-			}
-			if !ok {
-				applied = false
-				break
+		res, err := m.cond.read.execute(&execCtx{d: d, values: e.values, now: e.now, nowSec: e.nowSec})
+		if err != nil {
+			return nil, err
+		}
+		rows := res.(*message.RowsResult).Data
+		var current map[*Column][]byte // the current row, nil if none
+		if len(rows) > 0 {
+			current = map[*Column][]byte{}
+			for i, col := range t.AllColumns() {
+				current[col] = rows[0][i]
 			}
 		}
-	}
-	md := &message.RowsMetadata{Columns: m.cond.metadata()}
-	out := [][]byte{{boolByte(applied)}}
-	if !applied && current != nil {
-		cols := t.AllColumns()
-		if !m.cond.ifNotExists && !m.cond.ifExists {
-			cols = nil
+		applied := true
+		switch {
+		case m.cond.ifNotExists:
+			applied = current == nil
+		case m.cond.ifExists:
+			applied = current != nil
+		default:
 			for _, f := range m.cond.conds {
-				cols = append(cols, f.col)
+				ok, err := f.matchesCAS(e, current)
+				if err != nil {
+					return nil, err
+				}
+				if !ok {
+					applied = false
+					break
+				}
 			}
 		}
-		for _, col := range cols {
-			md.Columns = append(md.Columns, &message.ColumnMetadata{Keyspace: t.Keyspace, Table: t.Name, Name: col.Name, Type: col.Type.DataType()})
-			out = append(out, current[col])
+		if applied {
+			continue
 		}
+		out[0][0] = 0
+		if current != nil {
+			cols := t.AllColumns()
+			if !m.cond.ifNotExists && !m.cond.ifExists {
+				cols = nil
+				for _, f := range m.cond.conds {
+					cols = append(cols, f.col)
+				}
+			}
+			for _, col := range cols {
+				md.Columns = append(md.Columns, &message.ColumnMetadata{Name: col.Name, Type: col.Type.DataType()})
+				out = append(out, current[col])
+			}
+		}
+		break
 	}
 	for i, c := range md.Columns {
 		c.Keyspace, c.Table, c.Index = t.Keyspace, t.Name, int32(i)
 	}
 	md.ColumnCount = int32(len(md.Columns))
-	if applied {
-		if err := e.d.applyModifications([]boundModification{{m: m, e: e}}, e); err != nil {
+	if out[0][0] == 1 {
+		if err := d.applyModifications(mods, batchCtx); err != nil {
 			return nil, err
 		}
 	}

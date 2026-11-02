@@ -389,6 +389,26 @@ func (vs *vars) prepareFunction(f *cql.FunctionCall, name string, typ *types.Typ
 			return boundTimeUUID(ms, fname == "maxtimeuuid"), nil
 		}}, nil
 	}
+	if fname == "fromjson" {
+		if len(f.Args) != 1 {
+			return nil, invalidf("fromJson() takes exactly 1 argument")
+		}
+		a, err := vs.prepareTerm(f.Args[0], name, types.TextType)
+		if err != nil {
+			return nil, err
+		}
+		return &funcTerm{args: []term{a}, fn: func(_ *execCtx, args [][]byte) ([]byte, error) {
+			parsed, err := types.ParseJSON(string(args[0]))
+			if err != nil {
+				return nil, invalidf("Could not decode JSON string '%s': %v", args[0], err)
+			}
+			v, err := types.FromJSON(typ, parsed)
+			if err != nil {
+				return nil, invalidf("%v", err)
+			}
+			return v, nil
+		}}, nil
+	}
 	if src, ok := strings.CutSuffix(fname, "asblob"); ok {
 		st, err := types.Parse(src)
 		if err != nil {

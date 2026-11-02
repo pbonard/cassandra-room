@@ -138,6 +138,15 @@ type FuncSel struct {
 // TermSel selects a constant or bind marker.
 type TermSel struct{ Term Term }
 
+// OpSel is arithmetic on selectors: Op is one of + - * / %, or 'n' for a
+// negation (of Left).
+type OpSel struct {
+	Op          byte
+	Left, Right Selectable
+}
+
+func (*OpSel) selectable() {}
+
 func (*ColumnSel) selectable() {}
 func (*FuncSel) selectable()   {}
 func (*TermSel) selectable()   {}

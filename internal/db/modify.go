@@ -125,7 +125,13 @@ func (d *DB) prepareModification(s *Schema, session string, raw cql.Statement, v
 	case *cql.Insert:
 		m.kind = insertKind
 		if st.JSON != nil {
-			return nil, invalidf("INSERT JSON is not supported")
+			if err := m.prepareJSON(st, vs); err != nil {
+				return nil, err
+			}
+			if st.IfNotExists {
+				m.cond = &condition{ifNotExists: true}
+			}
+			break
 		}
 		if len(st.Columns) != len(st.Values) {
 			return nil, invalidf("Unmatched column names/values")
@@ -216,8 +222,10 @@ func (d *DB) prepareModification(s *Schema, session string, raw cql.Statement, v
 			}
 		}
 	}
-	if m.where, err = analyzeWhere(t, rels, vs); err != nil {
-		return nil, err
+	if m.where == nil {
+		if m.where, err = analyzeWhere(t, rels, vs); err != nil {
+			return nil, err
+		}
 	}
 	w := m.where
 	if w.token != nil {
@@ -913,7 +921,8 @@ func deletionCell(ts, nowSec int64) row.Cell {
 
 // batchStmt is a prepared BATCH (BatchStatement).
 type batchStmt struct {
-	mods []*modification
+	mods        []*modification
+	conditional bool
 }
 
 func (d *DB) prepareBatch(s *Schema, session string, st *cql.Batch, vs *vars) (*batchStmt, error) {
@@ -924,7 +933,7 @@ func (d *DB) prepareBatch(s *Schema, session string, st *cql.Batch, vs *vars) (*
 			return nil, err
 		}
 		if m.cond != nil {
-			return nil, invalidf("Conditional batches are not supported")
+			b.conditional = true
 		}
 		switch {
 		case m.t.IsCounter() && st.Type == "LOGGED":
@@ -954,8 +963,103 @@ func (b *batchStmt) execute(e *execCtx) (message.Message, error) {
 		child := *e
 		mods[i] = boundModification{m: m, e: &child}
 	}
+	if b.conditional {
+		return e.d.executeCAS(mods, e)
+	}
 	if err := e.d.applyModifications(mods, e); err != nil {
 		return nil, err
 	}
 	return &message.VoidResult{}, nil
+}
+
+// prepareJSON prepares INSERT JSON (Json.Raw): every column is bound from
+// the JSON object at execution; columns it omits are null (DEFAULT NULL)
+// or left unchanged (DEFAULT UNSET).
+func (m *modification) prepareJSON(st *cql.Insert, vs *vars) error {
+	t := m.t
+	src := &jsonSource{table: t, unset: st.DefaultUnset}
+	var err error
+	if src.t, err = vs.prepareTerm(st.JSON, "[json]", types.TextType); err != nil {
+		return err
+	}
+	m.where = &where{pk: make([]*valuesTerm, len(t.PartitionKey))}
+	for i, c := range t.PartitionKey {
+		m.where.pk[i] = &valuesTerm{col: c, eq: &jsonField{src: src, col: c}}
+	}
+	for _, c := range t.Clustering {
+		m.where.ck = append(m.where.ck, &valuesTerm{col: c, eq: &jsonField{src: src, col: c}})
+	}
+	for _, c := range t.Columns {
+		m.ops = append(m.ops, setOp{col: c, kind: opSet, t: &jsonField{src: src, col: c}})
+	}
+	return nil
+}
+
+// jsonSource is the JSON object of an INSERT JSON, decoded once per
+// execution.
+type jsonSource struct {
+	table *Table
+	t     term
+	unset bool
+}
+
+func (j *jsonSource) object(e *execCtx) (map[string]any, error) {
+	if obj, ok := e.json[j]; ok {
+		return obj, nil
+	}
+	v, st, err := j.t.bind(e)
+	if err != nil {
+		return nil, err
+	}
+	if st != vSet {
+		return nil, invalidf("Got null for INSERT JSON values")
+	}
+	parsed, err := types.ParseJSON(string(v))
+	if err != nil {
+		return nil, invalidf("%v", err)
+	}
+	raw, ok := parsed.(map[string]any)
+	if !ok {
+		return nil, invalidf("Could not decode JSON string as a map: %s", v)
+	}
+	obj := map[string]any{}
+	for k, x := range raw {
+		name := types.UnquoteJSONName(k)
+		if j.table.byName[name] == nil {
+			return nil, invalidf("JSON values map contains unrecognized column: %s", k)
+		}
+		obj[name] = x
+	}
+	if e.json == nil {
+		e.json = map[*jsonSource]map[string]any{}
+	}
+	e.json[j] = obj
+	return obj, nil
+}
+
+type jsonField struct {
+	src *jsonSource
+	col *Column
+}
+
+func (f *jsonField) bind(e *execCtx) ([]byte, valState, error) {
+	obj, err := f.src.object(e)
+	if err != nil {
+		return nil, vSet, err
+	}
+	x, ok := obj[f.col.Name]
+	if !ok {
+		if f.src.unset {
+			return nil, vUnset, nil
+		}
+		return nil, vNull, nil
+	}
+	v, err := types.FromJSON(f.col.Type, x)
+	if err != nil {
+		return nil, vSet, invalidf("Error decoding JSON value for %s: %v", f.col.Name, err)
+	}
+	if v == nil {
+		return nil, vNull, nil
+	}
+	return v, vSet, nil
 }
