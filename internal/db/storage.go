@@ -16,6 +16,7 @@ import (
 // belongs to, which places it on the ring: for index entries, the token
 // of the indexed row.
 type mutation struct {
+	trace  *Trace
 	writes []write
 }
 
@@ -41,6 +42,7 @@ type storage interface {
 type localStorage struct{ d *DB }
 
 func (l localStorage) apply(m *mutation, _ primitive.ConsistencyLevel) error {
+	m.trace.event("Applying %d writes locally (commit log, memtable)", len(m.writes))
 	return l.d.applyLocal(m.writes)
 }
 

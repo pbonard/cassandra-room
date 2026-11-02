@@ -338,7 +338,7 @@ type boundModification struct {
 func (d *DB) applyModifications(mods []boundModification, batchCtx *execCtx) error {
 	if d.proxy != nil && mods[0].m.isCounter() {
 		// Counter deltas, applied by each partition's leader.
-		b := &mutation{}
+		b := &mutation{trace: batchCtx.trace}
 		if len(mods) > 1 {
 			batchCtx.timestamp()
 		}
@@ -380,7 +380,7 @@ func (d *DB) applyModifications(mods []boundModification, batchCtx *execCtx) err
 // update counters).
 func (d *DB) applyLocked(mods []boundModification) error {
 	batchCtx := mods[0].e
-	b := &mutation{}
+	b := &mutation{trace: batchCtx.trace}
 	if len(mods) > 1 {
 		batchCtx.timestamp() // one timestamp for the whole batch
 		for i := range mods {

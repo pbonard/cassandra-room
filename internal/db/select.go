@@ -608,6 +608,11 @@ func (s *selectStmt) execute(e *execCtx) (message.Message, error) {
 		if src, err = e.readStore().source(s.t, s.t.Storage, e.cl); err != nil {
 			return nil, err
 		}
+		if ds, ok := src.(*distSource); ok {
+			ds.trace = e.trace
+		} else {
+			e.trace.event("Reading %s.%s locally", s.t.Keyspace, s.t.Name)
+		}
 	}
 	q := &query{s: s, e: e, src: src}
 	return q.run()

@@ -8,6 +8,7 @@ import (
 	"net"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -778,4 +779,28 @@ func TestClusterThreadPools(t *testing.T) {
 		total += len(c.values(n, one, "SELECT range_start FROM system.size_estimates WHERE keyspace_name = 'ks'"))
 	}
 	require.Equal(t, len(c.nodes[0].proxy.tokenSegments()), total)
+}
+
+// TestClusterTracing traces a write and a read on a coordinator: the
+// events name the replicas asked and their answers.
+func TestClusterTracing(t *testing.T) {
+	c := newTestCluster(t, 3)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}")
+	c.ok(0, quorum, "CREATE TABLE ks.kv (k int PRIMARY KEY, v text)")
+	time.Sleep(100 * time.Millisecond)
+	d := c.nodes[1]
+	tr := NewTrace("INSERT", "127.0.0.9", nil)
+	res := d.Execute(mustPrepare(t, d, "INSERT INTO ks.kv (k, v) VALUES (1, 'a')"), &RequestOptions{Consistency: quorum, Trace: tr})
+	_, isErr := res.(message.Error)
+	require.False(t, isErr, "%v", res)
+	d.FinishTrace(tr)
+	tr2 := NewTrace("SELECT", "127.0.0.9", nil)
+	d.Execute(mustPrepare(t, d, "SELECT v FROM ks.kv WHERE k = 1"), &RequestOptions{Consistency: quorum, Trace: tr2})
+	d.FinishTrace(tr2)
+	events := c.values(1, one, "SELECT activity FROM system_traces.events")
+	joined := strings.Join(events, "\n")
+	require.Contains(t, joined, "Writing 1 partitions at QUORUM to 3 replicas")
+	require.Contains(t, joined, "MUTATION acknowledged by")
+	require.Contains(t, joined, "Reading a row at QUORUM")
+	require.Len(t, c.values(1, one, "SELECT session_id FROM system_traces.sessions"), 2)
 }

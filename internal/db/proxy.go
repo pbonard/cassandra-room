@@ -726,7 +726,9 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 		err  error
 	}
 	acks := make(chan ack, len(perNode))
+	m.trace.event("Writing %d partitions at %s to %d replicas", len(groups), clName(cl), len(perNode))
 	for addr, ws := range perNode {
+		m.trace.event("Sending MUTATION (%d writes) to %s", len(ws), addr)
 		go func() {
 			var err error
 			if addr == p.self {
@@ -753,6 +755,11 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 		select {
 		case a := <-acks:
 			delete(pending, a.addr)
+			if a.err != nil {
+				m.trace.event("MUTATION to %s failed (%v): storing a hint", a.addr, a.err)
+			} else {
+				m.trace.event("MUTATION acknowledged by %s", a.addr)
+			}
 			if a.err != nil {
 				for _, w := range perNode[a.addr] {
 					hints = append(hints, hint{hostID: nodes[a.addr].HostID, w: w})
@@ -968,7 +975,8 @@ func (p *proxy) source(t *Table, id lsm.TableID, cl primitive.ConsistencyLevel) 
 }
 
 type distSource struct {
-	p  *proxy
+	trace *Trace
+	p     *proxy
 	k  *Keyspace
 	id lsm.TableID
 	cl primitive.ConsistencyLevel
@@ -1218,6 +1226,7 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 		}
 	}
 	initial := need.count()
+	s.trace.event("Reading a row at %s: data from %s, digests from %d replicas", clName(s.cl), reps[0].Addr, initial-1)
 	go ask(reps[0], true)
 	for _, r := range reps[1:initial] {
 		go ask(r, false)
@@ -1246,6 +1255,7 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 					next++
 				}
 				if next < len(reps) {
+					s.trace.event("Read from %s failed (%v): asking %s", r.node.Addr, r.err, reps[next].Addr)
 					go ask(reps[next], r.data || !haveData)
 					next++
 					outstanding++
@@ -1261,6 +1271,7 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 			haveData = haveData || r.data
 		case <-speculate.C:
 			if need.perDC == nil && next < len(reps) {
+				s.trace.event("Speculating read retry on %s", reps[next].Addr)
 				go ask(reps[next], !haveData)
 				next++
 				outstanding++
@@ -1288,6 +1299,7 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 		return data.v, nil
 	}
 	// Digest mismatch: full rows from everyone who answered.
+	s.trace.event("Digest mismatch: reading full rows from %d replicas", len(got))
 	full := make(chan resp, len(got))
 	for _, r := range got {
 		if r.data {
@@ -1335,6 +1347,7 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 		}
 	}
 	if len(stale) > 0 {
+		s.trace.event("Read repair of %v", stale)
 		s.p.repair(stale, []write{{table: s.id, key: key, value: merged, token: tokenOf(key)}})
 	}
 	return merged, nil
@@ -1518,6 +1531,7 @@ func (it *distIter) fetch(reps []*cluster.Node, need ackNeed, from, to []byte) (
 	}
 	initial := need.count()
 	for _, r := range reps[:initial] {
+		it.s.trace.event("Reading a range from %s", r.Addr)
 		go ask(r)
 	}
 	asked := map[string]bool{}

@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/cassandra-room/cassandra-room/internal/db"
 	"io"
 	"net"
 	"sync"
@@ -547,6 +548,27 @@ func (s *Server) handleFrameWithContext(ctx context.Context, session *Session, r
 		defer s.admission.releaseRequest()
 	}
 
+	var trace *db.Trace
+	if req.Header.Flags.Contains(primitive.HeaderFlagTracing) {
+		switch m := req.Body.Message.(type) {
+		case *message.Query:
+			trace = db.NewTrace(m.Query, "", map[string]string{"query": m.Query})
+		case *message.Execute:
+			trace = db.NewTrace("Execute CQL3 prepared query", "", nil)
+		case *message.Batch:
+			trace = db.NewTrace("Execute batch of CQL3 queries", "", nil)
+		}
+		if trace != nil {
+			ctx = context.WithValue(ctx, traceKey{}, trace)
+		}
+	}
 	respMsg := s.handleMessage(ctx, session, req.Header.Version, req.Body.Message)
-	return frame.NewFrame(req.Header.Version, req.Header.StreamId, respMsg)
+	resp = frame.NewFrame(req.Header.Version, req.Header.StreamId, respMsg)
+	if trace != nil {
+		s.db.FinishTrace(trace)
+		id := primitive.UUID(trace.ID)
+		resp.Header.Flags = resp.Header.Flags.Add(primitive.HeaderFlagTracing)
+		resp.Body.TracingId = &id
+	}
+	return resp
 }

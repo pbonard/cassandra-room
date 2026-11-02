@@ -197,6 +197,7 @@ func (s *Server) handleMessage(
 		if m.SerialConsistency != nil {
 			o.SerialConsistency = *m.SerialConsistency
 		}
+		o.Trace, _ = ctx.Value(traceKey{}).(*db.Trace)
 		return s.db.ExecuteBatch(m.Type, children, o)
 
 	default:
@@ -216,9 +217,13 @@ func (s *Server) execute(ctx context.Context, session *Session, p *db.Prepared, 
 	if session != nil {
 		o.User = session.User()
 	}
+	o.Trace, _ = ctx.Value(traceKey{}).(*db.Trace)
 	res := s.db.Execute(p, o)
 	if sk, ok := res.(*message.SetKeyspaceResult); ok && session != nil {
 		session.setKeyspace(sk.Keyspace)
 	}
 	return res
 }
+
+// traceKey carries a traced request's trace in its context.
+type traceKey struct{}

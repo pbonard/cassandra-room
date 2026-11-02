@@ -121,6 +121,17 @@ sample of partition sizes, as Spark's connector reads them),
 stages: active, limit, dropped), `cluster_metadata_log` and
 `cluster_metadata_directory`.
 
+## Tracing
+
+A request sent with the tracing flag (cqlsh's `TRACING ON`, drivers'
+query tracing) gets a session id in its response, and its coordinator
+records events: the statement and consistency, the replicas written and
+read (data and digest requests), acknowledgements, failures and hints,
+speculative retries, digest mismatches, read repairs and local reads and
+writes. Each node keeps its traces for 24 hours (at most 1000) as
+`system_traces.sessions` and `system_traces.events`. Replicas do not add
+events of their own.
+
 ## Configuration
 
 `cmd/cassandra-room`: `-addr`, `-data-dir`, `-commitlog-sync` (`periodic`,

@@ -166,6 +166,8 @@ type execCtx struct {
 	local bool
 	// tokenRange restricts a scattered index query to (lo, hi].
 	tokenRange *[2]int64
+	// trace records the request's events, if traced.
+	trace *Trace
 }
 
 // readStore is where the statement reads: the cluster, or this node.
@@ -198,6 +200,8 @@ type RequestOptions struct {
 	Version          primitive.ProtocolVersion
 	// User is the session's logged-in role, checked by the authorizer.
 	User string
+	// Trace, if set, records the request's events (TRACING ON).
+	Trace *Trace
 	// Consistency is the request's consistency level; SerialConsistency
 	// the Paxos one of conditional updates (SERIAL if unset).
 	Consistency       primitive.ConsistencyLevel
@@ -226,7 +230,7 @@ func OptionsOf(o *message.QueryOptions, v primitive.ProtocolVersion) *RequestOpt
 }
 
 func (d *DB) newCtx(o *RequestOptions, st *prepState) (*execCtx, error) {
-	e := &execCtx{d: d, now: d.opts.Now(), page: int(o.PageSize), paging: o.PagingState, noMeta: o.SkipMeta, version: o.Version, user: o.User, cl: o.Consistency, serial: o.SerialConsistency, local: o.local, tokenRange: o.tokenRange}
+	e := &execCtx{d: d, now: d.opts.Now(), page: int(o.PageSize), paging: o.PagingState, noMeta: o.SkipMeta, version: o.Version, user: o.User, cl: o.Consistency, serial: o.SerialConsistency, local: o.local, tokenRange: o.tokenRange, trace: o.Trace}
 	e.nowSec = e.now.Unix()
 	if o.NowInSec != nil {
 		e.nowSec = int64(*o.NowInSec)
@@ -275,6 +279,9 @@ func (d *DB) Execute(p *Prepared, o *RequestOptions) message.Message {
 		return ErrorMessage(err)
 	}
 	e, err := d.newCtx(o, st)
+	if e != nil && e.trace != nil {
+		e.trace.event("Executing %s at %s", statementKind(st.stmt), clName(o.Consistency))
+	}
 	if err != nil {
 		return ErrorMessage(err)
 	}
@@ -326,7 +333,7 @@ func (d *DB) ExecuteBatch(typ primitive.BatchType, children []BatchChild, o *Req
 	}
 	var mods []boundModification
 	conditional := false
-	ctx := &execCtx{d: d, now: d.opts.Now(), cl: o.Consistency, serial: o.SerialConsistency, user: o.User}
+	ctx := &execCtx{d: d, now: d.opts.Now(), cl: o.Consistency, serial: o.SerialConsistency, user: o.User, trace: o.Trace}
 	ctx.nowSec = ctx.now.Unix()
 	if o.NowInSec != nil {
 		ctx.nowSec = int64(*o.NowInSec)
@@ -403,4 +410,17 @@ func (d *DB) grantCreator(user string, sc *message.SchemaChangeResult) {
 		r.Permissions = withPerms(r.Permissions, res, applicable(res))
 		return nil, true, nil
 	})
+}
+
+// statementKind names a statement for traces.
+func statementKind(s statement) string {
+	switch st := s.(type) {
+	case *selectStmt:
+		return "SELECT on " + st.t.Keyspace + "." + st.t.Name
+	case *modification:
+		return "modification of " + st.t.Keyspace + "." + st.t.Name
+	case *batchStmt:
+		return "batch"
+	}
+	return fmt.Sprintf("%T", s)
 }

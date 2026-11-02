@@ -46,6 +46,13 @@ var systemTables = map[string]map[string]string{
 			preferred_port int, rack text, release_version text, native_address inet, native_port int,
 			schema_version uuid, tokens set<varchar>, PRIMARY KEY ((peer), peer_port))`,
 	},
+	"system_traces": {
+		"sessions": `CREATE TABLE sessions (session_id uuid, client inet, command text, coordinator inet,
+			coordinator_port int, duration int, parameters map<text, text>, request text, started_at timestamp,
+			PRIMARY KEY ((session_id)))`,
+		"events": `CREATE TABLE events (session_id uuid, event_id timeuuid, activity text, source inet,
+			source_elapsed int, source_port int, thread text, PRIMARY KEY ((session_id), event_id))`,
+	},
 	"system_views": {
 		"settings":     `CREATE TABLE settings (name text, value text, PRIMARY KEY ((name)))`,
 		"disk_usage":   `CREATE TABLE disk_usage (keyspace_name text, table_name text, mebibytes bigint, PRIMARY KEY ((keyspace_name), table_name))`,
@@ -147,6 +154,10 @@ func virtualRows(ks, table string) func(d *DB) []map[string][]byte {
 		return func(d *DB) []map[string][]byte { return estimateRows(d, false) }
 	case "system.table_estimates":
 		return func(d *DB) []map[string][]byte { return estimateRows(d, true) }
+	case "system_traces.sessions":
+		return traceSessionRows
+	case "system_traces.events":
+		return traceEventRows
 	case "system_views.settings":
 		return settingRows
 	case "system_views.disk_usage":

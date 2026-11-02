@@ -83,6 +83,8 @@ type DB struct {
 	counterMu sync.Mutex
 	// vecs holds the open vector indexes.
 	vecs vectorIndexes
+	// traces keeps recent traced requests (system_traces).
+	traces traces
 	// prog records the progress of resumable streaming operations.
 	progressOnce sync.Once
 	prog         *streamProgress

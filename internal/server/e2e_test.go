@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -370,4 +371,27 @@ func (r rawValue) MarshalCQL(gocql.TypeInfo) ([]byte, error) { return r, nil }
 func (r *rawValue) UnmarshalCQL(_ gocql.TypeInfo, b []byte) error {
 	*r = append((*r)[:0], b...)
 	return nil
+}
+
+// TestGocqlTracing traces queries through gocql, whose tracer reads the
+// session and its events back from system_traces, as cqlsh's TRACING ON
+// does.
+func TestGocqlTracing(t *testing.T) {
+	host, port := startServer(t)
+	s := connect(t, host, port, 4, "")
+	require.NoError(t, s.Query("CREATE KEYSPACE tr WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}").Exec())
+	s = connect(t, host, port, 4, "tr")
+	require.NoError(t, s.Query("CREATE TABLE kv (k int PRIMARY KEY, v text)").Exec())
+	var buf bytes.Buffer
+	tracer := gocql.NewTraceWriter(s, &buf)
+	require.NoError(t, s.Query("INSERT INTO kv (k, v) VALUES (1, 'a')").Trace(tracer).Exec())
+	out := buf.String()
+	require.Contains(t, out, "Executing modification of tr.kv at QUORUM")
+	require.Contains(t, out, "Applying 1 writes locally")
+	require.Contains(t, out, "Request complete")
+	buf.Reset()
+	var v string
+	require.NoError(t, s.Query("SELECT v FROM kv WHERE k = 1").Trace(tracer).Scan(&v))
+	require.Equal(t, "a", v)
+	require.Contains(t, buf.String(), "Reading tr.kv locally")
 }
