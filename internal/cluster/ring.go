@@ -8,19 +8,42 @@ import (
 	"strings"
 )
 
+// Node states in the cluster metadata (NodeState).
+const (
+	StatusRegistered = "REGISTERED"
+	StatusJoining    = "JOINING"
+	StatusNormal     = "NORMAL"
+	StatusLeaving    = "LEAVING"
+	StatusLeft       = "LEFT"
+)
+
+// Node is a node as the cluster metadata describes it (Directory): its
+// addresses, location, tokens and state.
+type Node struct {
+	Addr           string // internode address
+	HostID         string
+	NativeAddr     string
+	NativePort     int
+	DataCenter     string
+	Rack           string
+	Tokens         []int64
+	Status         string
+	ReleaseVersion string
+}
+
 // Ring is the token ring (TokenMetadata): each token owns the range
 // (previous token, token], and a key's replicas are found by walking the
 // ring clockwise from its token.
 type Ring struct {
 	tokens []int64
-	owner  map[int64]*EndpointState
-	nodes  map[string]*EndpointState
+	owner  map[int64]*Node
+	nodes  map[string]*Node
 }
 
 // NewRing builds a ring from the nodes that own tokens: normal nodes and,
 // when withLeaving, leaving ones.
-func NewRing(states []EndpointState) *Ring {
-	r := &Ring{owner: map[int64]*EndpointState{}, nodes: map[string]*EndpointState{}}
+func NewRing(states []Node) *Ring {
+	r := &Ring{owner: map[int64]*Node{}, nodes: map[string]*Node{}}
 	for i := range states {
 		s := &states[i]
 		if s.Status != StatusNormal && s.Status != StatusLeaving {
@@ -40,8 +63,8 @@ func NewRing(states []EndpointState) *Ring {
 
 // NewFutureRing builds the ring as it will be once joining nodes have
 // joined and leaving nodes have left (pending ranges).
-func NewFutureRing(states []EndpointState) *Ring {
-	var next []EndpointState
+func NewFutureRing(states []Node) *Ring {
+	var next []Node
 	for _, s := range states {
 		switch s.Status {
 		case StatusJoining:
@@ -69,8 +92,8 @@ func (r *Ring) Ranges() [][2]int64 {
 func (r *Ring) Empty() bool { return len(r.tokens) == 0 }
 
 // Nodes returns the ring's nodes.
-func (r *Ring) Nodes() []*EndpointState {
-	out := make([]*EndpointState, 0, len(r.nodes))
+func (r *Ring) Nodes() []*Node {
+	out := make([]*Node, 0, len(r.nodes))
 	for _, n := range r.nodes {
 		out = append(out, n)
 	}
@@ -99,7 +122,7 @@ func (r *Ring) RangeEnd(t int64) (end int64, wraps bool) {
 
 // Replicas returns the replicas of token t under a keyspace's replication
 // options (AbstractReplicationStrategy.calculateNaturalReplicas).
-func (r *Ring) Replicas(replication map[string]string, t int64) []*EndpointState {
+func (r *Ring) Replicas(replication map[string]string, t int64) []*Node {
 	if len(r.tokens) == 0 {
 		return nil
 	}
@@ -111,7 +134,7 @@ func (r *Ring) Replicas(replication map[string]string, t int64) []*EndpointState
 		return nil
 	}
 	rf, _ := strconv.Atoi(replication["replication_factor"])
-	var out []*EndpointState
+	var out []*Node
 	seen := map[string]bool{}
 	start := r.firstIndex(t)
 	for i := 0; i < len(r.tokens) && len(out) < rf; i++ {
@@ -126,7 +149,7 @@ func (r *Ring) Replicas(replication map[string]string, t int64) []*EndpointState
 
 // ntsReplicas is NetworkTopologyStrategy: per data center, walk the ring
 // taking nodes on racks not used yet, then the skipped nodes.
-func (r *Ring) ntsReplicas(replication map[string]string, t int64) []*EndpointState {
+func (r *Ring) ntsReplicas(replication map[string]string, t int64) []*Node {
 	want := map[string]int{}
 	for dc, v := range replication {
 		if dc == "class" {
@@ -142,10 +165,10 @@ func (r *Ring) ntsReplicas(replication map[string]string, t int64) []*EndpointSt
 		}
 		racks[n.DataCenter][n.Rack] = true
 	}
-	var out []*EndpointState
+	var out []*Node
 	have := map[string]int{}
 	usedRacks := map[string]map[string]bool{}
-	skipped := map[string][]*EndpointState{}
+	skipped := map[string][]*Node{}
 	seen := map[string]bool{}
 	start := r.firstIndex(t)
 	for i := 0; i < len(r.tokens); i++ {

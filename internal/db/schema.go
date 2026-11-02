@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cassandra-room/cassandra-room/internal/cluster"
 	"github.com/cassandra-room/cassandra-room/internal/cql"
 	"github.com/cassandra-room/cassandra-room/internal/storage/lsm"
 	"github.com/cassandra-room/cassandra-room/internal/types"
@@ -175,9 +176,19 @@ func (k *Keyspace) resolve(name string) (*types.Type, error) {
 	return nil, invalidf("Unknown type %s.%s", k.Name, name)
 }
 
-// Schema is an immutable snapshot of all keyspaces; DDL replaces it.
+// Schema is the cluster metadata (TCM's ClusterMetadata): an immutable
+// snapshot of the schema, roles and, in a cluster, the node directory,
+// identified by its epoch. Every change produces a new snapshot.
 type Schema struct {
 	Keyspaces map[string]*Keyspace
+	Epoch     int64
+	// NextStorageID allocates storage table ids, cluster-wide.
+	NextStorageID uint64
+	Roles         map[string]*Role
+	// Nodes is the directory of a cluster's nodes, by host id.
+	Nodes map[string]*cluster.Node
+	// Entries are the ids of the latest changes, for idempotent commits.
+	Entries   []string
 	Version   [16]byte
 	byStorage map[lsm.TableID]*Table
 	// storage holds every storage table in use: tables' and indexes'.
@@ -199,7 +210,14 @@ func (s *Schema) table(ks, name string) (*Table, error) {
 // clone copies the schema for a DDL change (tables are copied on write by
 // the caller).
 func (s *Schema) clone() *Schema {
-	out := &Schema{Keyspaces: make(map[string]*Keyspace, len(s.Keyspaces))}
+	out := &Schema{Keyspaces: make(map[string]*Keyspace, len(s.Keyspaces)), Epoch: s.Epoch,
+		NextStorageID: s.NextStorageID, Roles: cloneRoles(s.Roles), Nodes: map[string]*cluster.Node{},
+		Entries: slices.Clone(s.Entries)}
+	for id, n := range s.Nodes {
+		c := *n
+		c.Tokens = slices.Clone(n.Tokens)
+		out.Nodes[id] = &c
+	}
 	for n, k := range s.Keyspaces {
 		k2 := *k
 		k2.Tables = make(map[string]*Table, len(k.Tables))

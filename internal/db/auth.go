@@ -45,7 +45,7 @@ func applicable(resource string) []string {
 
 // Authenticate checks a login (PasswordAuthenticator.authenticate).
 func (d *DB) Authenticate(user, password string) error {
-	r := (*d.roles.Load())[user]
+	r := d.schema.Load().Roles[user]
 	if r == nil || !r.Login || r.Hash == "" || bcrypt.CompareHashAndPassword([]byte(r.Hash), []byte(password)) != nil {
 		return fmt.Errorf("Provided username %s and/or password are incorrect", user)
 	}
@@ -58,16 +58,21 @@ func (d *DB) AuthEnabled() bool { return d.opts.Authenticator }
 // defaultRoles creates the default superuser, cassandra/cassandra, when
 // authentication is enabled and no role exists (CassandraRoleManager).
 func (d *DB) defaultRoles() error {
-	if !d.opts.Authenticator || len(*d.roles.Load()) > 0 {
+	if !d.opts.Authenticator || len(d.schema.Load().Roles) > 0 {
 		return nil
 	}
 	h, err := bcrypt.GenerateFromPassword([]byte("cassandra"), 10)
 	if err != nil {
 		return err
 	}
-	m := map[string]*Role{"cassandra": {Name: "cassandra", Hash: string(h), Login: true, Superuser: true}}
-	d.roles.Store(&m)
-	return d.saveSchema(d.schema.Load())
+	_, err = d.change(func(next *Schema) (message.Message, bool, error) {
+		if len(next.Roles) > 0 {
+			return nil, false, nil
+		}
+		next.Roles["cassandra"] = &Role{Name: "cassandra", Hash: string(h), Login: true, Superuser: true}
+		return nil, true, nil
+	})
+	return err
 }
 
 // roleClosure returns a role and the roles granted to it, transitively.
@@ -137,7 +142,7 @@ func (d *DB) authorize(user, perm, resource string) error {
 	if !d.opts.Authorizer || user == "" {
 		return nil
 	}
-	roles := *d.roles.Load()
+	roles := d.schema.Load().Roles
 	if isSuper(roles, user) {
 		return nil
 	}
@@ -214,18 +219,6 @@ type authStmt struct {
 	session string
 }
 
-func (d *DB) saveRoles(m map[string]*Role) error {
-	d.roles.Store(&m)
-	d.epoch++
-	if err := d.saveSchema(d.schema.Load()); err != nil {
-		return err
-	}
-	if d.proxy != nil {
-		d.proxy.pushSchema()
-	}
-	return nil
-}
-
 func cloneRoles(m map[string]*Role) map[string]*Role {
 	out := make(map[string]*Role, len(m))
 	for k, r := range m {
@@ -244,10 +237,28 @@ func unauthorized(format string, args ...any) error {
 }
 
 func (a *authStmt) execute(e *execCtx) (message.Message, error) {
+	if l, ok := a.raw.(*cql.ListStmt); ok {
+		roles := e.d.schema.Load().Roles
+		user := e.user
+		super := user == "" || isSuper(roles, user) || !e.d.opts.Authorizer
+		return a.list(roles, l, user, super)
+	}
+	// Hash passwords once, outside the plan, which may run several times.
+	var hash string
+	if r, ok := a.raw.(*cql.RoleStmt); ok && r.Password != nil {
+		h, err := bcrypt.GenerateFromPassword([]byte(*r.Password), 10)
+		if err != nil {
+			return nil, err
+		}
+		hash = string(h)
+	}
+	return e.d.change(func(next *Schema) (message.Message, bool, error) { return a.plan(e, next, hash) })
+}
+
+// plan applies a role or permission change to the metadata.
+func (a *authStmt) plan(e *execCtx, next *Schema, hash string) (res message.Message, changed bool, err error) {
 	d := e.d
-	d.ddlMu.Lock()
-	defer d.ddlMu.Unlock()
-	roles := cloneRoles(*d.roles.Load())
+	roles := next.Roles
 	user := e.user
 	super := user == "" || isSuper(roles, user) || !d.opts.Authorizer
 	need := func(perm, resource string) error {
@@ -262,16 +273,16 @@ func (a *authStmt) execute(e *execCtx) (message.Message, error) {
 		switch s.Op {
 		case "CREATE":
 			if err := need("CREATE", "roles"); err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			if r != nil {
 				if s.IfNotExists {
-					return &message.VoidResult{}, nil
+					return &message.VoidResult{}, false, nil
 				}
-				return nil, invalidf("%s %s already exists", map[bool]string{true: "User", false: "Role"}[s.User], s.Name)
+				return nil, false, invalidf("%s %s already exists", map[bool]string{true: "User", false: "Role"}[s.User], s.Name)
 			}
 			if s.Superuser != nil && *s.Superuser && !super {
-				return nil, unauthorized("Only superusers can create a role with superuser status")
+				return nil, false, unauthorized("Only superusers can create a role with superuser status")
 			}
 			r = &Role{Name: s.Name}
 			roles[s.Name] = r
@@ -281,42 +292,38 @@ func (a *authStmt) execute(e *execCtx) (message.Message, error) {
 			}
 		case "ALTER":
 			if r == nil {
-				return nil, invalidf("%s doesn't exist", s.Name)
+				return nil, false, invalidf("%s doesn't exist", s.Name)
 			}
 			self := s.Name == user && s.Superuser == nil && s.Login == nil
 			if !self {
 				if err := need("ALTER", "roles/"+s.Name); err != nil {
-					return nil, err
+					return nil, false, err
 				}
 			}
 			if s.Superuser != nil && !super {
-				return nil, unauthorized("Only superusers are allowed to alter superuser status")
+				return nil, false, unauthorized("Only superusers are allowed to alter superuser status")
 			}
 		case "DROP":
 			if r == nil {
 				if s.IfExists {
-					return &message.VoidResult{}, nil
+					return &message.VoidResult{}, false, nil
 				}
-				return nil, invalidf("%s doesn't exist", s.Name)
+				return nil, false, invalidf("%s doesn't exist", s.Name)
 			}
 			if err := need("DROP", "roles/"+s.Name); err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			if s.Name == user {
-				return nil, invalidf("Cannot DROP primary role for current login")
+				return nil, false, invalidf("Cannot DROP primary role for current login")
 			}
 			delete(roles, s.Name)
 			for _, o := range roles {
 				o.MemberOf = slices.DeleteFunc(o.MemberOf, func(m string) bool { return m == s.Name })
 			}
-			return &message.VoidResult{}, d.saveRoles(roles)
+			return &message.VoidResult{}, true, nil
 		}
 		if s.Password != nil {
-			h, err := bcrypt.GenerateFromPassword([]byte(*s.Password), 10)
-			if err != nil {
-				return nil, err
-			}
-			r.Hash = string(h)
+			r.Hash = hash
 		}
 		if s.Login != nil {
 			r.Login = *s.Login
@@ -324,39 +331,39 @@ func (a *authStmt) execute(e *execCtx) (message.Message, error) {
 		if s.Superuser != nil {
 			r.Superuser = *s.Superuser
 		}
-		return &message.VoidResult{}, d.saveRoles(roles)
+		return &message.VoidResult{}, true, nil
 	case *cql.GrantStmt:
 		grantee := roles[s.Grantee]
 		if grantee == nil {
-			return nil, invalidf("%s doesn't exist", s.Grantee)
+			return nil, false, invalidf("%s doesn't exist", s.Grantee)
 		}
 		if s.Role != "" {
 			if roles[s.Role] == nil {
-				return nil, invalidf("%s doesn't exist", s.Role)
+				return nil, false, invalidf("%s doesn't exist", s.Role)
 			}
 			if err := need("AUTHORIZE", "roles/"+s.Role); err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			if s.Revoke {
 				grantee.MemberOf = slices.DeleteFunc(grantee.MemberOf, func(m string) bool { return m == s.Role })
 			} else {
 				for _, r := range roleClosure(roles, s.Role) {
 					if r.Name == s.Grantee {
-						return nil, invalidf("%s is a member of %s", s.Role, s.Grantee)
+						return nil, false, invalidf("%s is a member of %s", s.Role, s.Grantee)
 					}
 				}
 				if !slices.Contains(grantee.MemberOf, s.Role) {
 					grantee.MemberOf = append(grantee.MemberOf, s.Role)
 				}
 			}
-			return &message.VoidResult{}, d.saveRoles(roles)
+			return &message.VoidResult{}, true, nil
 		}
 		res := a.resource(s.Resource)
 		if err := d.checkResource(res); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if err := need("AUTHORIZE", res); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		perms := s.Permissions
 		if perms[0] == "ALL" {
@@ -364,7 +371,7 @@ func (a *authStmt) execute(e *execCtx) (message.Message, error) {
 		}
 		for _, p := range perms {
 			if !slices.Contains(applicable(res), p) {
-				return nil, invalidf("Resource type %s does not support any of the requested permissions", strings.SplitN(res, "/", 2)[0])
+				return nil, false, invalidf("Resource type %s does not support any of the requested permissions", strings.SplitN(res, "/", 2)[0])
 			}
 		}
 		if s.Revoke {
@@ -380,11 +387,9 @@ func (a *authStmt) execute(e *execCtx) (message.Message, error) {
 		} else {
 			grantee.Permissions = withPerms(grantee.Permissions, res, perms)
 		}
-		return &message.VoidResult{}, d.saveRoles(roles)
-	case *cql.ListStmt:
-		return a.list(roles, s, user, super)
+		return &message.VoidResult{}, true, nil
 	}
-	return nil, invalidf("unsupported statement")
+	return nil, false, invalidf("unsupported statement")
 }
 
 func withPerms(m map[string][]string, res string, perms []string) map[string][]string {

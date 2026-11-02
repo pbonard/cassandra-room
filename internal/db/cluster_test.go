@@ -3,6 +3,7 @@ package db
 import (
 	"errors"
 	"fmt"
+	"github.com/cassandra-room/cassandra-room/internal/cluster"
 	"net"
 	"sort"
 	"testing"
@@ -54,7 +55,7 @@ func newTestCluster(t *testing.T, n int) *testCluster {
 func (c *testCluster) start(i int) {
 	d, err := Open("db", Options{FS: c.fs[i], Address: net.IPv4(127, 0, 0, byte(1+i)), Cluster: &ClusterOptions{
 		ListenAddress: c.addrs[i], Seeds: []string{c.addrs[0]}, NumTokens: 8,
-		GossipInterval: 50 * time.Millisecond, DownAfter: 400 * time.Millisecond,
+		Membership:   testMembership(),
 		WriteTimeout: time.Second, ReadTimeout: time.Second,
 	}})
 	require.NoError(c.t, err)
@@ -176,10 +177,15 @@ func TestClusterReplication(t *testing.T) {
 	require.EqualValues(t, 3, ue.Required)
 	require.EqualValues(t, 2, ue.Alive)
 	require.Equal(t, []string{"missed"}, c.values(1, quorum, "SELECT v FROM ks.kv WHERE k = 7"))
+	// The metadata moves on without it.
+	c.ok(1, quorum, "CREATE TABLE ks.later (k int PRIMARY KEY)")
+	epoch := c.nodes[0].schema.Load().Epoch
 
-	// It comes back and receives the hint.
+	// It comes back, catches up with the metadata and receives the hint.
 	c.start(2)
 	c.waitConverged()
+	require.GreaterOrEqual(t, c.nodes[2].schema.Load().Epoch, epoch)
+	require.NotNil(t, c.nodes[2].schema.Load().Keyspaces["ks"].Tables["later"])
 	require.Eventually(t, func() bool {
 		res := c.nodes[2].Execute(mustPrepare(t, c.nodes[2], "SELECT v FROM ks.kv WHERE k = 7"), &RequestOptions{Consistency: one, local: true, forwarded: true})
 		rows := res.(*message.RowsResult).Data
@@ -302,16 +308,16 @@ func TestClusterBootstrapDecommissionRepair(t *testing.T) {
 		}
 	}
 
-	// Node 0 leaves: its data moves to the others.
-	require.NoError(t, c.nodes[0].Decommission())
-	c.stop(0)
-	require.Eventually(t, func() bool {
-		return c.nodes[1].proxy.ring.Load() != nil && len(c.nodes[1].proxy.ring.Load().Nodes()) == 2
-	},
-		5*time.Second, 20*time.Millisecond)
-	require.Equal(t, 300, local(1))
+	// Node 0 is the metadata service: it cannot leave.
+	require.Error(t, c.nodes[0].Decommission())
+	// Node 1 leaves: its data moves to the others.
+	require.NoError(t, c.nodes[1].Decommission())
+	require.Equal(t, cluster.StatusLeft, c.nodes[0].schema.Load().Nodes[c.nodes[1].local.HostID].Status)
+	c.stop(1)
+	require.Equal(t, 2, len(c.nodes[0].proxy.ring.Load().Nodes()))
+	require.Equal(t, 300, local(0))
 	require.Equal(t, 300, local(2))
-	require.Len(t, c.values(1, all, "SELECT k FROM ks.kv"), 300)
+	require.Len(t, c.values(2, all, "SELECT k FROM ks.kv"), 300)
 }
 
 // checkReplicas checks that every row k < n is stored on each of its
@@ -338,4 +344,13 @@ func (c *testCluster) checkReplicas(n int) {
 			}
 		}
 	}
+}
+
+// testMembership is a fast failure detector for tests.
+func testMembership() *cluster.Config {
+	c := cluster.DefaultConfig()
+	c.ProbeInterval, c.ProbeTimeout = 100*time.Millisecond, 50*time.Millisecond
+	c.GossipInterval, c.PushPullInterval = 30*time.Millisecond, 500*time.Millisecond
+	c.MinSuspicionTimeout = 300 * time.Millisecond
+	return &c
 }

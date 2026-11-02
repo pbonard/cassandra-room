@@ -1,7 +1,8 @@
 // Package cluster connects nodes: internode messaging (MessagingService),
-// gossip membership with failure detection (Gossiper, FailureDetector) and
-// the token ring with its replication strategies (TokenMetadata,
-// SimpleStrategy, NetworkTopologyStrategy).
+// SWIM membership with failure detection (after hashicorp/memberlist), the
+// Cluster Metadata Service that commits metadata epochs (CEP-21,
+// Transactional Cluster Metadata) and the token ring with its replication
+// strategies (SimpleStrategy, NetworkTopologyStrategy).
 package cluster
 
 import (
@@ -25,11 +26,15 @@ const (
 	VerbMutation
 	VerbReadRow
 	VerbReadRange
-	VerbSchemaPull
-	VerbSchemaPush
 	VerbExecute
-	VerbStream
 	VerbRepair
+	VerbPing
+	VerbPingReq
+	VerbBroadcast
+	VerbPaxosPrepare
+	VerbPaxosAccept
+	VerbMetadataFetch
+	VerbMetadataPush
 )
 
 // Handler handles a request and returns the response payload.

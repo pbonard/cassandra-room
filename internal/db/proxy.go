@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/cassandra-room/cassandra-room/internal/cluster"
-	"github.com/cassandra-room/cassandra-room/internal/cql"
 	"github.com/cassandra-room/cassandra-room/internal/storage/lsm"
 	"github.com/cassandra-room/cassandra-room/internal/storage/row"
 	"github.com/cassandra-room/cassandra-room/internal/types"
@@ -36,9 +35,9 @@ type ClusterOptions struct {
 	// WriteTimeout and ReadTimeout bound requests to replicas
 	// (write_request_timeout, read_request_timeout): 2 s and 5 s.
 	WriteTimeout, ReadTimeout time.Duration
-	// Gossip timing (tests): the interval and how long a silent node
-	// stays up.
-	GossipInterval, DownAfter time.Duration
+	// Membership tunes failure detection and gossip (memberlist's LAN
+	// defaults if nil).
+	Membership *cluster.Config
 }
 
 // proxy coordinates statements across the cluster (StorageProxy): writes
@@ -50,6 +49,7 @@ type proxy struct {
 	d      *DB
 	m      *cluster.Messaging
 	g      *cluster.Gossiper
+	cms    *cluster.CMS
 	opts   ClusterOptions
 	ring   atomic.Pointer[cluster.Ring]
 	self   string
@@ -102,13 +102,7 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 			return err
 		}
 	}
-	newNode := len(d.local.Tokens) == 0
-	isSeed := slices.Contains(o.Seeds, o.ListenAddress)
-	status := cluster.StatusNormal
-	if newNode && len(o.Seeds) > 0 && !isSeed {
-		status = cluster.StatusJoining
-	}
-	if newNode {
+	if len(d.local.Tokens) == 0 {
 		d.local.Tokens = cluster.RandomTokens(o.NumTokens)
 		d.ddlMu.Lock()
 		err := d.saveSchema(d.schema.Load())
@@ -125,21 +119,19 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	m.Handle(cluster.VerbMutation, p.handleMutation)
 	m.Handle(cluster.VerbReadRow, p.handleReadRow)
 	m.Handle(cluster.VerbReadRange, p.handleReadRange)
-	m.Handle(cluster.VerbSchemaPull, p.handleSchemaPull)
-	m.Handle(cluster.VerbSchemaPush, p.handleSchemaPush)
 	m.Handle(cluster.VerbExecute, p.handleExecute)
-	m.Handle(cluster.VerbStream, p.handleStream)
 	m.Handle(cluster.VerbRepair, p.handleRepair)
-	v := d.schema.Load().Version
-	p.g = cluster.NewGossiper(m, cluster.EndpointState{
-		HostID: d.local.HostID, DataCenter: d.opts.DataCenter, Rack: d.opts.Rack, Tokens: d.local.Tokens,
-		Status: status, NativeAddr: d.opts.Address.String(), NativePort: d.opts.Port,
-		SchemaVersion: types.FormatUUID(v[:]), ReleaseVersion: ReleaseVersion, SchemaEpoch: d.epoch,
-	}, o.Seeds)
-	if o.GossipInterval > 0 {
-		p.g.SetTiming(o.GossipInterval, o.DownAfter)
+	p.g = cluster.NewGossiper(m, cluster.EndpointState{HostID: d.local.HostID, Epoch: d.schema.Load().Epoch}, o.Seeds)
+	if o.Membership != nil {
+		p.g.SetConfig(*o.Membership)
 	}
-	p.g.OnChange(p.topologyChanged)
+	// The seeds form the Cluster Metadata Service (TCM's initial CMS).
+	members := o.Seeds
+	if len(members) == 0 {
+		members = []string{p.self}
+	}
+	p.cms = cluster.NewCMS(m, members, d.currentMetadata, d.installBytes, metadataInfo)
+	p.g.OnChange(p.membershipChanged)
 	p.g.OnLiveness(func(addr string, up bool) {
 		if up {
 			go p.replayHints()
@@ -147,25 +139,112 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	})
 	d.proxy = p
 	d.store = p
+	p.ring.Store(cluster.NewRing(nodeList(d.schema.Load())))
 	m.Start()
-	p.topologyChanged()
 	p.g.Start()
-	if status == cluster.StatusJoining {
-		// Learn the ring, then stream the ranges this node will own before
-		// serving them (auto_bootstrap).
-		time.Sleep(3 * p.gossipInterval())
-		p.ring.Store(cluster.NewRing(p.g.States()))
-		if !p.ring.Load().Empty() {
-			if err := p.bootstrap(); err != nil {
-				p.stop()
-				return err
-			}
+	for _, s := range o.Seeds {
+		if s != p.self && p.cms.CatchUp(s) == nil {
+			break
 		}
-		p.g.Update(func(s *cluster.EndpointState) { s.Status = cluster.StatusNormal })
+	}
+	if err := p.join(); err != nil {
+		p.stop()
+		return err
 	}
 	p.wg.Add(1)
 	go p.background()
 	return nil
+}
+
+// join registers this node in the cluster metadata and, if it joins a
+// cluster with data, bootstraps it: PrepareJoin, streaming, FinishJoin.
+func (p *proxy) join() error {
+	d := p.d
+	me := &cluster.Node{Addr: p.self, HostID: d.local.HostID, NativeAddr: d.opts.Address.String(), NativePort: d.opts.Port,
+		DataCenter: d.opts.DataCenter, Rack: d.opts.Rack, Tokens: d.local.Tokens, ReleaseVersion: ReleaseVersion}
+	_, err := d.change(func(next *Schema) (message.Message, bool, error) {
+		cur := next.Nodes[me.HostID]
+		if cur != nil && cur.Status != cluster.StatusLeft && cur.Addr == me.Addr && cur.NativeAddr == me.NativeAddr && cur.NativePort == me.NativePort {
+			return nil, false, nil
+		}
+		n := *me
+		n.Status = cluster.StatusNormal
+		for _, o := range next.Nodes {
+			if o.HostID != me.HostID && o.Status == cluster.StatusNormal {
+				n.Status = cluster.StatusJoining // there is data to stream
+				break
+			}
+		}
+		if cur != nil && cur.Status != cluster.StatusLeft {
+			n.Status = cur.Status // an address change
+		}
+		next.Nodes[me.HostID] = &n
+		return nil, true, nil
+	})
+	if err != nil {
+		return fmt.Errorf("db: registering in the cluster metadata: %w", err)
+	}
+	if d.schema.Load().Nodes[me.HostID].Status != cluster.StatusJoining {
+		return nil
+	}
+	if err := p.bootstrap(); err != nil {
+		return err
+	}
+	return p.setStatus(cluster.StatusNormal)
+}
+
+// setStatus commits a change of this node's state (FinishJoin,
+// PrepareLeave, FinishLeave).
+func (p *proxy) setStatus(status string) error {
+	_, err := p.d.change(func(next *Schema) (message.Message, bool, error) {
+		n := next.Nodes[p.d.local.HostID]
+		if n == nil || n.Status == status {
+			return nil, false, nil
+		}
+		n.Status = status
+		return nil, true, nil
+	})
+	return err
+}
+
+// nodeList returns the directory's nodes.
+func nodeList(s *Schema) []cluster.Node {
+	out := make([]cluster.Node, 0, len(s.Nodes))
+	for _, n := range s.Nodes {
+		out = append(out, *n)
+	}
+	return out
+}
+
+// metadataChanged is called when a new metadata snapshot is installed.
+func (p *proxy) metadataChanged(s *Schema) {
+	p.ring.Store(cluster.NewRing(nodeList(s)))
+	p.g.Update(func(st *cluster.EndpointState) { st.Epoch = s.Epoch })
+}
+
+// membershipChanged catches up with a node that gossips a newer epoch
+// (TCM's peer log fetching).
+func (p *proxy) membershipChanged() {
+	epoch := p.d.schema.Load().Epoch
+	for _, s := range p.g.States() {
+		if s.Epoch > epoch && s.Addr != p.self && p.g.IsAlive(s.Addr) {
+			go func() { _ = p.cms.CatchUp(s.Addr) }()
+			return
+		}
+	}
+}
+
+// disseminate pushes the current metadata to the live nodes after a
+// commit (TCM's log replication).
+func (p *proxy) disseminate() {
+	var nodes []string
+	for _, n := range p.d.schema.Load().Nodes {
+		if n.Addr != p.self && n.Status != cluster.StatusLeft && p.g.IsAlive(n.Addr) {
+			nodes = append(nodes, n.Addr)
+		}
+	}
+	_, b := p.d.currentMetadata()
+	p.cms.Push(nodes, b)
 }
 
 func (p *proxy) stop() {
@@ -188,24 +267,19 @@ func (p *proxy) background() {
 		case <-t.C:
 		}
 		n++
-		p.syncSchema()
+		p.membershipChanged()
 		if n%5 == 0 {
 			p.replayHints()
 		}
 	}
 }
 
-func (p *proxy) topologyChanged() {
-	p.ring.Store(cluster.NewRing(p.g.States()))
-	go p.syncSchema()
-}
-
 // liveReplicas returns a partition's replicas, this node first, then the
 // live ones, then the down ones; n is the number of live replicas.
-func (p *proxy) replicas(k *Keyspace, token int64, cl primitive.ConsistencyLevel) (reps []*cluster.EndpointState, live int) {
+func (p *proxy) replicas(k *Keyspace, token int64, cl primitive.ConsistencyLevel) (reps []*cluster.Node, live int) {
 	all := p.ring.Load().Replicas(k.Replication, token)
 	local := cl == primitive.ConsistencyLevelLocalOne || cl == primitive.ConsistencyLevelLocalQuorum || cl == primitive.ConsistencyLevelLocalSerial
-	var up, down []*cluster.EndpointState
+	var up, down []*cluster.Node
 	for _, r := range all {
 		if local && r.DataCenter != p.d.opts.DataCenter {
 			continue
@@ -216,7 +290,7 @@ func (p *proxy) replicas(k *Keyspace, token int64, cl primitive.ConsistencyLevel
 			down = append(down, r)
 		}
 	}
-	slices.SortStableFunc(up, func(a, b *cluster.EndpointState) int {
+	slices.SortStableFunc(up, func(a, b *cluster.Node) int {
 		switch {
 		case a.Addr == p.self:
 			return -1
@@ -333,11 +407,11 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 	}
 	type group struct {
 		need, acks int
-		reps       []*cluster.EndpointState
+		reps       []*cluster.Node
 	}
 	groups := map[string]*group{} // by keyspace and token
 	perNode := map[string][]write{}
-	nodes := map[string]*cluster.EndpointState{}
+	nodes := map[string]*cluster.Node{}
 	writeGroups := map[string][]*group{}
 	var hints []hint
 	for _, w := range m.writes {
@@ -496,11 +570,10 @@ func (p *proxy) replayHints() {
 	if err != nil {
 		return
 	}
-	byHost := map[string]*cluster.EndpointState{}
-	for _, s := range p.g.States() {
-		if s.Addr != p.self && p.g.IsAlive(s.Addr) {
-			st := s
-			byHost[s.HostID] = &st
+	byHost := map[string]*cluster.Node{}
+	for _, n := range p.d.schema.Load().Nodes {
+		if n.Addr != p.self && p.g.IsAlive(n.Addr) {
+			byHost[n.HostID] = n
 		}
 	}
 	for host, node := range byHost {
@@ -610,7 +683,7 @@ func (p *proxy) handleReadRow(_ string, payload []byte) ([]byte, error) {
 
 // readTargets returns the replicas to read token from: blockFor live
 // replicas, this node first.
-func (s *distSource) readTargets(token int64) ([]*cluster.EndpointState, int, error) {
+func (s *distSource) readTargets(token int64) ([]*cluster.Node, int, error) {
 	reps, live := s.p.replicas(s.k, token, s.cl)
 	need := blockFor(s.cl, s.k, s.p.d.opts.DataCenter)
 	if live < need {
@@ -635,7 +708,7 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 		err   error
 	}
 	ch := make(chan resp, len(reps))
-	ask := func(r *cluster.EndpointState) {
+	ask := func(r *cluster.Node) {
 		b, err := s.p.m.Request(ctx, r.Addr, cluster.VerbReadRow, encodeKey(s.id, key))
 		if err == nil && len(b) == 0 {
 			err = errors.New("empty response")
@@ -848,7 +921,7 @@ func (it *distIter) load(from []byte) bool {
 
 // fetch reads [from, to) from need replicas and merges their rows; cutoff
 // is the last complete key when a replica's page was cut.
-func (it *distIter) fetch(reps []*cluster.EndpointState, need int, from, to []byte) ([]kv, []byte, error) {
+func (it *distIter) fetch(reps []*cluster.Node, need int, from, to []byte) ([]kv, []byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), it.s.p.opts.ReadTimeout)
 	defer cancel()
 	type resp struct {
@@ -857,7 +930,7 @@ func (it *distIter) fetch(reps []*cluster.EndpointState, need int, from, to []by
 		err  error
 	}
 	ch := make(chan resp, len(reps))
-	ask := func(r *cluster.EndpointState) {
+	ask := func(r *cluster.Node) {
 		b, err := it.s.p.m.Request(ctx, r.Addr, cluster.VerbReadRange, encodeKey(it.s.id, from, to))
 		if err != nil {
 			ch <- resp{err: err}
@@ -966,141 +1039,6 @@ func (it *distIter) Key() []byte   { return it.buf[it.i].k }
 func (it *distIter) Value() []byte { return it.buf[it.i].v }
 func (it *distIter) Error() error  { return it.err }
 func (it *distIter) Close() error  { return nil }
-
-// ---- schema (MigrationManager) ----
-
-// schemaLeader is the node that executes schema changes: the live node
-// with the smallest host id, so that changes are serialized.
-func (p *proxy) schemaLeader() string {
-	leader, id := p.self, p.d.local.HostID
-	for _, s := range p.g.States() {
-		if (s.Addr == p.self || p.g.IsAlive(s.Addr)) && s.HostID < id {
-			leader, id = s.Addr, s.HostID
-		}
-	}
-	return leader
-}
-
-func (p *proxy) handleSchemaPull(string, []byte) ([]byte, error) {
-	p.d.ddlMu.Lock()
-	defer p.d.ddlMu.Unlock()
-	return p.d.schemaBytes(p.d.schema.Load())
-}
-
-func (p *proxy) handleSchemaPush(_ string, payload []byte) ([]byte, error) {
-	return nil, p.d.adoptSchema(payload)
-}
-
-// pushSchema sends this node's schema to every live node.
-func (p *proxy) pushSchema() {
-	b, err := p.d.schemaBytes(p.d.schema.Load())
-	if err != nil {
-		return
-	}
-	v := p.d.schema.Load().Version
-	p.g.Update(func(s *cluster.EndpointState) {
-		s.SchemaVersion, s.SchemaEpoch = types.FormatUUID(v[:]), p.d.epoch
-	})
-	ctx, cancel := context.WithTimeout(context.Background(), p.opts.WriteTimeout)
-	defer cancel()
-	var wg sync.WaitGroup
-	for _, s := range p.g.States() {
-		if s.Addr == p.self || !p.g.IsAlive(s.Addr) {
-			continue
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_, _ = p.m.Request(ctx, s.Addr, cluster.VerbSchemaPush, b)
-		}()
-	}
-	wg.Wait()
-}
-
-// syncSchema pulls the schema from a node gossiping a newer epoch.
-func (p *proxy) syncSchema() {
-	p.d.ddlMu.Lock()
-	epoch := p.d.epoch
-	p.d.ddlMu.Unlock()
-	for _, s := range p.g.States() {
-		if s.Addr == p.self || s.SchemaEpoch <= epoch || !p.g.IsAlive(s.Addr) {
-			continue
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), p.opts.ReadTimeout)
-		b, err := p.m.Request(ctx, s.Addr, cluster.VerbSchemaPull, nil)
-		cancel()
-		if err == nil {
-			_ = p.d.adoptSchema(b)
-		}
-		return
-	}
-}
-
-// schemaBytes encodes the schema file (caller holds ddlMu).
-func (d *DB) schemaBytes(s *Schema) ([]byte, error) {
-	sf := schemaFile{Local: d.local, Epoch: d.epoch}
-	if r := d.roles.Load(); r != nil {
-		for _, role := range *r {
-			sf.Roles = append(sf.Roles, role)
-		}
-	}
-	for _, k := range s.Keyspaces {
-		if k.virtual {
-			continue
-		}
-		sf.Keyspaces = append(sf.Keyspaces, k)
-		for _, t := range k.Tables {
-			b, err := marshalTable(t)
-			if err != nil {
-				return nil, err
-			}
-			sf.Tables = append(sf.Tables, b)
-		}
-	}
-	return json.Marshal(sf)
-}
-
-// adoptSchema installs a schema from another node if it is newer: storage
-// for new tables is created, and storage of dropped ones removed.
-func (d *DB) adoptSchema(b []byte) error {
-	s, sf, err := parseSchemaFile(b)
-	if err != nil {
-		return err
-	}
-	d.ddlMu.Lock()
-	defer d.ddlMu.Unlock()
-	if sf.Epoch <= d.epoch {
-		return nil
-	}
-	for id := range s.storage {
-		if _, err := d.engine.Table(id); errors.Is(err, lsm.ErrUnknownTable) {
-			if _, err := d.engine.CreateTable(id); err != nil {
-				return err
-			}
-		}
-	}
-	old := d.schema.Load()
-	d.epoch = sf.Epoch
-	d.local.NextStorageID = max(d.local.NextStorageID, sf.Local.NextStorageID)
-	d.roles.Store(rolesOf(sf))
-	if err := d.saveSchema(s); err != nil {
-		return err
-	}
-	d.schema.Store(s)
-	var gone []lsm.TableID
-	for id := range old.storage {
-		if !s.storage[id] {
-			gone = append(gone, id)
-		}
-	}
-	if d.proxy != nil {
-		v := s.Version
-		d.proxy.g.Update(func(st *cluster.EndpointState) {
-			st.SchemaVersion, st.SchemaEpoch = types.FormatUUID(v[:]), d.epoch
-		})
-	}
-	return d.dropStorage(gone...)
-}
 
 // ---- forwarded statements ----
 
@@ -1220,17 +1158,6 @@ func (p *proxy) handleExecute(_ string, payload []byte) ([]byte, error) {
 // live replica. It returns "" to run here.
 func (p *proxy) route(st *prepState, e *execCtx) string {
 	switch s := st.stmt.(type) {
-	case *authStmt:
-		if _, list := s.raw.(*cql.ListStmt); list {
-			return ""
-		}
-		if l := p.schemaLeader(); l != p.self {
-			return l
-		}
-	case *ddlStmt:
-		if l := p.schemaLeader(); l != p.self {
-			return l
-		}
 	case *modification:
 		if s.cond != nil || s.isCounter() {
 			return p.partitionLeader(s, e)
@@ -1270,13 +1197,14 @@ func (p *proxy) partitionLeader(m *modification, e *execCtx) string {
 
 // ---- system.peers ----
 
-func (p *proxy) peers() []cluster.EndpointState {
-	var out []cluster.EndpointState
-	for _, s := range p.g.States() {
-		if s.Addr != p.self && s.Status == cluster.StatusNormal {
-			out = append(out, s)
+func (p *proxy) peers() []cluster.Node {
+	var out []cluster.Node
+	for _, n := range p.d.schema.Load().Nodes {
+		if n.Addr != p.self && n.Status == cluster.StatusNormal {
+			out = append(out, *n)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Addr < out[j].Addr })
 	return out
 }
 
@@ -1311,9 +1239,9 @@ func (p *proxy) scatter(pr *Prepared, e *execCtx, o *RequestOptions) message.Mes
 	f := &forwarded{Keyspace: pr.Keyspace, Query: pr.Query, Values: vals, Null: null, Unset: unset,
 		CL: uint16(primitive.ConsistencyLevelOne), Timestamp: o.Timestamp, NowInSec: o.NowInSec, User: o.User, Local: true}
 	var nodes []string
-	for _, s := range p.g.States() {
-		if s.Addr == p.self || p.g.IsAlive(s.Addr) {
-			nodes = append(nodes, s.Addr)
+	for _, n := range p.d.schema.Load().Nodes {
+		if n.Status == cluster.StatusNormal && (n.Addr == p.self || p.g.IsAlive(n.Addr)) {
+			nodes = append(nodes, n.Addr)
 		}
 	}
 	results := make([]message.Message, len(nodes))
@@ -1360,8 +1288,4 @@ func (p *proxy) ownsPrimary(ks string, token int64) bool {
 		}
 	}
 	return false
-}
-
-func (p *proxy) handleStream(string, []byte) ([]byte, error) {
-	return nil, errors.New("streaming is not implemented yet")
 }

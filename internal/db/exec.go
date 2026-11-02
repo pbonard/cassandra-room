@@ -288,9 +288,7 @@ func (d *DB) Execute(p *Prepared, o *RequestOptions) message.Message {
 	if sc, ok := res.(*message.SchemaChangeResult); ok && sc.ChangeType == primitive.SchemaChangeTypeCreated {
 		d.grantCreator(o.User, sc)
 	}
-	if _, ddl := st.stmt.(*ddlStmt); ddl && d.proxy != nil {
-		d.proxy.pushSchema()
-	}
+
 	if rows, ok := res.(*message.RowsResult); ok {
 		switch {
 		case o.ResultMetadataID != nil && string(o.ResultMetadataID) != string(st.resultID):
@@ -387,13 +385,6 @@ func (d *DB) grantCreator(user string, sc *message.SchemaChangeResult) {
 	if !d.opts.Authorizer || user == "" {
 		return
 	}
-	d.ddlMu.Lock()
-	defer d.ddlMu.Unlock()
-	roles := cloneRoles(*d.roles.Load())
-	r := roles[user]
-	if r == nil || isSuper(roles, user) {
-		return
-	}
 	res := "data/" + sc.Keyspace
 	switch sc.Target {
 	case primitive.SchemaChangeTargetTable:
@@ -402,6 +393,12 @@ func (d *DB) grantCreator(user string, sc *message.SchemaChangeResult) {
 	default:
 		return
 	}
-	r.Permissions = withPerms(r.Permissions, res, applicable(res))
-	_ = d.saveRoles(roles)
+	_, _ = d.change(func(next *Schema) (message.Message, bool, error) {
+		r := next.Roles[user]
+		if r == nil || isSuper(next.Roles, user) {
+			return nil, false, nil
+		}
+		r.Permissions = withPerms(r.Permissions, res, applicable(res))
+		return nil, true, nil
+	})
 }

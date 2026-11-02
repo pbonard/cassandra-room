@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"github.com/cassandra-room/cassandra-room/internal/cluster"
 	"net"
 	"strconv"
 	"testing"
@@ -271,7 +272,7 @@ func TestGocqlCluster(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		d, err := db.Open("db", db.Options{FS: vfs.NewMem(), Address: net.IPv4(127, 0, 0, byte(i+1)), Port: port,
 			Cluster: &db.ClusterOptions{ListenAddress: storage[i], Seeds: []string{storage[0]}, NumTokens: 8,
-				GossipInterval: 50 * time.Millisecond, DownAfter: time.Second}})
+				Membership: fastMembership()}})
 		require.NoError(t, err)
 		srv := New(d)
 		go func(ln net.Listener) { _ = srv.Serve(ln) }(lns[i])
@@ -317,4 +318,12 @@ func TestGocqlCluster(t *testing.T) {
 		}
 		return len(seen) == 3
 	}, 5*time.Second, 100*time.Millisecond, "token-aware routing reaches every node")
+}
+
+func fastMembership() *cluster.Config {
+	c := cluster.DefaultConfig()
+	c.ProbeInterval, c.ProbeTimeout = 100*time.Millisecond, 50*time.Millisecond
+	c.GossipInterval, c.PushPullInterval = 30*time.Millisecond, 500*time.Millisecond
+	c.MinSuspicionTimeout = 500 * time.Millisecond
+	return &c
 }

@@ -204,9 +204,10 @@ func peerRows(d *DB, v2 bool) []map[string][]byte {
 		return nil
 	}
 	var out []map[string][]byte
+	// With transactional metadata every node converges on the same schema.
+	schemaID := d.schema.Load().Version
 	for _, s := range d.proxy.peers() {
 		hostID, _ := types.ParseUUID(s.HostID)
-		schemaID, _ := types.ParseUUID(s.SchemaVersion)
 		r := map[string][]byte{
 			"peer":            ipBytes(s.Addr),
 			"data_center":     textV(s.DataCenter),

@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cassandra-room/cassandra-room/internal/cluster"
 	"github.com/cassandra-room/cassandra-room/internal/storage/lsm"
 	"github.com/cassandra-room/cassandra-room/internal/storage/row"
 	"github.com/cassandra-room/cassandra-room/internal/types"
@@ -64,12 +65,10 @@ type DB struct {
 	tableMu sync.RWMutex
 	schema  atomic.Pointer[Schema]
 	local   localState
-	// pending is a table whose storage is being created, before it is in
-	// the schema (for engineTableOptions).
-	pending atomic.Pointer[Table]
 
 	lastTS atomic.Int64
-	epoch  int64 // the schema epoch, guarded by ddlMu
+	// installing is the metadata being installed (for engineTableOptions).
+	installing atomic.Pointer[Schema]
 
 	// hostID is the node's id, which owns its shard of counters.
 	hostID [16]byte
@@ -80,8 +79,6 @@ type DB struct {
 	// before writing it (Cassandra's counter locks).
 	counterMu sync.Mutex
 
-	roles atomic.Pointer[map[string]*Role]
-
 	// store runs statements' reads and writes: localStorage, or the
 	// cluster's coordinator.
 	store storage
@@ -90,21 +87,25 @@ type DB struct {
 
 // localState is persisted with the schema.
 type localState struct {
-	HostID        string
-	NextStorageID uint64
+	HostID string
+	// NextStorageID is read from older schema files only.
+	NextStorageID uint64 `json:",omitempty"`
 	Bootstrapped  bool
 	Tokens        []int64 `json:",omitempty"`
 }
 
 // schemaFile is the durable form of the schema.
 type schemaFile struct {
-	// Epoch counts schema changes cluster-wide: a node adopts a pushed
-	// schema with a higher epoch.
-	Epoch     int64
-	Local     localState
+	// Epoch numbers the metadata (TCM's epoch).
+	Epoch         int64
+	NextStorageID uint64
+	// Local is this node's own state (not part of the metadata).
+	Local     localState `json:",omitempty"`
 	Keyspaces []*Keyspace
 	Tables    []json.RawMessage
-	Roles     []*Role `json:",omitempty"`
+	Roles     []*Role         `json:",omitempty"`
+	Nodes     []*cluster.Node `json:",omitempty"`
+	Entries   []string        `json:",omitempty"`
 }
 
 const schemaFileName = "schema.json"
@@ -140,8 +141,6 @@ func Open(dir string, opts Options) (*DB, error) {
 	if err := d.fs.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
-	empty := map[string]*Role{}
-	d.roles.Store(&empty)
 	if err := d.loadSchema(); err != nil {
 		return nil, err
 	}
@@ -167,7 +166,7 @@ func Open(dir string, opts Options) (*DB, error) {
 			}
 		}
 	}
-	for id := lsm.TableID(1); uint64(id) < d.local.NextStorageID; id++ {
+	for id := lsm.TableID(1); uint64(id) < d.schema.Load().NextStorageID; id++ {
 		if !d.schema.Load().storage[id] {
 			if err := e.DropTable(id); err != nil && !errors.Is(err, lsm.ErrUnknownTable) {
 				e.Close()
@@ -175,15 +174,16 @@ func Open(dir string, opts Options) (*DB, error) {
 			}
 		}
 	}
-	if err := d.defaultRoles(); err != nil {
-		e.Close()
-		return nil, err
-	}
 	if opts.Cluster != nil {
 		if err := d.startCluster(opts.Cluster); err != nil {
 			e.Close()
 			return nil, err
 		}
+	}
+	// In a cluster the default roles are a metadata change like any other.
+	if err := d.defaultRoles(); err != nil {
+		d.Close()
+		return nil, err
 	}
 	if !d.local.Bootstrapped {
 		d.local.Bootstrapped = true
@@ -209,13 +209,10 @@ func (d *DB) Close() error {
 func (d *DB) Engine() *lsm.Engine { return d.engine }
 
 func (d *DB) engineTableOptions(id lsm.TableID) lsm.TableOptions {
-	if t := d.pending.Load(); t != nil && t.Storage == id {
-		o, err := compactionOptions(t.Params.Compaction, t.Params.GCGraceSeconds)
-		if err == nil {
-			return o
+	for _, s := range []*Schema{d.installing.Load(), d.schema.Load()} {
+		if s == nil {
+			continue
 		}
-	}
-	if s := d.schema.Load(); s != nil {
 		if t, ok := s.byStorage[id]; ok {
 			o, err := compactionOptions(t.Params.Compaction, t.Params.GCGraceSeconds)
 			if err == nil {
@@ -239,8 +236,10 @@ func (d *DB) loadSchema() error {
 		if err != nil {
 			return err
 		}
-		d.local, d.epoch = sf.Local, sf.Epoch
-		d.roles.Store(rolesOf(sf))
+		d.local = sf.Local
+		if s.NextStorageID == 0 { // an older schema file
+			s.NextStorageID = max(1, sf.Local.NextStorageID)
+		}
 		d.schema.Store(s)
 		return nil
 	case oserrorIsNotExist(err):
@@ -248,8 +247,8 @@ func (d *DB) loadSchema() error {
 		_, _ = rand.Read(id[:])
 		id[6] = id[6]&0x0f | 0x40
 		id[8] = id[8]&0x3f | 0x80
-		d.local = localState{HostID: types.FormatUUID(id[:]), NextStorageID: 1}
-		s := &Schema{Keyspaces: map[string]*Keyspace{}}
+		d.local = localState{HostID: types.FormatUUID(id[:])}
+		s := &Schema{Keyspaces: map[string]*Keyspace{}, NextStorageID: 1, Roles: map[string]*Role{}, Nodes: map[string]*cluster.Node{}}
 		addSystemKeyspaces(s)
 		s.finish()
 		d.schema.Store(s)
@@ -258,20 +257,19 @@ func (d *DB) loadSchema() error {
 	return err
 }
 
-func rolesOf(sf *schemaFile) *map[string]*Role {
-	roles := map[string]*Role{}
-	for _, r := range sf.Roles {
-		roles[r.Name] = r
-	}
-	return &roles
-}
-
 // parseSchemaFile decodes a schema file.
 func parseSchemaFile(b []byte) (*Schema, *schemaFile, error) {
-	s := &Schema{Keyspaces: map[string]*Keyspace{}}
 	var sf schemaFile
 	if err := json.Unmarshal(b, &sf); err != nil {
 		return nil, nil, fmt.Errorf("db: corrupt schema file: %w", err)
+	}
+	s := &Schema{Keyspaces: map[string]*Keyspace{}, Epoch: sf.Epoch, NextStorageID: sf.NextStorageID,
+		Roles: map[string]*Role{}, Nodes: map[string]*cluster.Node{}, Entries: sf.Entries}
+	for _, r := range sf.Roles {
+		s.Roles[r.Name] = r
+	}
+	for _, n := range sf.Nodes {
+		s.Nodes[n.HostID] = n
 	}
 	for _, k := range sf.Keyspaces {
 		k.Tables = map[string]*Table{}
@@ -305,26 +303,8 @@ func oserrorIsNotExist(err error) bool { return errors.Is(err, os.ErrNotExist) }
 // saveSchema writes the schema file atomically: a new file, synced, then
 // renamed over the old one.
 func (d *DB) saveSchema(s *Schema) error {
-	sf := schemaFile{Local: d.local, Epoch: d.epoch}
-	if r := d.roles.Load(); r != nil {
-		for _, role := range *r {
-			sf.Roles = append(sf.Roles, role)
-		}
-		sort.Slice(sf.Roles, func(i, j int) bool { return sf.Roles[i].Name < sf.Roles[j].Name })
-	}
-	for _, k := range s.Keyspaces {
-		if k.virtual {
-			continue
-		}
-		sf.Keyspaces = append(sf.Keyspaces, k)
-		for _, t := range k.Tables {
-			b, err := marshalTable(t)
-			if err != nil {
-				return err
-			}
-			sf.Tables = append(sf.Tables, b)
-		}
-	}
+	sf := s.file()
+	sf.Local = d.local
 	b, err := json.MarshalIndent(sf, "", " ")
 	if err != nil {
 		return err
@@ -367,4 +347,44 @@ func (d *DB) timestamp() int64 {
 			return ts
 		}
 	}
+}
+
+// file returns the durable form of the metadata.
+func (s *Schema) file() *schemaFile {
+	sf := &schemaFile{Epoch: s.Epoch, NextStorageID: s.NextStorageID, Entries: s.Entries}
+	for _, r := range s.Roles {
+		sf.Roles = append(sf.Roles, r)
+	}
+	sort.Slice(sf.Roles, func(i, j int) bool { return sf.Roles[i].Name < sf.Roles[j].Name })
+	for _, n := range s.Nodes {
+		sf.Nodes = append(sf.Nodes, n)
+	}
+	sort.Slice(sf.Nodes, func(i, j int) bool { return sf.Nodes[i].HostID < sf.Nodes[j].HostID })
+	var names []string
+	for n, k := range s.Keyspaces {
+		if !k.virtual {
+			names = append(names, n)
+		}
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		k := s.Keyspaces[n]
+		sf.Keyspaces = append(sf.Keyspaces, k)
+		var tnames []string
+		for tn := range k.Tables {
+			tnames = append(tnames, tn)
+		}
+		sort.Strings(tnames)
+		for _, tn := range tnames {
+			b, _ := marshalTable(k.Tables[tn])
+			sf.Tables = append(sf.Tables, b)
+		}
+	}
+	return sf
+}
+
+// metadataBytes serializes the metadata for other nodes.
+func metadataBytes(s *Schema) []byte {
+	b, _ := json.Marshal(s.file())
+	return b
 }

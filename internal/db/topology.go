@@ -1,14 +1,13 @@
 package db
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -59,8 +58,8 @@ func (d *DB) userTables() []*Table {
 	return out
 }
 
-func containsAddr(nodes []*cluster.EndpointState, addr string) bool {
-	return slices.ContainsFunc(nodes, func(n *cluster.EndpointState) bool { return n.Addr == addr })
+func containsAddr(nodes []*cluster.Node, addr string) bool {
+	return slices.ContainsFunc(nodes, func(n *cluster.Node) bool { return n.Addr == addr })
 }
 
 // fetchRange copies a key range of a table from a node to this one.
@@ -133,9 +132,8 @@ func (p *proxy) pushRange(to string, id lsm.TableID, lo, hi []byte) (int, error)
 // bootstrap streams to this joining node the ranges it will own, from
 // their current replicas, then rebuilds its local indexes.
 func (p *proxy) bootstrap() error {
-	p.syncSchema()
 	cur := p.ring.Load()
-	future := cluster.NewFutureRing(p.g.States())
+	future := cluster.NewFutureRing(nodeList(p.d.schema.Load()))
 	for _, t := range p.d.userTables() {
 		k := p.d.schema.Load().Keyspaces[t.Keyspace]
 		for _, r := range future.Ranges() {
@@ -169,8 +167,8 @@ func (p *proxy) bootstrap() error {
 
 // pendingReplicas are the nodes that will become replicas of a token once
 // pending joins and departures complete: writes go to them too.
-func (p *proxy) pendingReplicas(k *Keyspace, token int64, current []*cluster.EndpointState) []*cluster.EndpointState {
-	states := p.g.States()
+func (p *proxy) pendingReplicas(k *Keyspace, token int64, current []*cluster.Node) []*cluster.Node {
+	states := nodeList(p.d.schema.Load())
 	moving := false
 	for _, s := range states {
 		if s.Status == cluster.StatusJoining || s.Status == cluster.StatusLeaving {
@@ -181,7 +179,7 @@ func (p *proxy) pendingReplicas(k *Keyspace, token int64, current []*cluster.End
 	if !moving {
 		return nil
 	}
-	var out []*cluster.EndpointState
+	var out []*cluster.Node
 	for _, n := range cluster.NewFutureRing(states).Replicas(k.Replication, token) {
 		if !containsAddr(current, n.Addr) {
 			out = append(out, n)
@@ -196,6 +194,9 @@ func (d *DB) Decommission() error {
 	p := d.proxy
 	if p == nil {
 		return errors.New("db: not a cluster node")
+	}
+	if slices.Contains(p.cms.Members(), p.self) {
+		return errors.New("db: a member of the cluster metadata service cannot be decommissioned")
 	}
 	// Like StorageService.decommission, refuse to leave fewer nodes than a
 	// keyspace's replication factor.
@@ -223,10 +224,13 @@ func (d *DB) Decommission() error {
 			}
 		}
 	}
-	p.g.Update(func(s *cluster.EndpointState) { s.Status = cluster.StatusLeaving })
-	time.Sleep(3 * p.gossipInterval()) // others learn the pending ranges
+	// PrepareLeave: once committed (and pushed to the live nodes), writes
+	// also go to the nodes taking over this node's ranges.
+	if err := p.setStatus(cluster.StatusLeaving); err != nil {
+		return err
+	}
 	cur := p.ring.Load()
-	future := cluster.NewFutureRing(p.g.States())
+	future := cluster.NewFutureRing(nodeList(d.schema.Load()))
 	for _, t := range d.userTables() {
 		k := d.schema.Load().Keyspaces[t.Keyspace]
 		for _, r := range cur.Ranges() {
@@ -246,16 +250,8 @@ func (d *DB) Decommission() error {
 		}
 	}
 	p.replayHints()
-	p.g.Update(func(s *cluster.EndpointState) { s.Status = cluster.StatusLeft })
-	time.Sleep(3 * p.gossipInterval())
-	return nil
-}
-
-func (p *proxy) gossipInterval() time.Duration {
-	if p.opts.GossipInterval > 0 {
-		return p.opts.GossipInterval
-	}
-	return time.Second
+	// FinishLeave.
+	return p.setStatus(cluster.StatusLeft)
 }
 
 // ---- repair ----
@@ -381,7 +377,9 @@ func (d *DB) Status() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Datacenter: %s\n", d.opts.DataCenter)
 	fmt.Fprintf(&b, "%-4s %-22s %-7s %-37s %s\n", "--", "Address", "Tokens", "Host ID", "Rack")
-	for _, s := range p.g.States() {
+	nodes := nodeList(d.schema.Load())
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Addr < nodes[j].Addr })
+	for _, s := range nodes {
 		state := "U"
 		if s.Addr != p.self && !p.g.IsAlive(s.Addr) {
 			state = "D"
@@ -392,5 +390,3 @@ func (d *DB) Status() string {
 	return b.String()
 }
 
-var _ = bytes.Equal
-var _ = binary.AppendUvarint

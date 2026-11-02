@@ -76,27 +76,29 @@ func schemaChange(change primitive.SchemaChangeType, ks, table string) *message.
 }
 
 func (s *ddlStmt) execute(e *execCtx) (message.Message, error) {
-	d := e.d
-	d.ddlMu.Lock()
-	defer d.ddlMu.Unlock()
-	cur := d.schema.Load()
-	next := cur.clone()
-	var res message.Message
-	var after func() error // engine work once the schema is saved
+	return e.d.change(func(next *Schema) (message.Message, bool, error) { return s.plan(e, next) })
+}
+
+// plan applies the statement to next, a copy of the cluster metadata
+// (a transformation): it has no side effects, which installing the new
+// metadata performs (creating and dropping storage, building indexes).
+// changed is false for a no-op (IF [NOT] EXISTS).
+func (s *ddlStmt) plan(e *execCtx, next *Schema) (res message.Message, changed bool, err error) {
+	cur := next
 	switch st := s.raw.(type) {
 	case *cql.CreateKeyspace:
 		if !validName(st.Keyspace) || len(st.Keyspace) > keyspaceNameLength {
-			return nil, invalidf("Keyspace name must not be empty, more than %d characters long, or contain non-alphanumeric-underscore characters (got \"%s\")", keyspaceNameLength, st.Keyspace)
+			return nil, false, invalidf("Keyspace name must not be empty, more than %d characters long, or contain non-alphanumeric-underscore characters (got \"%s\")", keyspaceNameLength, st.Keyspace)
 		}
 		if _, ok := cur.Keyspaces[st.Keyspace]; ok {
 			if st.IfNotExists {
-				return &message.VoidResult{}, nil
+				return &message.VoidResult{}, false, nil
 			}
-			return nil, alreadyExists(st.Keyspace, "")
+			return nil, false, alreadyExists(st.Keyspace, "")
 		}
 		repl, durable, err := replication(st.Properties)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		next.Keyspaces[st.Keyspace] = &Keyspace{Name: st.Keyspace, Replication: repl, DurableWrites: durable, Tables: map[string]*Table{}}
 		res = schemaChange(primitive.SchemaChangeTypeCreated, st.Keyspace, "")
@@ -104,12 +106,12 @@ func (s *ddlStmt) execute(e *execCtx) (message.Message, error) {
 		k, ok := cur.Keyspaces[st.Keyspace]
 		if !ok {
 			if st.IfExists {
-				return &message.VoidResult{}, nil
+				return &message.VoidResult{}, false, nil
 			}
-			return nil, invalidf("Keyspace '%s' doesn't exist", st.Keyspace)
+			return nil, false, invalidf("Keyspace '%s' doesn't exist", st.Keyspace)
 		}
 		if k.virtual {
-			return nil, unauthorizedf("%s keyspace is not user-modifiable", st.Keyspace)
+			return nil, false, unauthorizedf("%s keyspace is not user-modifiable", st.Keyspace)
 		}
 		nk := *k
 		for _, p := range st.Properties {
@@ -117,17 +119,17 @@ func (s *ddlStmt) execute(e *execCtx) (message.Message, error) {
 			case "replication":
 				repl, _, err := replication([]cql.Property{p})
 				if err != nil {
-					return nil, err
+					return nil, false, err
 				}
 				nk.Replication = repl
 			case "durable_writes":
 				v, err := stringProperty(p)
 				if err != nil {
-					return nil, err
+					return nil, false, err
 				}
 				nk.DurableWrites = v != "false"
 			default:
-				return nil, syntaxf("Unknown property '%s'", p.Name)
+				return nil, false, syntaxf("Unknown property '%s'", p.Name)
 			}
 		}
 		next.Keyspaces[st.Keyspace] = &nk
@@ -136,55 +138,36 @@ func (s *ddlStmt) execute(e *execCtx) (message.Message, error) {
 		k, ok := cur.Keyspaces[st.Keyspace]
 		if !ok {
 			if st.IfExists {
-				return &message.VoidResult{}, nil
+				return &message.VoidResult{}, false, nil
 			}
-			return nil, invalidf("Keyspace '%s' doesn't exist", st.Keyspace)
+			return nil, false, invalidf("Keyspace '%s' doesn't exist", st.Keyspace)
 		}
 		if k.virtual {
-			return nil, unauthorizedf("%s keyspace is not user-modifiable", st.Keyspace)
+			return nil, false, unauthorizedf("%s keyspace is not user-modifiable", st.Keyspace)
 		}
 		delete(next.Keyspaces, st.Keyspace)
-		var ids []lsm.TableID
-		for _, t := range k.Tables {
-			ids = append(ids, t.storageIDs()...)
-		}
-		after = func() error { return d.dropStorage(ids...) }
 		res = schemaChange(primitive.SchemaChangeTypeDropped, st.Keyspace, "")
 	case *cql.CreateTable:
 		ksName, _ := keyspaceOf(st.Keyspace, s.session)
 		k, ok := cur.Keyspaces[ksName]
 		if !ok {
-			return nil, invalidf("Keyspace '%s' doesn't exist", ksName)
+			return nil, false, invalidf("Keyspace '%s' doesn't exist", ksName)
 		}
 		if k.virtual {
-			return nil, unauthorizedf("%s keyspace is not user-modifiable", ksName)
+			return nil, false, unauthorizedf("%s keyspace is not user-modifiable", ksName)
 		}
 		if _, ok := k.Tables[st.Table]; ok {
 			if st.IfNotExists {
-				return &message.VoidResult{}, nil
+				return &message.VoidResult{}, false, nil
 			}
-			return nil, alreadyExists(ksName, st.Table)
+			return nil, false, alreadyExists(ksName, st.Table)
 		}
 		t, err := newTable(k, st)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		copy(t.ID[:], newTimeUUID(e.now))
-		t.Storage = d.newStorageID()
-		d.pending.Store(t)
-		defer d.pending.Store(nil)
-		if _, err := d.engine.CreateTable(t.Storage); err != nil {
-			if !errors.Is(err, lsm.ErrTableExists) {
-				return nil, err
-			}
-			// Left by a crash before the schema was saved: start empty.
-			if err := d.dropStorage(t.Storage); err != nil {
-				return nil, err
-			}
-			if _, err := d.engine.CreateTable(t.Storage); err != nil {
-				return nil, err
-			}
-		}
+		t.Storage = next.newStorageID()
 		next.Keyspaces[ksName].Tables[st.Table] = t
 		res = schemaChange(primitive.SchemaChangeTypeCreated, ksName, st.Table)
 	case *cql.AlterTable:
@@ -192,16 +175,16 @@ func (s *ddlStmt) execute(e *execCtx) (message.Message, error) {
 		t, err := cur.table(ksName, st.Table)
 		if err != nil {
 			if st.IfExists {
-				return &message.VoidResult{}, nil
+				return &message.VoidResult{}, false, nil
 			}
-			return nil, err
+			return nil, false, err
 		}
 		if t.virtual != nil {
-			return nil, unauthorizedf("%s keyspace is not user-modifiable", ksName)
+			return nil, false, unauthorizedf("%s keyspace is not user-modifiable", ksName)
 		}
 		nt, err := alterTable(cur.Keyspaces[ksName], t, st)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		next.Keyspaces[ksName].Tables[st.Table] = nt
 		res = schemaChange(primitive.SchemaChangeTypeUpdated, ksName, st.Table)
@@ -210,97 +193,77 @@ func (s *ddlStmt) execute(e *execCtx) (message.Message, error) {
 		t, err := cur.table(ksName, st.Table)
 		if err != nil {
 			if st.IfExists {
-				return &message.VoidResult{}, nil
+				return &message.VoidResult{}, false, nil
 			}
-			return nil, err
+			return nil, false, err
 		}
 		if t.virtual != nil {
-			return nil, unauthorizedf("%s keyspace is not user-modifiable", ksName)
+			return nil, false, unauthorizedf("%s keyspace is not user-modifiable", ksName)
 		}
 		delete(next.Keyspaces[ksName].Tables, st.Table)
-		after = func() error { return d.dropStorage(t.storageIDs()...) }
 		res = schemaChange(primitive.SchemaChangeTypeDropped, ksName, st.Table)
 	case *cql.Truncate:
 		ksName, _ := keyspaceOf(st.Keyspace, s.session)
 		t, err := cur.table(ksName, st.Table)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if t.virtual != nil {
-			return nil, invalidf("Cannot truncate virtual table %s.%s", ksName, st.Table)
+			return nil, false, invalidf("Cannot truncate virtual table %s.%s", ksName, st.Table)
 		}
 		// Truncation switches the table and its indexes to new, empty
 		// storage.
 		nt := *t
-		nt.Storage = d.newStorageID()
-		d.pending.Store(&nt)
-		defer d.pending.Store(nil)
-		if _, err := d.engine.CreateTable(nt.Storage); err != nil {
-			return nil, err
-		}
+		nt.Storage = next.newStorageID()
 		nt.Indexes = nil
 		for _, ix := range t.Indexes {
 			nix := *ix
-			nix.Storage = d.newStorageID()
-			if _, err := d.engine.CreateTable(nix.Storage); err != nil {
-				return nil, err
-			}
+			nix.Storage = next.newStorageID()
 			nt.Indexes = append(nt.Indexes, &nix)
 		}
 		nt.index()
 		next.Keyspaces[ksName].Tables[st.Table] = &nt
-		after = func() error { return d.dropStorage(t.storageIDs()...) }
 		res = &message.VoidResult{}
 	case *cql.CreateIndex:
 		ksName, _ := keyspaceOf(st.Keyspace, s.session)
 		t, err := cur.table(ksName, st.Table)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if t.virtual != nil {
-			return nil, invalidf("Secondary indexes are not supported on virtual tables")
+			return nil, false, invalidf("Secondary indexes are not supported on virtual tables")
 		}
 		ix, err := newIndex(t, st)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		for _, other := range cur.Keyspaces[ksName].Tables {
 			for _, o := range other.Indexes {
 				if o.Name == ix.Name {
 					if st.IfNotExists {
-						return &message.VoidResult{}, nil
+						return &message.VoidResult{}, false, nil
 					}
-					return nil, invalidf("Index '%s' already exists", ix.Name)
+					return nil, false, invalidf("Index '%s' already exists", ix.Name)
 				}
 				if other == t && o.Column == ix.Column && o.Target == ix.Target {
 					if st.IfNotExists {
-						return &message.VoidResult{}, nil
+						return &message.VoidResult{}, false, nil
 					}
-					return nil, invalidf("Index %s is a duplicate of existing index %s", ix.Name, o.Name)
+					return nil, false, invalidf("Index %s is a duplicate of existing index %s", ix.Name, o.Name)
 				}
 			}
 		}
-		ix.Storage = d.newStorageID()
-		if _, err := d.engine.CreateTable(ix.Storage); err != nil {
-			return nil, err
-		}
+		ix.Storage = next.newStorageID()
 		nt := *t
 		nt.Indexes = append(slices.Clone(t.Indexes), ix)
 		nt.index()
 		next.Keyspaces[ksName].Tables[st.Table] = &nt
-		// Writes maintain the index once the schema has it; then the
-		// existing rows are indexed.
-		after = func() error {
-			d.tableMu.RLock()
-			defer d.tableMu.RUnlock()
-			return d.buildIndex(&nt, ix, e.nowSec)
-		}
 		res = schemaChange(primitive.SchemaChangeTypeUpdated, ksName, st.Table)
 	case *cql.DropIndex:
 		ksName, _ := keyspaceOf(st.Keyspace, s.session)
 		k, ok := cur.Keyspaces[ksName]
 		if !ok {
-			return nil, invalidf("Keyspace '%s' doesn't exist", ksName)
+			return nil, false, invalidf("Keyspace '%s' doesn't exist", ksName)
 		}
 		var found *Table
 		var ix *Index
@@ -313,37 +276,24 @@ func (s *ddlStmt) execute(e *execCtx) (message.Message, error) {
 		}
 		if found == nil {
 			if st.IfExists {
-				return &message.VoidResult{}, nil
+				return &message.VoidResult{}, false, nil
 			}
-			return nil, invalidf("Index '%s.%s' doesn't exist", ksName, st.Name)
+			return nil, false, invalidf("Index '%s.%s' doesn't exist", ksName, st.Name)
 		}
 		nt := *found
 		nt.Indexes = slices.DeleteFunc(slices.Clone(found.Indexes), func(o *Index) bool { return o == ix })
 		nt.index()
 		next.Keyspaces[ksName].Tables[found.Name] = &nt
-		after = func() error { return d.dropStorage(ix.Storage) }
 		res = schemaChange(primitive.SchemaChangeTypeUpdated, ksName, found.Name)
 	case *cql.CreateType, *cql.AlterType, *cql.DropType:
-		var err error
 		if res, err = s.typeChange(next); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if res == nil {
-			return &message.VoidResult{}, nil
+			return &message.VoidResult{}, false, nil
 		}
 	}
-	next.finish()
-	d.epoch++
-	if err := d.saveSchema(next); err != nil {
-		return nil, err
-	}
-	d.schema.Store(next)
-	if after != nil {
-		if err := after(); err != nil {
-			return nil, err
-		}
-	}
-	return res, nil
+	return res, true, nil
 }
 
 func unauthorizedf(format string, args ...any) error {
@@ -580,9 +530,9 @@ func referencesType(t *types.Type, name string) bool {
 	return slices.ContainsFunc(t.Elems, func(e *types.Type) bool { return referencesType(e, name) })
 }
 
-func (d *DB) newStorageID() lsm.TableID {
-	id := lsm.TableID(d.local.NextStorageID)
-	d.local.NextStorageID++
+func (s *Schema) newStorageID() lsm.TableID {
+	id := lsm.TableID(s.NextStorageID)
+	s.NextStorageID++
 	return id
 }
 
