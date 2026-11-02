@@ -39,7 +39,7 @@ func main() {
 		numTokens             = flag.Int("num-tokens", 16, "Number of tokens (vnodes) of this node")
 		dataCenter            = flag.String("dc", "datacenter1", "Data center of this node")
 		rack                  = flag.String("rack", "rack1", "Rack of this node")
-		adminAddress          = flag.String("admin-address", "", "HTTP address for nodetool-style operations: GET /status, POST /repair?keyspace=, POST /decommission")
+		adminAddress          = flag.String("admin-address", "", "HTTP address for nodetool-style operations: GET /status, POST /repair?keyspace=, POST /cleanup?keyspace=, POST /decommission")
 	)
 	flag.Parse()
 
@@ -140,6 +140,14 @@ func serveAdmin(addr string, d *db.DB) {
 			return
 		}
 		fmt.Fprintf(w, "repaired %d ranges: %d mismatching, %d rows streamed\n", st.Ranges, st.Mismatches, st.Streamed)
+	})
+	mux.HandleFunc("POST /cleanup", func(w http.ResponseWriter, r *http.Request) {
+		n, err := d.Cleanup(r.URL.Query().Get("keyspace"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintf(w, "cleaned %d tables\n", n)
 	})
 	mux.HandleFunc("POST /decommission", func(w http.ResponseWriter, _ *http.Request) {
 		if err := d.Decommission(); err != nil {

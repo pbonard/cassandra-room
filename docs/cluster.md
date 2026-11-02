@@ -79,10 +79,17 @@ node, the coordinator in a cluster.
   one ring range at a time, in pages, cutting each page at the first
   replica page that was truncated.
 - **Schema** and role changes are metadata commits (above), from any node.
-- **Counters and LWT** run on the partition's first live replica: counter
-  shards are read locally there; conditions are read at QUORUM under the
-  partition's lock. This is not Paxos: conditional updates are
-  linearizable while that replica stays the leader.
+- **Counters** run on the partition's first live replica, where counter
+  shards are read locally.
+- **Lightweight transactions** run single-decree Paxos per partition among
+  its replicas (Cassandra's Paxos v1, as ScyllaDB's `service/paxos`):
+  prepare (finishing an accepted but uncommitted round, repairing replicas
+  that missed the last commit), a QUORUM read and the condition check,
+  propose (the update timestamped with the ballot), commit at the
+  statement's consistency level, and prune once every replica learnt it.
+  Each replica's promise, accepted proposal and last commit are cells of a
+  `system.paxos`-like table, synced before answering. SERIAL reads finish
+  rounds in progress first. Any node can coordinate.
 - **Secondary index** queries are gathered from every live node, each
   answering for the partitions it is the first live replica of.
 - Drivers see the cluster through `system.peers`/`peers_v2` and route
@@ -102,15 +109,17 @@ node, the coordinator in a cluster.
 - **Repair** (`POST /repair?keyspace=`): for each range this node
   replicates, each replica builds a Merkle tree (the engine's, over purged
   rows); differing leaves are streamed both ways.
+- **Cleanup** (`POST /cleanup?keyspace=`): rewrites the tables (and their
+  indexes) without the rows of ranges this node no longer replicates, as
+  nodetool cleanup does after nodes join; refused while nodes are joining
+  or leaving.
 - `GET /status` is nodetool status.
 
 ## Not done
 
-Paxos for LWT; the CMS acceptors' promises live in memory (a CMS member
-that restarts in the middle of a commit could accept an older ballot;
-TCM keeps them in a system table), CMS membership changes (it is fixed to
+CMS membership changes (it is fixed to
 the seeds), the metadata log itself (only the latest snapshot is kept);
-cleanup of ranges a node no longer owns, `removenode` and
+`removenode` and
 `replace_address`, internode encryption and compression, EACH_QUORUM per
 data center (it is approximated as QUORUM), digest reads, speculative
 retry by latency.

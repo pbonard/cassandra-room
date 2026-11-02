@@ -276,6 +276,16 @@ func TestClusterBootstrapDecommissionRepair(t *testing.T) {
 	}
 	require.Greater(t, local(2), 100, "the new node has its share")
 	c.checkReplicas(300)
+	// The old replicas still hold the ranges they gave away; cleanup
+	// leaves each row on its two replicas only.
+	require.Greater(t, local(0)+local(1)+local(2), 600)
+	for i := range c.nodes {
+		n, err := c.nodes[i].Cleanup("ks")
+		require.NoError(t, err)
+		require.Equal(t, 1, n)
+	}
+	require.Equal(t, 600, local(0)+local(1)+local(2))
+	c.checkReplicas(300)
 	require.Len(t, c.values(2, all, "SELECT k FROM ks.kv"), 300)
 
 	// Replicas diverge (writes to node 1's engine only, for keys it

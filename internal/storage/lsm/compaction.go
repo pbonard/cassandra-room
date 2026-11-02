@@ -806,6 +806,8 @@ type compactionPick struct {
 	dropOnly bool
 	// single is a compaction of one sstable for its droppable tombstones.
 	single bool
+	// keep, if set, drops every row whose key it rejects (cleanup).
+	keep func(key []byte) bool
 	// unreffed holds inputs whose reference the compaction dropped when it
 	// released them early. Guarded by Engine.mu.
 	unreffed map[*fileMeta]bool
@@ -1198,7 +1200,14 @@ func (e *Engine) runCompaction(t *Table, p *compactionPick) {
 // compact): it flushes, waits for the table's running compactions, then
 // merges all of its sstables, purging what the purge rule allows, into one
 // set of shards. Background compactions of the table pause meanwhile.
-func (t *Table) Compact() error {
+func (t *Table) Compact() error { return t.majorCompaction(nil) }
+
+// Cleanup rewrites the table without the rows whose key keep rejects
+// (nodetool cleanup: data of ranges the node no longer replicates). Rows
+// written meanwhile are not affected.
+func (t *Table) Cleanup(keep func(key []byte) bool) error { return t.majorCompaction(keep) }
+
+func (t *Table) majorCompaction(keep func(key []byte) bool) error {
 	if err := t.Flush(); err != nil {
 		return err
 	}
@@ -1237,7 +1246,7 @@ func (t *Table) Compact() error {
 	e.mu.compactions++
 	e.compactWG.Add(1)
 	e.mu.Unlock()
-	e.runCompaction(t, &compactionPick{inputs: files})
+	e.runCompaction(t, &compactionPick{inputs: files, keep: keep})
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.checkUsableLocked()
@@ -1766,6 +1775,9 @@ func (c *compaction) compactShard(s int) error {
 	for n := 1; ok; ok, n = mi.next(), n+1 {
 		if n%1024 == 0 && (e.unusable.Load() || t.dropped.Load()) {
 			return fail(errCompactionAborted)
+		}
+		if c.p.keep != nil && !c.p.keep(mi.key) {
+			continue
 		}
 		value := mi.value
 		var rs *row.Stats

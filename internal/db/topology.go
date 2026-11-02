@@ -13,6 +13,7 @@ import (
 
 	"github.com/cassandra-room/cassandra-room/internal/cluster"
 	"github.com/cassandra-room/cassandra-room/internal/storage/lsm"
+	"github.com/cassandra-room/cassandra-room/internal/types"
 )
 
 // Topology changes: bootstrap (BootStrapper, RangeStreamer), decommission
@@ -388,4 +389,62 @@ func (d *DB) Status() string {
 		fmt.Fprintf(&b, "%-4s %-22s %-7d %-37s %s\n", state, s.Addr, len(s.Tokens), s.HostID, s.Rack)
 	}
 	return b.String()
+}
+
+// Cleanup removes the data of ranges this node no longer replicates
+// (nodetool cleanup), for one keyspace or all: after nodes join, the old
+// replicas of their ranges keep the data until cleaned. Like
+// CompactionManager.performCleanup it refuses while ranges are moving.
+// It returns the number of tables cleaned.
+func (d *DB) Cleanup(keyspace string) (int, error) {
+	p := d.proxy
+	if p == nil {
+		return 0, nil // a single node owns everything
+	}
+	s := d.schema.Load()
+	for _, n := range s.Nodes {
+		if n.Status == cluster.StatusJoining || n.Status == cluster.StatusLeaving {
+			return 0, fmt.Errorf("db: node %s is %s: cleanup must wait until ranges stop moving", n.Addr, n.Status)
+		}
+	}
+	ring := p.ring.Load()
+	cleaned := 0
+	for _, t := range d.userTables() {
+		if keyspace != "" && t.Keyspace != keyspace {
+			continue
+		}
+		k := s.Keyspaces[t.Keyspace]
+		owned := map[int64]bool{} // by range end
+		keep := func(tok int64) bool {
+			end, _ := ring.RangeEnd(tok)
+			o, ok := owned[end]
+			if !ok {
+				o = containsAddr(ring.Replicas(k.Replication, tok), p.self)
+				owned[end] = o
+			}
+			return o
+		}
+		lt, err := d.engine.Table(t.Storage)
+		if err != nil {
+			return cleaned, err
+		}
+		if err := lt.Cleanup(func(key []byte) bool { return keep(tokenOf(key)) }); err != nil {
+			return cleaned, err
+		}
+		for _, ix := range t.Indexes {
+			it, err := d.engine.Table(ix.Storage)
+			if err != nil {
+				return cleaned, err
+			}
+			vt := ix.valueType()
+			if err := it.Cleanup(func(key []byte) bool {
+				_, rest, err := types.ReadComponent(key, vt, false)
+				return err != nil || len(rest) < 8 || keep(tokenOf(rest))
+			}); err != nil {
+				return cleaned, err
+			}
+		}
+		cleaned++
+	}
+	return cleaned, nil
 }
