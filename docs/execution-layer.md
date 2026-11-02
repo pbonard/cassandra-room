@@ -184,7 +184,7 @@ candidate is kept only if it is closer to the node than to kept neighbors,
 relaxed up to alpha 1.4), with backlinks pruned past 1.2x the maximum. A
 search is a best-first beam search for `optimize_for`'s top-k of the limit
 (LATENCY by default: 16 for LIMIT 10; RECALL: 42), scored exactly. Deleted
-vectors stay in the graph for routing and are never returned. Each node
+vectors stay in the graph for routing and are never returned, until they reach a quarter of the live ones and are cleaned out (their neighbors relinked around them). Each node
 indexes its own rows as writes are applied, in the index's table (the
 graph is cached in memory); candidates are checked against the rows, which
 drops stale entries, and more are fetched while fewer than LIMIT qualify.
@@ -192,7 +192,7 @@ In a cluster the query goes to every node (each answering for the
 partitions it is the first replica of) and the coordinator merges by
 score. With the partition key restricted, rows are scored one by one.
 Not done: product quantization (jvector compresses graphs of 1K+ vectors
-on disk), compacting away deleted nodes.
+on disk); the graph is held in memory once loaded.
 
 ## Not supported yet
 

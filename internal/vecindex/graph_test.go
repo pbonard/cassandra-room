@@ -173,3 +173,36 @@ func TestRejects(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, res, 1)
 }
+
+// TestGraphCleanup deletes most vectors: the deleted nodes are removed
+// from the graph and the store, and search still finds the live ones.
+func TestGraphCleanup(t *testing.T) {
+	rng := rand.New(rand.NewSource(9))
+	st := newMem()
+	x, err := New(st, Options{Dims: 16, Similarity: Euclidean})
+	require.NoError(t, err)
+	data := map[int][]float32{}
+	for i := 0; i < 2000; i++ {
+		data[i] = randVec(rng, 16)
+		require.NoError(t, x.Insert(key(i), data[i]))
+	}
+	for i := 0; i < 1500; i++ {
+		require.NoError(t, x.Delete(key(i)))
+		delete(data, i)
+	}
+	require.NoError(t, x.Cleanup())
+	require.Equal(t, 500, x.Len())
+	require.Len(t, x.nodes, 500, "deleted nodes are gone")
+	nodes := 0
+	require.NoError(t, st.Scan([]byte("N"), func(k, v []byte) error { nodes++; return nil }))
+	require.Equal(t, 500, nodes)
+	var queries [][]float32
+	for range 30 {
+		queries = append(queries, randVec(rng, 16))
+	}
+	require.Greater(t, recall(t, x, data, queries, 10, true), 0.95)
+	// Reopened from the store.
+	y, err := New(st, Options{Dims: 16, Similarity: Euclidean})
+	require.NoError(t, err)
+	require.Greater(t, recall(t, y, data, queries, 10, true), 0.95)
+}

@@ -103,9 +103,10 @@ type node struct {
 }
 
 type meta struct {
-	Entry int64 // -1 for an empty graph
-	Next  uint32
-	Live  int
+	Entry   int64 // -1 for an empty graph
+	Next    uint32
+	Live    int
+	Deleted int
 }
 
 // Index is a vector graph. Searches run concurrently; changes are
@@ -154,6 +155,7 @@ func New(st Store, o Options) (*Index, error) {
 		}
 		return nil
 	})
+	x.meta.Live, x.meta.Deleted = len(x.byKey), len(x.nodes)-len(x.byKey)
 	return x, err
 }
 
@@ -424,7 +426,8 @@ func (x *Index) Insert(key []byte, vec []float32) error {
 	return x.saveMeta()
 }
 
-// Delete removes key's vector: its node stays for routing, marked deleted.
+// Delete removes key's vector: its node stays for routing, marked deleted,
+// until deleted nodes reach a quarter of the live ones and are cleaned up.
 func (x *Index) Delete(key []byte) error {
 	x.mu.Lock()
 	defer x.mu.Unlock()
@@ -435,7 +438,84 @@ func (x *Index) Delete(key []byte) error {
 	if err := x.deleteLocked(ord); err != nil {
 		return err
 	}
+	if x.meta.Deleted > 16 && x.meta.Deleted*4 > x.meta.Live {
+		if err := x.cleanupLocked(); err != nil {
+			return err
+		}
+	}
 	return x.saveMeta()
+}
+
+// Cleanup removes the deleted nodes from the graph.
+func (x *Index) Cleanup() error {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if err := x.cleanupLocked(); err != nil {
+		return err
+	}
+	return x.saveMeta()
+}
+
+// cleanupLocked removes deleted nodes (jvector's removeDeletedNodes): every
+// live node that links to deleted ones takes new neighbors from its live
+// neighbors and the deleted nodes' live neighbors, kept diverse; the
+// entry moves to a live node.
+func (x *Index) cleanupLocked() error {
+	if x.meta.Deleted == 0 {
+		return nil
+	}
+	var dirty []uint32
+	for ord, n := range x.nodes {
+		if n.Deleted || !slices.ContainsFunc(n.Neighbors, func(o uint32) bool { return x.nodes[o] == nil || x.nodes[o].Deleted }) {
+			continue
+		}
+		cands := map[uint32]bool{}
+		for _, nb := range n.Neighbors {
+			m := x.nodes[nb]
+			switch {
+			case m == nil:
+			case !m.Deleted:
+				cands[nb] = true
+			default:
+				for _, nn := range m.Neighbors {
+					if mm := x.nodes[nn]; mm != nil && !mm.Deleted && nn != ord {
+						cands[nn] = true
+					}
+				}
+			}
+		}
+		scoredCands := make([]scored, 0, len(cands))
+		for c := range cands {
+			scoredCands = append(scoredCands, scored{c, x.opts.Similarity.Score(n.Vector, x.nodes[c].Vector)})
+		}
+		sort.Slice(scoredCands, func(a, b int) bool { return scoredCands[a].score > scoredCands[b].score })
+		n.Neighbors = ords(x.diverse(scoredCands))
+		dirty = append(dirty, ord)
+	}
+	if e := x.meta.Entry; e >= 0 && x.nodes[uint32(e)].Deleted {
+		x.meta.Entry = -1
+		for ord, n := range x.nodes {
+			if !n.Deleted {
+				x.meta.Entry = int64(ord)
+				break
+			}
+		}
+	}
+	for _, ord := range dirty {
+		if err := x.saveNode(ord); err != nil {
+			return err
+		}
+	}
+	for ord, n := range x.nodes {
+		if n.Deleted {
+			if err := x.st.Delete(nodeKey(ord)); err != nil {
+				return err
+			}
+			delete(x.nodes, ord)
+		}
+	}
+	x.meta.Deleted = 0
+	return nil
 }
 
 func (x *Index) deleteLocked(ord uint32) error {
@@ -443,6 +523,7 @@ func (x *Index) deleteLocked(ord uint32) error {
 	n.Deleted = true
 	delete(x.byKey, string(n.Key))
 	x.meta.Live--
+	x.meta.Deleted++
 	if err := x.st.Delete(append([]byte{'K'}, n.Key...)); err != nil {
 		return err
 	}
@@ -470,7 +551,7 @@ func (x *Index) Search(query []float32, topK int) ([]Result, error) {
 	}
 	x.mu.RLock()
 	defer x.mu.RUnlock()
-	res := x.search(query, topK, func(o uint32) bool { return !x.nodes[o].Deleted })
+	res := x.search(query, topK, func(o uint32) bool { n := x.nodes[o]; return n != nil && !n.Deleted })
 	out := make([]Result, len(res))
 	for i, r := range res {
 		out[i] = Result{Key: x.nodes[r.ord].Key, Score: r.score}
