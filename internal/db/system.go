@@ -118,6 +118,8 @@ func virtualRows(ks, table string) func(d *DB) []map[string][]byte {
 		return columnRows
 	case "system_schema.types":
 		return typeRows
+	case "system_schema.indexes":
+		return indexRows
 	}
 	return func(*DB) []map[string][]byte { return nil }
 }
@@ -389,6 +391,32 @@ func typeRows(d *DB) []map[string][]byte {
 				"field_names":   textListV(u.Fields),
 				"field_types":   textListV(ft),
 			})
+		}
+	}
+	return out
+}
+
+func indexRows(d *DB) []map[string][]byte {
+	var out []map[string][]byte
+	for _, k := range sortedKeyspaces(d) {
+		for _, t := range k.Tables {
+			for _, ix := range t.Indexes {
+				kind, opts := "COMPOSITES", map[string]string{"target": ix.targetString()}
+				if ix.Class != "" {
+					kind = "CUSTOM"
+					opts["class_name"] = ix.Class
+				}
+				for k, v := range ix.Options {
+					opts[k] = v
+				}
+				out = append(out, map[string][]byte{
+					"keyspace_name": textV(k.Name),
+					"table_name":    textV(t.Name),
+					"index_name":    textV(ix.Name),
+					"kind":          textV(kind),
+					"options":       textMapV(opts),
+				})
+			}
 		}
 	}
 	return out

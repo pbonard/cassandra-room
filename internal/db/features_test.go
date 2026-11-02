@@ -1,7 +1,11 @@
 package db
 
 import (
+	"fmt"
+	"sort"
 	"testing"
+
+	"github.com/datastax/go-cassandra-native-protocol/message"
 
 	"github.com/stretchr/testify/require"
 )
@@ -60,4 +64,57 @@ func TestConditionalBatch(t *testing.T) {
 		UPDATE acct SET balance = 0 WHERE owner = 'a' AND id = 1 IF balance = 70;
 		UPDATE acct SET balance = 0 WHERE owner = 'b' AND id = 1;
 		APPLY BATCH`, "cannot span multiple partitions")
+}
+
+func TestSecondaryIndex(t *testing.T) {
+	s := newKS(t)
+	s.ok("CREATE TABLE users (id int, sub int, email text, age int, tags set<text>, attrs map<text, int>, PRIMARY KEY (id, sub))")
+	for i := 0; i < 20; i++ {
+		s.ok("INSERT INTO users (id, sub, email, age) VALUES (?, 0, ?, ?)", i, fmt.Sprintf("u%d@x", i%5), i)
+		s.ok("UPDATE users SET tags = tags + {'"+fmt.Sprint("t", i%3)+"'}, attrs['k"+fmt.Sprint(i%2)+"'] = 1 WHERE id = ? AND sub = 0", i)
+	}
+	s.fails("SELECT id FROM users WHERE email = 'u1@x'", "ALLOW FILTERING")
+	s.ok("CREATE INDEX ON users (email)") // indexes existing rows
+	s.ok("CREATE INDEX tags_idx ON users (tags)")
+	s.ok("CREATE INDEX ON users (keys(attrs))")
+	s.ok("CREATE CUSTOM INDEX age_sai ON users (age) USING 'StorageAttachedIndex'")
+	s.fails("CREATE INDEX ON users (email)", "already exists")
+	ids := func(q string) []string {
+		out := s.cqlRows(q)
+		sort.Strings(out)
+		return out
+	}
+	require.Equal(t, []string{"1", "11", "16", "6"}, ids("SELECT id FROM users WHERE email = 'u1@x'"))
+	require.Len(t, ids("SELECT id FROM users WHERE tags CONTAINS 't0'"), 7)
+	require.Len(t, ids("SELECT id FROM users WHERE attrs CONTAINS KEY 'k1'"), 10)
+	require.Equal(t, []string{"17", "18", "19"}, ids("SELECT id FROM users WHERE age > 16"))
+	require.Equal(t, []string{"0", "1"}, ids("SELECT id FROM users WHERE age <= 1"))
+	// Other restrictions with an index need ALLOW FILTERING.
+	s.fails("SELECT id FROM users WHERE email = 'u1@x' AND age > 5", "ALLOW FILTERING")
+	require.Equal(t, []string{"11", "16", "6"}, ids("SELECT id FROM users WHERE email = 'u1@x' AND age > 5 ALLOW FILTERING"))
+	// Updates and deletions leave stale entries, which reads skip.
+	s.ok("UPDATE users SET email = 'moved' WHERE id = 1 AND sub = 0")
+	s.ok("DELETE FROM users WHERE id = 6")
+	require.Equal(t, []string{"11", "16"}, ids("SELECT id FROM users WHERE email = 'u1@x'"))
+	require.Equal(t, []string{"1"}, ids("SELECT id FROM users WHERE email = 'moved'"))
+	// Paging through an index.
+	p, err := s.d.Prepare("ks", "SELECT id FROM users WHERE tags CONTAINS 't1'")
+	require.NoError(t, err)
+	var got int
+	var state []byte
+	for {
+		res := s.d.Execute(p, &RequestOptions{PageSize: 2, PagingState: state}).(*message.RowsResult)
+		got += len(res.Data)
+		if res.Metadata.PagingState == nil {
+			break
+		}
+		state = res.Metadata.PagingState
+	}
+	require.Equal(t, 7, got)
+	require.Len(t, s.rows("SELECT index_name FROM system_schema.indexes WHERE keyspace_name = 'ks'"), 4)
+	s.fails("ALTER TABLE users DROP email", "dependent secondary indexes")
+	s.ok("DROP INDEX tags_idx")
+	s.fails("SELECT id FROM users WHERE tags CONTAINS 't0'", "ALLOW FILTERING")
+	s.ok("TRUNCATE users")
+	require.Empty(t, ids("SELECT id FROM users WHERE email = 'u2@x'"))
 }

@@ -83,6 +83,9 @@ func (d *describeStmt) execute(e *execCtx) (message.Message, error) {
 		}
 		for _, t := range tables(k) {
 			element(k.Name, "table", t.Name, tableCQL(t))
+			for _, ix := range t.Indexes {
+				element(k.Name, "index", ix.Name, indexCQL(t, ix))
+			}
 		}
 	}
 	keyspace := func(name string) (*Keyspace, error) {
@@ -302,4 +305,13 @@ func typeCQL(k *Keyspace, u UserType) string {
 	}
 	b.WriteString(");")
 	return b.String()
+}
+
+// indexCQL is IndexMetadata.toCqlString.
+func indexCQL(t *Table, ix *Index) string {
+	stmt := fmt.Sprintf("CREATE INDEX %s ON %s.%s (%s);", quoteName(ix.Name), quoteName(t.Keyspace), quoteName(t.Name), ix.targetString())
+	if ix.Class != "" {
+		stmt = fmt.Sprintf("CREATE CUSTOM INDEX %s ON %s.%s (%s) USING '%s';", quoteName(ix.Name), quoteName(t.Keyspace), quoteName(t.Name), ix.targetString(), ix.Class)
+	}
+	return stmt
 }

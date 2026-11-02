@@ -38,6 +38,14 @@ func (d *DB) prepareDDL(session string, st cql.Statement) (*ddlStmt, error) {
 		if _, err := keyspaceOf(s.Keyspace, session); err != nil {
 			return nil, err
 		}
+	case *cql.CreateIndex:
+		if _, err := keyspaceOf(s.Keyspace, session); err != nil {
+			return nil, err
+		}
+	case *cql.DropIndex:
+		if _, err := keyspaceOf(s.Keyspace, session); err != nil {
+			return nil, err
+		}
 	case *cql.CreateType:
 		if _, err := keyspaceOf(s.Keyspace, session); err != nil {
 			return nil, err
@@ -138,7 +146,7 @@ func (s *ddlStmt) execute(e *execCtx) (message.Message, error) {
 		delete(next.Keyspaces, st.Keyspace)
 		var ids []lsm.TableID
 		for _, t := range k.Tables {
-			ids = append(ids, t.Storage)
+			ids = append(ids, t.storageIDs()...)
 		}
 		after = func() error { return d.dropStorage(ids...) }
 		res = schemaChange(primitive.SchemaChangeTypeDropped, st.Keyspace, "")
@@ -162,8 +170,7 @@ func (s *ddlStmt) execute(e *execCtx) (message.Message, error) {
 			return nil, err
 		}
 		copy(t.ID[:], newTimeUUID(e.now))
-		t.Storage = lsm.TableID(d.local.NextStorageID)
-		d.local.NextStorageID++
+		t.Storage = d.newStorageID()
 		d.pending.Store(t)
 		defer d.pending.Store(nil)
 		if _, err := d.engine.CreateTable(t.Storage); err != nil {
@@ -211,7 +218,7 @@ func (s *ddlStmt) execute(e *execCtx) (message.Message, error) {
 			return nil, unauthorizedf("%s keyspace is not user-modifiable", ksName)
 		}
 		delete(next.Keyspaces[ksName].Tables, st.Table)
-		after = func() error { return d.dropStorage(t.Storage) }
+		after = func() error { return d.dropStorage(t.storageIDs()...) }
 		res = schemaChange(primitive.SchemaChangeTypeDropped, ksName, st.Table)
 	case *cql.Truncate:
 		ksName, _ := keyspaceOf(st.Keyspace, s.session)
@@ -222,19 +229,100 @@ func (s *ddlStmt) execute(e *execCtx) (message.Message, error) {
 		if t.virtual != nil {
 			return nil, invalidf("Cannot truncate virtual table %s.%s", ksName, st.Table)
 		}
-		// Truncation switches the table to new, empty storage.
+		// Truncation switches the table and its indexes to new, empty
+		// storage.
 		nt := *t
-		nt.Storage = lsm.TableID(d.local.NextStorageID)
-		d.local.NextStorageID++
+		nt.Storage = d.newStorageID()
 		d.pending.Store(&nt)
 		defer d.pending.Store(nil)
 		if _, err := d.engine.CreateTable(nt.Storage); err != nil {
 			return nil, err
 		}
+		nt.Indexes = nil
+		for _, ix := range t.Indexes {
+			nix := *ix
+			nix.Storage = d.newStorageID()
+			if _, err := d.engine.CreateTable(nix.Storage); err != nil {
+				return nil, err
+			}
+			nt.Indexes = append(nt.Indexes, &nix)
+		}
 		nt.index()
 		next.Keyspaces[ksName].Tables[st.Table] = &nt
-		after = func() error { return d.dropStorage(t.Storage) }
+		after = func() error { return d.dropStorage(t.storageIDs()...) }
 		res = &message.VoidResult{}
+	case *cql.CreateIndex:
+		ksName, _ := keyspaceOf(st.Keyspace, s.session)
+		t, err := cur.table(ksName, st.Table)
+		if err != nil {
+			return nil, err
+		}
+		if t.virtual != nil {
+			return nil, invalidf("Secondary indexes are not supported on virtual tables")
+		}
+		ix, err := newIndex(t, st)
+		if err != nil {
+			return nil, err
+		}
+		for _, other := range cur.Keyspaces[ksName].Tables {
+			for _, o := range other.Indexes {
+				if o.Name == ix.Name {
+					if st.IfNotExists {
+						return &message.VoidResult{}, nil
+					}
+					return nil, invalidf("Index '%s' already exists", ix.Name)
+				}
+				if other == t && o.Column == ix.Column && o.Target == ix.Target {
+					if st.IfNotExists {
+						return &message.VoidResult{}, nil
+					}
+					return nil, invalidf("Index %s is a duplicate of existing index %s", ix.Name, o.Name)
+				}
+			}
+		}
+		ix.Storage = d.newStorageID()
+		if _, err := d.engine.CreateTable(ix.Storage); err != nil {
+			return nil, err
+		}
+		nt := *t
+		nt.Indexes = append(slices.Clone(t.Indexes), ix)
+		nt.index()
+		next.Keyspaces[ksName].Tables[st.Table] = &nt
+		// Writes maintain the index once the schema has it; then the
+		// existing rows are indexed.
+		after = func() error {
+			d.tableMu.RLock()
+			defer d.tableMu.RUnlock()
+			return d.buildIndex(&nt, ix, e.nowSec)
+		}
+		res = schemaChange(primitive.SchemaChangeTypeUpdated, ksName, st.Table)
+	case *cql.DropIndex:
+		ksName, _ := keyspaceOf(st.Keyspace, s.session)
+		k, ok := cur.Keyspaces[ksName]
+		if !ok {
+			return nil, invalidf("Keyspace '%s' doesn't exist", ksName)
+		}
+		var found *Table
+		var ix *Index
+		for _, t := range k.Tables {
+			for _, o := range t.Indexes {
+				if o.Name == st.Name {
+					found, ix = t, o
+				}
+			}
+		}
+		if found == nil {
+			if st.IfExists {
+				return &message.VoidResult{}, nil
+			}
+			return nil, invalidf("Index '%s.%s' doesn't exist", ksName, st.Name)
+		}
+		nt := *found
+		nt.Indexes = slices.DeleteFunc(slices.Clone(found.Indexes), func(o *Index) bool { return o == ix })
+		nt.index()
+		next.Keyspaces[ksName].Tables[found.Name] = &nt
+		after = func() error { return d.dropStorage(ix.Storage) }
+		res = schemaChange(primitive.SchemaChangeTypeUpdated, ksName, found.Name)
 	case *cql.CreateType, *cql.AlterType, *cql.DropType:
 		var err error
 		if res, err = s.typeChange(next); err != nil {
@@ -314,6 +402,11 @@ func alterTable(k *Keyspace, t *Table, st *cql.AlterTable) (*Table, error) {
 		}
 		if c.Kind == PartitionKey || c.Kind == Clustering {
 			return nil, invalidf("Cannot drop PRIMARY KEY column %s", name)
+		}
+		for _, ix := range nt.Indexes {
+			if ix.Column == name {
+				return nil, invalidf("Cannot drop column %s because it has dependent secondary indexes (%s)", name, ix.Name)
+			}
 		}
 		// Dropped columns' cells are ignored from now on: a re-added column
 		// gets a new id.
@@ -484,4 +577,19 @@ func referencesType(t *types.Type, name string) bool {
 		return true
 	}
 	return slices.ContainsFunc(t.Elems, func(e *types.Type) bool { return referencesType(e, name) })
+}
+
+func (d *DB) newStorageID() lsm.TableID {
+	id := lsm.TableID(d.local.NextStorageID)
+	d.local.NextStorageID++
+	return id
+}
+
+// storageIDs are the storage tables of a table and its indexes.
+func (t *Table) storageIDs() []lsm.TableID {
+	ids := []lsm.TableID{t.Storage}
+	for _, ix := range t.Indexes {
+		ids = append(ids, ix.Storage)
+	}
+	return ids
 }

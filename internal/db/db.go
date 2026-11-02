@@ -137,16 +137,16 @@ func Open(dir string, opts Options) (*DB, error) {
 	d.engine = e
 	// Create missing storage (a crash between creating a table's storage
 	// and saving the schema), and drop orphans.
-	for _, t := range d.schema.Load().byStorage {
-		if _, err := e.Table(t.Storage); errors.Is(err, lsm.ErrUnknownTable) {
-			if _, err := e.CreateTable(t.Storage); err != nil {
+	for id := range d.schema.Load().storage {
+		if _, err := e.Table(id); errors.Is(err, lsm.ErrUnknownTable) {
+			if _, err := e.CreateTable(id); err != nil {
 				e.Close()
 				return nil, err
 			}
 		}
 	}
 	for id := lsm.TableID(1); uint64(id) < d.local.NextStorageID; id++ {
-		if _, ok := d.schema.Load().byStorage[id]; !ok {
+		if !d.schema.Load().storage[id] {
 			if err := e.DropTable(id); err != nil && !errors.Is(err, lsm.ErrUnknownTable) {
 				e.Close()
 				return nil, err

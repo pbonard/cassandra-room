@@ -471,6 +471,11 @@ func (m *modification) addMutations(e *execCtx, b *lsm.Batch) error {
 	put := func(key []byte, r *row.Row) {
 		buf = row.Append(buf[:0], r)
 		b.Put(t.Storage, key, buf)
+		if len(t.Indexes) > 0 && len(r.Cells) > 0 && (len(t.Clustering) == 0 || key[len(key)-1] == types.Terminator) {
+			if err := t.addEntries(b, key, r.Cells, e.nowSec); err != nil {
+				panic(err) // values were validated
+			}
+		}
 	}
 	for _, pk := range pks {
 		p := partitionPrefix(pk)

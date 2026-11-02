@@ -182,6 +182,8 @@ func (p *parser) statement() (Statement, error) {
 		switch {
 		case p.isWordAt(1, "type"):
 			return p.createType()
+		case p.isWordAt(1, "index"), p.isWordAt(1, "custom") && p.isWordAt(2, "index"):
+			return p.createIndex()
 		case p.isWordAt(1, "keyspace"), p.isWordAt(1, "schema"):
 			return p.createKeyspace()
 		case p.isWordAt(1, "table"), p.isWordAt(1, "columnfamily"):
@@ -198,6 +200,14 @@ func (p *parser) statement() (Statement, error) {
 		}
 	case "drop":
 		switch {
+		case p.isWordAt(1, "index"):
+			p.i += 2
+			ifExists, err := p.ifExists()
+			if err != nil {
+				return nil, err
+			}
+			ks, name, err := p.tableName()
+			return &DropIndex{Keyspace: ks, Name: name, IfExists: ifExists}, err
 		case p.isWordAt(1, "type"):
 			p.i += 2
 			ifExists, err := p.ifExists()
@@ -1546,6 +1556,84 @@ func (p *parser) alterType() (*AlterType, error) {
 		}
 	default:
 		return nil, &UnsupportedError{Statement: "ALTER TYPE"}
+	}
+	return s, nil
+}
+
+func (p *parser) createIndex() (*CreateIndex, error) {
+	p.next()
+	custom := p.word("custom")
+	p.next() // index
+	s := &CreateIndex{}
+	var err error
+	if s.IfNotExists, err = p.ifNotExists(); err != nil {
+		return nil, err
+	}
+	if !p.isWord("on") {
+		if s.Name, err = p.ident(); err != nil {
+			return nil, err
+		}
+	}
+	if err := p.expectWord("on"); err != nil {
+		return nil, err
+	}
+	if s.Keyspace, s.Table, err = p.tableName(); err != nil {
+		return nil, err
+	}
+	if err := p.expectPunct("("); err != nil {
+		return nil, err
+	}
+	for _, target := range []string{"keys", "values", "entries", "full"} {
+		if p.isWord(target) && p.isPunctAt(1, "(") {
+			p.i += 2
+			s.Target = target
+			break
+		}
+	}
+	if s.Column, err = p.ident(); err != nil {
+		return nil, err
+	}
+	if s.Target != "" {
+		if err := p.expectPunct(")"); err != nil {
+			return nil, err
+		}
+	}
+	if err := p.expectPunct(")"); err != nil {
+		return nil, err
+	}
+	if p.word("using") {
+		t := p.next()
+		if t.kind != tString {
+			return nil, p.errorf("mismatched input '%s' expecting STRING_LITERAL", t.text)
+		}
+		s.Class = t.text
+		if p.word("with") {
+			if err := p.expectWord("options"); err != nil {
+				return nil, err
+			}
+			if err := p.expectPunct("="); err != nil {
+				return nil, err
+			}
+			m, err := p.mapOrSet()
+			if err != nil {
+				return nil, err
+			}
+			ml, ok := m.(*MapLiteral)
+			if !ok {
+				return nil, p.errorf("index options must be a map")
+			}
+			s.Options = map[string]string{}
+			for i := range ml.Keys {
+				k, ok1 := ml.Keys[i].(*Literal)
+				v, ok2 := ml.Values[i].(*Literal)
+				if !ok1 || !ok2 {
+					return nil, p.errorf("index options must be strings")
+				}
+				s.Options[k.Text] = v.Text
+			}
+		}
+	} else if custom {
+		return nil, p.errorf("CUSTOM index requires USING")
 	}
 	return s, nil
 }

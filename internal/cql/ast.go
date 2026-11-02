@@ -297,9 +297,29 @@ type DropType struct {
 	IfExists       bool
 }
 
-func (*CreateType) stmt() {}
-func (*AlterType) stmt()  {}
-func (*DropType) stmt()   {}
+// CreateIndex is CREATE [CUSTOM] INDEX.
+type CreateIndex struct {
+	Keyspace, Table, Name string
+	IfNotExists           bool
+	Column                string
+	// Target is "values", "keys", "entries", "full", or "" (the column's
+	// default).
+	Target  string
+	Class   string // USING 'class'
+	Options map[string]string
+}
+
+// DropIndex is DROP INDEX.
+type DropIndex struct {
+	Keyspace, Name string
+	IfExists       bool
+}
+
+func (*CreateIndex) stmt() {}
+func (*DropIndex) stmt()   {}
+func (*CreateType) stmt()  {}
+func (*AlterType) stmt()   {}
+func (*DropType) stmt()    {}
 
 // Truncate is TRUNCATE.
 type Truncate struct{ Keyspace, Table string }

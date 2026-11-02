@@ -34,6 +34,7 @@ type selectStmt struct {
 	// (a partially restricted partition key with ALLOW FILTERING).
 	partitionFilters []filter
 	md               []*message.ColumnMetadata
+	index            *indexPlan
 	json             bool
 	groupBy          []*Column // a prefix of the primary key
 }
@@ -138,8 +139,14 @@ func (d *DB) prepareSelect(s *Schema, session string, st *cql.Select, vs *vars) 
 		}
 		w.pk = make([]*valuesTerm, len(t.PartitionKey))
 	}
+	if !w.pkComplete() && w.token == nil {
+		sel.index = findIndex(t, w.filters)
+	}
 	if !st.AllowFiltering {
-		if slices.ContainsFunc(w.filters, func(f filter) bool { return f.tuple == nil }) {
+		needs := func(f filter) bool {
+			return f.tuple == nil && (sel.index == nil || f.col != sel.index.f.col || f.op != sel.index.f.op)
+		}
+		if slices.ContainsFunc(w.filters, needs) {
 			if w.filters[0].col.Kind == Clustering && len(w.filters) > 0 {
 				c := w.filters[0].col
 				if c.Position > 0 && (len(w.ck) < c.Position) {
@@ -148,7 +155,7 @@ func (d *DB) prepareSelect(s *Schema, session string, st *cql.Select, vs *vars) 
 			}
 			return nil, filteringError()
 		}
-		if !w.pkComplete() && (len(w.ck) > 0 || w.slice != nil) {
+		if !w.pkComplete() && (len(w.ck) > 0 || w.slice != nil) && sel.index == nil {
 			return nil, filteringError()
 		}
 	}
@@ -572,6 +579,7 @@ type query struct {
 	exhausted bool
 	part      partState
 	groupKey  []byte
+	indexKey  []byte // the index entry being read, in index scans
 }
 
 func (q *query) run() (message.Message, error) {
@@ -645,6 +653,10 @@ func (q *query) run() (message.Message, error) {
 		}
 		if !q.done() {
 			q.exhausted = true
+		}
+	} else if s.index != nil {
+		if err := q.scanIndex(s.index); err != nil {
+			return nil, err
 		}
 	} else {
 		if err := q.scan(); err != nil {
@@ -1122,6 +1134,9 @@ func (q *query) output(r *rowData, key []byte, staticOnly bool) error {
 	}
 	q.count++
 	q.lastKey, q.lastStat = key, staticOnly
+	if q.indexKey != nil {
+		q.lastKey = q.indexKey
+	}
 	if q.agg != nil {
 		return q.agg.add(q, r)
 	}

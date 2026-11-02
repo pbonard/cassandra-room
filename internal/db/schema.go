@@ -55,6 +55,7 @@ type Table struct {
 	NextColumnID   uint32
 	Params         TableParams
 	HasStatic      bool
+	Indexes        []*Index
 
 	// virtual tables (system keyspaces) generate their rows on reads.
 	virtual func(db *DB) []map[string][]byte
@@ -73,6 +74,11 @@ func (t *Table) AllColumns() []*Column {
 }
 
 func (t *Table) index() {
+	defer func() {
+		for _, ix := range t.Indexes {
+			ix.col = t.byName[ix.Column]
+		}
+	}()
 	t.byName = map[string]*Column{}
 	t.byID = map[uint32]*Column{}
 	t.HasStatic = false
@@ -174,6 +180,8 @@ type Schema struct {
 	Keyspaces map[string]*Keyspace
 	Version   [16]byte
 	byStorage map[lsm.TableID]*Table
+	// storage holds every storage table in use: tables' and indexes'.
+	storage map[lsm.TableID]bool
 }
 
 func (s *Schema) table(ks, name string) (*Table, error) {
@@ -207,6 +215,7 @@ func (s *Schema) clone() *Schema {
 // keyspaces' definitions (as Cassandra's schema version).
 func (s *Schema) finish() {
 	s.byStorage = map[lsm.TableID]*Table{}
+	s.storage = map[lsm.TableID]bool{}
 	h := md5.New()
 	names := make([]string, 0, len(s.Keyspaces))
 	for n := range s.Keyspaces {
@@ -222,6 +231,10 @@ func (s *Schema) finish() {
 			tnames = append(tnames, tn)
 			if t.virtual == nil {
 				s.byStorage[t.Storage] = t
+				s.storage[t.Storage] = true
+				for _, ix := range t.Indexes {
+					s.storage[ix.Storage] = true
+				}
 			}
 		}
 		sort.Strings(tnames)
@@ -707,6 +720,7 @@ type tableJSON struct {
 	Columns        []columnJSON
 	NextColumnID   uint32
 	Params         TableParams
+	Indexes        []*Index `json:",omitempty"`
 }
 
 type columnJSON struct {
@@ -719,7 +733,7 @@ type columnJSON struct {
 
 func marshalTable(t *Table) ([]byte, error) {
 	j := tableJSON{Keyspace: t.Keyspace, Name: t.Name, ID: types.FormatUUID(t.ID[:]), Storage: uint64(t.Storage),
-		NextColumnID: t.NextColumnID, Params: t.Params}
+		NextColumnID: t.NextColumnID, Params: t.Params, Indexes: t.Indexes}
 	conv := func(cs []*Column) []columnJSON {
 		var out []columnJSON
 		for _, c := range cs {
@@ -740,7 +754,7 @@ func unmarshalTable(b []byte, resolve func(string) (*types.Type, error)) (*Table
 	if err != nil {
 		return nil, err
 	}
-	t := &Table{Keyspace: j.Keyspace, Name: j.Name, ID: id, Storage: lsm.TableID(j.Storage), NextColumnID: j.NextColumnID, Params: j.Params}
+	t := &Table{Keyspace: j.Keyspace, Name: j.Name, ID: id, Storage: lsm.TableID(j.Storage), NextColumnID: j.NextColumnID, Params: j.Params, Indexes: j.Indexes}
 	conv := func(cs []columnJSON, kind ColumnKind) ([]*Column, error) {
 		var out []*Column
 		for i, c := range cs {
