@@ -578,6 +578,14 @@ func (p *parser) relation() (Relation, error) {
 			return r, err
 		}
 		r.Columns = []string{c}
+		if p.punct("[") {
+			if r.MapKey, err = p.term(); err != nil {
+				return r, err
+			}
+			if err := p.expectPunct("]"); err != nil {
+				return r, err
+			}
+		}
 	}
 	t := p.peek()
 	switch {

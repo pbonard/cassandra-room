@@ -197,14 +197,14 @@ func (o *TableOptions) windowOfTS(ts int64) int64 {
 // when output is not segregated (outside the time-window mode, in
 // Cassandra's TWCS behaviour, or with a Merger that cannot split).
 func (t *Table) timeSplitter() func(v []byte) ([]row.Part, error) {
-	if t.opts.TimeWindow <= 0 || t.opts.TimeWindowCassandra {
+	if t.o().TimeWindow <= 0 || t.o().TimeWindowCassandra {
 		return nil
 	}
 	sp, ok := t.e.merger.(TimeSplitter)
 	if !ok {
 		return nil
 	}
-	bucket := t.opts.windowOfTS
+	bucket := t.o().windowOfTS
 	return func(v []byte) ([]row.Part, error) { return sp.SplitByTimestamp(v, bucket) }
 }
 
@@ -234,8 +234,8 @@ func (o *TableOptions) threshold(level int) int {
 // flushSizeBytes is Controller.getFlushSizeBytes: the override, or the
 // observed flush size rounded up to a whole MiB.
 func (t *Table) flushSizeBytesLocked() float64 {
-	if t.opts.FlushSizeOverride > 0 {
-		return float64(t.opts.FlushSizeOverride)
+	if t.o().FlushSizeOverride > 0 {
+		return float64(t.o().FlushSizeOverride)
 	}
 	return math.Ceil(t.flushSize/(1<<20)) * (1 << 20)
 }
@@ -262,7 +262,7 @@ type ucsLevel struct {
 func (t *Table) formLevelsLocked(files []*fileMeta) []*ucsLevel {
 	files = slices.Clone(files)
 	slices.SortFunc(files, func(a, b *fileMeta) int { return cmp.Compare(density(a), density(b)) })
-	f0 := float64(t.opts.fanout(0))
+	f0 := float64(t.o().fanout(0))
 	base := max(1<<20, t.flushSizeBytesLocked()) * (1 - 0.9/f0)
 	maxDensity := math.Floor(base * f0)
 	levels := []*ucsLevel{}
@@ -275,7 +275,7 @@ func (t *Table) formLevelsLocked(files []*fileMeta) []*ucsLevel {
 			minDensity := level.max
 			level = &ucsLevel{
 				index: next, min: minDensity,
-				max: math.Floor(minDensity * float64(t.opts.fanout(next))),
+				max: math.Floor(minDensity * float64(t.o().fanout(next))),
 			}
 		}
 		level.files = append(level.files, f)
@@ -433,12 +433,12 @@ func (b *ucsBucket) pullOldest(limit int) []*fileMeta {
 // preserve the hierarchy's structure.
 func (t *Table) constructPick(index int, b *ucsBucket) []*fileMeta {
 	count := b.maxOverlap
-	fanout := t.opts.fanout(index)
-	maxToCompact := max(fanout, t.opts.MaxSSTablesToCompact)
+	fanout := t.o().fanout(index)
+	maxToCompact := max(fanout, t.o().MaxSSTablesToCompact)
 	switch {
 	case count <= fanout:
 		return b.files()
-	case count <= fanout*t.opts.fanout(index+1) || maxToCompact == fanout:
+	case count <= fanout*t.o().fanout(index+1) || maxToCompact == fanout:
 		if count <= maxToCompact {
 			return b.files()
 		}
@@ -452,16 +452,16 @@ func (t *Table) constructPick(index int, b *ucsBucket) []*fileMeta {
 // behind, compact as many sstables as needed to reach a level directly.
 func (t *Table) selectPickSize(index, count, maxToCompact int) int {
 	limit := min(maxToCompact, count)
-	pickSize, nextStep := 0, t.opts.fanout(index)
+	pickSize, nextStep := 0, t.o().fanout(index)
 	for i := index; ; {
 		pickSize = nextStep
 		i++
-		nextStep *= t.opts.fanout(i)
+		nextStep *= t.o().fanout(i)
 		if nextStep > limit {
 			break
 		}
 	}
-	if t.opts.scalingParameter(index) < 0 {
+	if t.o().scalingParameter(index) < 0 {
 		pickSize *= limit / pickSize
 	}
 	return pickSize
@@ -482,7 +482,7 @@ func (t *Table) ucsPickLocked(files []*fileMeta) []*fileMeta {
 	var best []*fileMeta
 	bestOverlap := 0
 	for _, level := range t.formLevelsLocked(files) {
-		threshold := t.opts.threshold(level.index)
+		threshold := t.o().threshold(level.index)
 		var chosen *ucsBucket
 		matching := 0
 		buckets := assignBuckets(threshold, overlapSets(level.files))
@@ -530,7 +530,7 @@ func (t *Table) timeWindowPickLocked(files []*fileMeta) []*fileMeta {
 	windows := map[int64][]*fileMeta{}
 	var keys []int64
 	for _, f := range files {
-		w := t.opts.timeWindow(f)
+		w := t.o().timeWindow(f)
 		if windows[w] == nil {
 			keys = append(keys, w)
 		}
@@ -548,14 +548,14 @@ func (t *Table) timeWindowPickLocked(files []*fileMeta) []*fileMeta {
 	for _, w := range keys {
 		fs := windows[w]
 		switch {
-		case len(fs) >= t.opts.MinThreshold && w >= now:
-			if p := mostInterestingBucket(stcsBuckets(fs, &t.opts), t.opts.MinThreshold, t.opts.MaxThreshold); p != nil {
+		case len(fs) >= t.o().MinThreshold && w >= now:
+			if p := mostInterestingBucket(stcsBuckets(fs, t.o()), t.o().MinThreshold, t.o().MaxThreshold); p != nil {
 				return p
 			}
 		case len(fs) >= 2 && w < now:
 			// trimToThreshold: the smallest sstables, up to MaxThreshold.
 			slices.SortStableFunc(fs, func(a, b *fileMeta) int { return cmp.Compare(a.size, b.size) })
-			return fs[:min(len(fs), t.opts.MaxThreshold)]
+			return fs[:min(len(fs), t.o().MaxThreshold)]
 		}
 	}
 	return nil
@@ -621,7 +621,7 @@ func (t *Table) timeWindowPickScyllaLocked(files []*fileMeta) []*fileMeta {
 	windows := map[int64][]*fileMeta{}
 	var keys []int64
 	for _, f := range files {
-		w := t.opts.timeWindow(f)
+		w := t.o().timeWindow(f)
 		if windows[w] == nil {
 			keys = append(keys, w)
 		}
@@ -648,7 +648,7 @@ func (t *Table) timeWindowPickScyllaLocked(files []*fileMeta) []*fileMeta {
 		}
 		threshold := 2
 		if last {
-			threshold = t.opts.MinThreshold
+			threshold = t.o().MinThreshold
 		}
 		switch {
 		case len(units) >= 2 && !last && t.recentWindows[w]:
@@ -657,14 +657,14 @@ func (t *Table) timeWindowPickScyllaLocked(files []*fileMeta) []*fileMeta {
 			}
 			// trim_to_threshold: the smallest runs, up to MaxThreshold.
 			slices.SortStableFunc(units, func(a, b *twUnit) int { return cmp.Compare(a.size, b.size) })
-			return unitFiles(units[:min(len(units), t.opts.MaxThreshold)])
+			return unitFiles(units[:min(len(units), t.o().MaxThreshold)])
 		case len(units) >= threshold:
 			sizes := make([]uint64, len(units))
 			for i, u := range units {
 				sizes[i] = u.size
 			}
 			var picked []*twUnit
-			for _, i := range mostInterestingBucketIdx(stcsBucketsIdx(sizes, &t.opts), sizes, threshold, t.opts.MaxThreshold) {
+			for _, i := range mostInterestingBucketIdx(stcsBucketsIdx(sizes, t.o()), sizes, threshold, t.o().MaxThreshold) {
 				picked = append(picked, units[i])
 			}
 			if len(picked) > 0 {
@@ -790,8 +790,8 @@ func (t *Table) pickCompactionLocked() []*fileMeta {
 			candidates = append(candidates, f)
 		}
 	}
-	if t.opts.TimeWindow > 0 {
-		if t.opts.TimeWindowCassandra {
+	if t.o().TimeWindow > 0 {
+		if t.o().TimeWindowCassandra {
 			return t.timeWindowPickLocked(candidates)
 		}
 		return t.timeWindowPickScyllaLocked(candidates)
@@ -819,7 +819,7 @@ type compactionPick struct {
 // tombstones.
 func (t *Table) nextCompactionLocked() *compactionPick {
 	now := t.e.opts.Now()
-	if t.opts.ExpiredCheckInterval < 0 || now.Sub(t.lastExpiredCheck) >= t.opts.ExpiredCheckInterval {
+	if t.o().ExpiredCheckInterval < 0 || now.Sub(t.lastExpiredCheck) >= t.o().ExpiredCheckInterval {
 		t.lastExpiredCheck = now
 		if expired := t.fullyExpiredLocked(now.Unix()); len(expired) > 0 {
 			return &compactionPick{inputs: expired, dropOnly: true}
@@ -833,7 +833,7 @@ func (t *Table) nextCompactionLocked() *compactionPick {
 	}
 	// ScyllaDB ICS's cross-tier jobs run only once the table has no other
 	// compaction, as there.
-	if t.opts.TimeWindow <= 0 && !slices.ContainsFunc(t.files, func(f *fileMeta) bool { return f.compacting }) {
+	if t.o().TimeWindow <= 0 && !slices.ContainsFunc(t.files, func(f *fileMeta) bool { return f.compacting }) {
 		if inputs := t.garbageCollectionJobLocked(now.Unix()); len(inputs) >= 2 {
 			return &compactionPick{inputs: inputs, single: true}
 		}
@@ -864,10 +864,10 @@ func (t *Table) levelsWithFiles() []*ucsLevel {
 // the top level), so the tombstones meet that data and can be purged.
 // Levels are searched from the top, as ICS searches tiers from the largest.
 func (t *Table) garbageCollectionJobLocked(nowSec int64) []*fileMeta {
-	if t.opts.TombstoneThreshold < 0 {
+	if t.o().TombstoneThreshold < 0 {
 		return nil
 	}
-	gcBefore := t.opts.gcBefore(nowSec)
+	gcBefore := t.o().gcBefore(nowSec)
 	levels := t.levelsWithFiles()
 	for i := len(levels) - 1; i >= 0; i-- {
 		want := false
@@ -899,7 +899,7 @@ func (t *Table) garbageCollectionJobLocked(nowSec int64) []*fileMeta {
 // hold more than that many times the highest level's size ((S0+S1)/S0),
 // they are compacted together, bounding the space overwritten data takes.
 func (t *Table) spaceAmplificationJobLocked() []*fileMeta {
-	goal := t.opts.SpaceAmplificationGoal
+	goal := t.o().SpaceAmplificationGoal
 	if goal <= 0 {
 		return nil
 	}
@@ -948,12 +948,12 @@ func (t *Table) spaceAmplificationJobLocked() []*fileMeta {
 // treated as holding the oldest data past the bound), which is never less
 // strict for the keys concerned.
 func (t *Table) fullyExpiredLocked(nowSec int64) []*fileMeta {
-	gcBefore := t.opts.gcBefore(nowSec)
+	gcBefore := t.o().gcBefore(nowSec)
 	expiredBy := func(f *fileMeta) bool {
 		return f.stats.valid && f.stats.maxLDT < gcBefore && f.stats.maxLDT <= nowSec
 	}
 	var expired []*fileMeta
-	aggressive := t.opts.TimeWindow > 0 && t.opts.UnsafeAggressiveExpiration
+	aggressive := t.o().TimeWindow > 0 && t.o().UnsafeAggressiveExpiration
 	for _, c := range t.files {
 		if c.compacting || !expiredBy(c) {
 			continue
@@ -1020,7 +1020,7 @@ func (t *Table) memtableMinTSLocked(lo, hi []byte) int64 {
 // estimates that share from index samples; the engine assumes keys spread
 // evenly over the sstable's token span).
 func (t *Table) worthDroppingTombstonesLocked(f *fileMeta, nowSec, gcBefore int64) (float64, bool) {
-	o := &t.opts
+	o := t.o()
 	if !f.stats.valid {
 		return 0, false
 	}
@@ -1066,7 +1066,7 @@ func (t *Table) worthDroppingTombstonesLocked(f *fileMeta, nowSec, gcBefore int6
 // tombstoneCandidateLocked is the first half of worthDroppingTombstones:
 // old enough, and enough droppable tombstones.
 func (t *Table) tombstoneCandidateLocked(f *fileMeta, nowSec, gcBefore int64) bool {
-	o := &t.opts
+	o := t.o()
 	if !f.stats.valid {
 		return false
 	}
@@ -1112,10 +1112,10 @@ func uncoveredTokenShare(f *fileMeta, overlaps []*fileMeta) float64 {
 // has no single-sstable tombstone compactions; the engine adds them to UCS
 // tables, as this design's due-file picking.
 func (t *Table) dueFileLocked(nowSec int64) *fileMeta {
-	if t.opts.TombstoneThreshold < 0 {
+	if t.o().TombstoneThreshold < 0 {
 		return nil
 	}
-	gcBefore := t.opts.gcBefore(nowSec)
+	gcBefore := t.o().gcBefore(nowSec)
 	var best *fileMeta
 	for _, f := range t.files {
 		if f.compacting {
@@ -1127,11 +1127,11 @@ func (t *Table) dueFileLocked(nowSec int64) *fileMeta {
 		switch {
 		case best == nil:
 			best = f
-		case t.opts.TimeWindow > 0 && !t.opts.TimeWindowCassandra && f.minTS < best.minTS:
+		case t.o().TimeWindow > 0 && !t.o().TimeWindowCassandra && f.minTS < best.minTS:
 			best = f // ScyllaDB's TWCS: the oldest data first
-		case t.opts.TimeWindow > 0 && t.opts.TimeWindowCassandra && f.size < best.size:
+		case t.o().TimeWindow > 0 && t.o().TimeWindowCassandra && f.size < best.size:
 			best = f
-		case t.opts.TimeWindow <= 0 && f.size > best.size:
+		case t.o().TimeWindow <= 0 && f.size > best.size:
 			best = f
 		}
 	}
@@ -1261,7 +1261,7 @@ var errCompactionAborted = errors.New("lsm: compaction aborted")
 // fixed token boundaries chosen from the output's estimated density, so a
 // partition is never split and shards can be written in parallel.
 func (t *Table) outputShards(inputs []*fileMeta) [][2][]byte {
-	if t.opts.TimeWindow > 0 {
+	if t.o().TimeWindow > 0 {
 		return [][2][]byte{{nil, nil}}
 	}
 	lo, hi := inputs[0].smallest.UserKey, inputs[0].largest.UserKey
@@ -1273,7 +1273,7 @@ func (t *Table) outputShards(inputs []*fileMeta) [][2][]byte {
 			hi = f.largest.UserKey
 		}
 	}
-	bounds := shardBoundaries(t.opts.numShards(combinedDensity(inputs)))
+	bounds := shardBoundaries(t.o().numShards(combinedDensity(inputs)))
 	var out [][2][]byte
 	var lower []byte
 	for _, b := range bounds {
@@ -1319,7 +1319,7 @@ func (e *Engine) compact(t *Table, p *compactionPick) error {
 		errs[i] = c.compactShard(i)
 		c.shardFinished(i, errs[i])
 	}
-	if t.opts.SerialOutputShards || len(c.shards) <= 1 {
+	if t.o().SerialOutputShards || len(c.shards) <= 1 {
 		for i := range c.shards {
 			if run(i); errs[i] != nil {
 				break
@@ -1494,7 +1494,7 @@ func (c *compaction) installLocked(final bool) error {
 			}
 		}
 	} else {
-		if t.opts.fragmentSize() <= 0 {
+		if t.o().fragmentSize() <= 0 {
 			return nil
 		}
 		ready := map[int]bool{}
@@ -1653,7 +1653,7 @@ func (c *compaction) compactShard(s int) error {
 	}
 
 	nowSec := e.opts.Now().Unix()
-	gcBefore := t.opts.gcBefore(nowSec)
+	gcBefore := t.o().gcBefore(nowSec)
 	purger, _ := e.merger.(Purger)
 	purge := false
 	if purger != nil {
@@ -1738,7 +1738,7 @@ func (c *compaction) compactShard(s int) error {
 		}
 		return err
 	}
-	fragment := uint64(t.opts.fragmentSize())
+	fragment := uint64(t.o().fragmentSize())
 	// Inputs can only be released early if some shard seals a fragment
 	// before the end; below one fragment's worth of input there is nothing
 	// to release, so purged rows need not tie their inputs.
@@ -1749,8 +1749,8 @@ func (c *compaction) compactShard(s int) error {
 	incremental := fragment > 0 && inSize > fragment
 	var filter RowFilter
 	var filterEnv *FilterEnv
-	if t.opts.RowFilter != nil {
-		filter = t.opts.RowFilter()
+	if t.o().RowFilter != nil {
+		filter = t.o().RowFilter()
 		filterEnv = &FilterEnv{NowSec: nowSec, GCBefore: gcBefore, MaxPurgeable: func(lo, hi []byte, minTS, maxTS int64) (int64, error) {
 			if lookup == nil {
 				lookup = &purgeLookup{e: e, t: t, inputs: c.nums}

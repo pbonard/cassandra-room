@@ -112,3 +112,19 @@ func TestPurgeKeepsDeletionOverOlderData(t *testing.T) {
 	defer it.Close()
 	require.False(t, it.First(), "nothing left of the partition")
 }
+
+// TestAlterTableOptionsLive checks that ALTER TABLE options reach the
+// storage engine without a restart.
+func TestAlterTableOptionsLive(t *testing.T) {
+	s := openTest(t, nil)
+	s.ok("CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+	s.ok("CREATE TABLE ks.t (k int PRIMARY KEY, v int)")
+	tbl := s.d.schema.Load().Keyspaces["ks"].Tables["t"]
+	before := s.d.engineTableOptions(tbl.Storage)
+	require.Equal(t, int64(864000), before.GCGraceSeconds)
+	s.ok("ALTER TABLE ks.t WITH gc_grace_seconds = 60 AND compaction = {'class': 'LeveledCompactionStrategy'}")
+	lt, err := s.d.engine.Table(tbl.Storage)
+	require.NoError(t, err)
+	require.Equal(t, int64(60), lt.Options().GCGraceSeconds)
+	require.Equal(t, []int{-8}, lt.Options().ScalingParameters)
+}

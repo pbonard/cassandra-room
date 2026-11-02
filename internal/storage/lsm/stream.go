@@ -341,8 +341,8 @@ func (t *Table) rewriteImported(ext []*externalTable, alloc func() uint64, creat
 		return nil, nil
 	}
 	var boundaries [][]byte
-	if t.opts.TimeWindow <= 0 {
-		boundaries = shardBoundaries(t.opts.numShards(float64(size)))
+	if t.o().TimeWindow <= 0 {
+		boundaries = shardBoundaries(t.o().numShards(float64(size)))
 	}
 	started := false
 	next := func() ([]byte, []byte, uint64, bool, error) {
@@ -362,9 +362,9 @@ func (t *Table) rewriteImported(ext []*externalTable, alloc func() uint64, creat
 	var metas []*fileMeta
 	var err error
 	if split := t.timeSplitter(); split != nil {
-		metas, err = writeByWindow(e.fs, t.dir, alloc, e.writerOpts, e.merger, next, split, t.opts.fragmentSize(), created)
+		metas, err = writeByWindow(e.fs, t.dir, alloc, e.writerOpts, e.merger, next, split, t.o().fragmentSize(), created)
 	} else {
-		metas, err = writeSharded(e.fs, t.dir, alloc, e.writerOpts, e.merger, next, boundaries, t.opts.fragmentSize(), created)
+		metas, err = writeSharded(e.fs, t.dir, alloc, e.writerOpts, e.merger, next, boundaries, t.o().fragmentSize(), created)
 	}
 	if err != nil {
 		return nil, err

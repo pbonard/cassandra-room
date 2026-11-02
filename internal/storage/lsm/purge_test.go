@@ -351,8 +351,9 @@ func TestSTCSBuckets(t *testing.T) {
 // and the current window does not move back when newer files disappear.
 func TestTimeWindowCurrentWindow(t *testing.T) {
 	hour := time.Hour
-	tbl := &Table{opts: TableOptions{TimeWindow: hour, TimeWindowCassandra: true}}
-	tbl.opts.ensureDefaults()
+	tbl := &Table{}
+	tbl.opts.Store(&TableOptions{TimeWindow: hour, TimeWindowCassandra: true})
+	tbl.o().ensureDefaults()
 	h := hour.Microseconds()
 	f := func(window int64, size uint64) *fileMeta {
 		return &fileMeta{maxTS: window*h + 1, size: size, smallest: makeKey("a"), largest: makeKey("z")}
@@ -392,7 +393,7 @@ func TestWorthDroppingTombstones(t *testing.T) {
 	require.NoError(t, tbl.Flush())
 	a := tableFileList(e, tbl)[0]
 	clock.Add(7200)
-	now, gc := clock.Load(), tbl.opts.gcBefore(clock.Load())
+	now, gc := clock.Load(), tbl.o().gcBefore(clock.Load())
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	_, ok := tbl.worthDroppingTombstonesLocked(a, now, gc)
@@ -404,10 +405,10 @@ func TestWorthDroppingTombstones(t *testing.T) {
 	tbl.files = append(tbl.files, b)
 	_, ok = tbl.worthDroppingTombstonesLocked(a, now, gc)
 	require.False(t, ok, "fully overlapped, data older than the tombstones")
-	tbl.opts.UncheckedTombstoneCompaction = true
+	tbl.o().UncheckedTombstoneCompaction = true
 	_, ok = tbl.worthDroppingTombstonesLocked(a, now, gc)
 	require.True(t, ok, "unchecked")
-	tbl.opts.UncheckedTombstoneCompaction = false
+	tbl.o().UncheckedTombstoneCompaction = false
 	// B covering only the first quarter leaves 3/4 of A: 0.75·1 > 0.2.
 	b.largest = makeKey(key(1<<60-1, ""))
 	_, ok = tbl.worthDroppingTombstonesLocked(a, now, gc)
@@ -570,8 +571,9 @@ func TestGarbageCollectionJob(t *testing.T) {
 // density levels whose combined size exceeds goal times the top level's are
 // compacted together.
 func TestSpaceAmplificationJob(t *testing.T) {
-	tbl := &Table{opts: TableOptions{SpaceAmplificationGoal: 1.5, FlushSizeOverride: 1 << 20}}
-	tbl.opts.ensureDefaults()
+	tbl := &Table{}
+	tbl.opts.Store(&TableOptions{SpaceAmplificationGoal: 1.5, FlushSizeOverride: 1 << 20})
+	tbl.o().ensureDefaults()
 	num := uint64(0)
 	f := func(size uint64, a, b string) *fileMeta {
 		num++
@@ -595,7 +597,7 @@ func TestSpaceAmplificationJob(t *testing.T) {
 	}
 	require.Nil(t, tbl.spaceAmplificationJobLocked())
 	big.run = 0
-	tbl.opts.SpaceAmplificationGoal = 0
+	tbl.o().SpaceAmplificationGoal = 0
 	require.Nil(t, tbl.spaceAmplificationJobLocked())
 }
 
@@ -661,8 +663,9 @@ func TestRecoveredSeqAfterPurge(t *testing.T) {
 // compaction from two similar runs instead.
 func TestTimeWindowScyllaRules(t *testing.T) {
 	hour := time.Hour
-	tbl := &Table{opts: TableOptions{TimeWindow: hour}}
-	tbl.opts.ensureDefaults()
+	tbl := &Table{}
+	tbl.opts.Store(&TableOptions{TimeWindow: hour})
+	tbl.o().ensureDefaults()
 	h := hour.Microseconds()
 	// Above and below STCS's min_sstable_size (50 MiB), which groups all
 	// smaller runs together.

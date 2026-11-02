@@ -24,11 +24,11 @@ import (
 // UnifiedCompactionStrategy.Bucket.constructPick comments.
 func TestSelectPickSize(t *testing.T) {
 	tbl := &Table{}
-	tbl.opts = TableOptions{ScalingParameters: []int{2}}
-	tbl.opts.ensureDefaults()
+	tbl.opts.Store(&TableOptions{ScalingParameters: []int{2}})
+	tbl.o().ensureDefaults()
 	// "for w=2 and 55 sstables, pick a compaction of 16 sstables"
 	require.Equal(t, 16, tbl.selectPickSize(0, 55, 64))
-	tbl.opts.ScalingParameters = []int{-2}
+	tbl.o().ScalingParameters = []int{-2}
 	// "for w=-2 and 55, this means pick a compaction of 48"
 	require.Equal(t, 48, tbl.selectPickSize(0, 55, 64))
 
@@ -619,8 +619,9 @@ func TestOverlapSets(t *testing.T) {
 // TestPicksAreDisjoint checks that one table can run several compactions:
 // a pick excludes files other compactions use, and picks never share files.
 func TestPicksAreDisjoint(t *testing.T) {
-	tbl := &Table{opts: TableOptions{ScalingParameters: []int{0}}}
-	tbl.opts.ensureDefaults()
+	tbl := &Table{}
+	tbl.opts.Store(&TableOptions{ScalingParameters: []int{0}})
+	tbl.o().ensureDefaults()
 	f := func(a, b string, ts int64) *fileMeta {
 		return &fileMeta{smallest: makeKey(a), largest: makeKey(b), size: 1000, maxTS: ts}
 	}

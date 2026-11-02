@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"reflect"
 	"fmt"
 	"slices"
 	"time"
@@ -122,6 +123,14 @@ func (d *DB) installLocked(next *Schema) error {
 		return err
 	}
 	d.schema.Store(next)
+	// Options changed by ALTER TABLE take effect now.
+	for id, t := range next.byStorage {
+		if ot := old.byStorage[id]; ot != nil && !reflect.DeepEqual(ot.Params, t.Params) {
+			if lt, err := d.engine.Table(id); err == nil {
+				lt.SetOptions(d.engineTableOptions(id))
+			}
+		}
+	}
 	var gone []lsm.TableID
 	for id := range old.storage {
 		if !next.storage[id] {

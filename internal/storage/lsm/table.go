@@ -25,7 +25,7 @@ type Table struct {
 	imm        []*immMemTable // oldest first
 	files      []*fileMeta    // newest first (by maxSeq)
 	flushedSeq uint64
-	opts       TableOptions
+	opts       atomic.Pointer[TableOptions] // replaced whole by SetOptions
 	// flushSize is a moving average of flush output sizes, UCS's m.
 	flushSize float64
 	// lastExpiredCheck is when fully expired sstables were last looked for.
@@ -54,10 +54,10 @@ type immMemTable struct {
 // UCS shards flush output like compaction output, by its density (the
 // memtable covers the whole token space).
 func (t *Table) flushBoundaries(mem *memTable) [][]byte {
-	if t.opts.TimeWindow > 0 {
+	if t.o().TimeWindow > 0 {
 		return nil
 	}
-	return shardBoundaries(t.opts.numShards(float64(mem.approximateSize())))
+	return shardBoundaries(t.o().numShards(float64(mem.approximateSize())))
 }
 
 // readState is an immutable view of a table's memtables and sstables. It is
@@ -96,6 +96,20 @@ func (s *readState) release() {
 
 // ID returns the table's ID.
 func (t *Table) ID() TableID { return t.id }
+
+// o returns the table's options.
+func (t *Table) o() *TableOptions { return t.opts.Load() }
+
+// SetOptions replaces the table's options (ALTER TABLE ... WITH): later
+// compaction decisions use them; running compactions finish with the
+// options they started with.
+func (t *Table) SetOptions(o TableOptions) {
+	o.ensureDefaults()
+	t.opts.Store(&o)
+	t.e.mu.Lock()
+	t.e.maybeScheduleCompactionsLocked()
+	t.e.mu.Unlock()
+}
 
 // publishLocked publishes the table's current memtables and files to
 // readers. Engine.mu must be held.
@@ -363,3 +377,6 @@ func (it *Iterator) Close() error {
 	}
 	return err
 }
+
+// Options returns a copy of the table's options.
+func (t *Table) Options() TableOptions { return *t.o() }

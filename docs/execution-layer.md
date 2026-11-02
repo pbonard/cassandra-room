@@ -170,8 +170,7 @@ sstables or the memtables.
 
 - vectors, user-defined functions and aggregates, materialized views,
   triggers, LIKE, data masking
-- `entries()` indexes, indexes on keys or static columns
-- options changed by ALTER TABLE take effect at restart
+
 
 
 ## Tests

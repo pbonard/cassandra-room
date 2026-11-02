@@ -88,6 +88,9 @@ type filter struct {
 	op  string
 	t   term
 	in  *valuesTerm
+	// key is the map key of an element restriction, m[key] = value (op
+	// "ENTRY=").
+	key term
 	// tuple is a multi-column slice on clustering columns of mixed order,
 	// evaluated on each row of the range of its first column (not
 	// filtering in Cassandra's sense: no ALLOW FILTERING needed).
@@ -216,6 +219,24 @@ func analyzeWhere(t *Table, rels []cql.Relation, vs *vars) (*where, error) {
 		c := t.byName[name]
 		if c == nil {
 			return nil, invalidf("Undefined column name %s in table %s.%s", name, t.Keyspace, t.Name)
+		}
+		if r.MapKey != nil {
+			if c.Type.Kind != types.Map || !c.Type.IsMultiCell() {
+				return nil, invalidf("Column %s cannot be used as a map", c.Name)
+			}
+			if r.Op != "=" {
+				return nil, invalidf("Unsupported restriction on map element: %s", relationString(r))
+			}
+			kt, err := vs.prepareTerm(r.MapKey, "key("+c.Name+")", c.Type.Elems[0])
+			if err != nil {
+				return nil, err
+			}
+			vt, err := vs.prepareTerm(r.Value, "value("+c.Name+")", c.Type.Elems[1])
+			if err != nil {
+				return nil, err
+			}
+			w.filters = append(w.filters, filter{col: c, op: "ENTRY=", key: kt, t: vt})
+			continue
 		}
 		switch r.Op {
 		case "=", "IN":

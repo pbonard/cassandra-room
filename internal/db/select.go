@@ -1090,6 +1090,24 @@ func (f *filter) matches(e *execCtx, r *rowData) (bool, error) {
 		return false, nil
 	}
 	switch f.op {
+	case "ENTRY=":
+		k, kst, err := f.key.bind(e)
+		if err != nil {
+			return false, err
+		}
+		if kst != vSet {
+			return false, invalidf("Invalid null value for map key of %s", f.col.Name)
+		}
+		elems, err := types.SplitCollection(v, 2)
+		if err != nil {
+			return false, err
+		}
+		for i := 0; i+1 < len(elems); i += 2 {
+			if types.Compare(f.col.Type.Elems[0], elems[i], k) == 0 {
+				return types.Compare(f.col.Type.Elems[1], elems[i+1], x) == 0, nil
+			}
+		}
+		return false, nil
 	case "CONTAINS", "CONTAINS KEY":
 		per := 1
 		if f.col.Type.Kind == types.Map {

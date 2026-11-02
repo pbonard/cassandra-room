@@ -882,7 +882,7 @@ func BenchmarkTimeWindow(b *testing.B) {
 				mixed := 0
 				e.mu.Lock()
 				for _, f := range tbl.files {
-					if tbl.opts.windowOfTS(f.minTS) != tbl.opts.windowOfTS(f.maxTS) {
+					if tbl.o().windowOfTS(f.minTS) != tbl.o().windowOfTS(f.maxTS) {
 						mixed++
 					}
 				}

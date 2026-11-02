@@ -2,6 +2,7 @@ package db
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"slices"
 	"strings"
@@ -49,6 +50,8 @@ func (ix *Index) valueType() *types.Type {
 	switch ix.Target {
 	case "keys":
 		return t.Elems[0]
+	case "entries":
+		return &types.Type{Kind: types.Tuple, Elems: []*types.Type{t.Elems[0], t.Elems[1]}, Frozen: true}
 	case "values":
 		if t.Kind == types.Map {
 			return t.Elems[1]
@@ -79,8 +82,6 @@ func newIndex(t *Table, st *cql.CreateIndex) (*Index, error) {
 	switch c.Kind {
 	case PartitionKey, Clustering:
 		return nil, invalidf("Indexes on primary key columns are not supported")
-	case Static:
-		return nil, invalidf("Indexes on static columns are not supported")
 	}
 	if c.Type.Kind == types.Counter {
 		return nil, invalidf("Cannot create secondary index on a counter column")
@@ -104,7 +105,9 @@ func newIndex(t *Table, st *cql.CreateIndex) (*Index, error) {
 		}
 		ix.Target = ""
 	case "entries":
-		return nil, invalidf("entries() indexes are not supported")
+		if !multi || c.Type.Kind != types.Map {
+			return nil, invalidf("Cannot create entries() index on %s column %s", map[bool]string{true: "frozen", false: "non-map"}[c.Type.IsCollection()], c.Name)
+		}
 	}
 	if ix.Name == "" {
 		ix.Name = t.Name + "_" + c.Name + "_idx"
@@ -129,6 +132,12 @@ func (ix *Index) indexValues(cells []row.Cell, nowSec int64) (vals [][]byte, liv
 				continue
 			}
 			vals = append(vals, k)
+		case ix.Target == "entries":
+			k, _, err := types.ReadComponent(c.Path, ix.col.Type.Elems[0], false)
+			if err != nil {
+				continue
+			}
+			vals = append(vals, entryTuple(k, c.Value))
 		default:
 			vals = append(vals, c.Value)
 		}
@@ -184,8 +193,8 @@ func (d *DB) buildIndex(t *Table, ix *Index, nowSec int64) error {
 		k := it.Key()
 		if len(t.Clustering) > 0 {
 			_, _, rest, err := parsePartition(k)
-			if err != nil || len(rest) == 0 || rest[0] < types.NullSep {
-				continue // header or range tombstone
+			if err != nil || len(rest) == 0 || (rest[0] < types.NullSep && rest[0] != headerSuffix) {
+				continue // a range tombstone
 			}
 		}
 		r, err := row.Decode(it.Value())
@@ -220,7 +229,7 @@ type indexPlan struct {
 // on collections), or a range on an SAI index.
 func findIndex(t *Table, filters []filter) *indexPlan {
 	for _, f := range filters {
-		if f.tuple != nil || f.col.Kind != Regular {
+		if f.tuple != nil || (f.col.Kind != Regular && f.col.Kind != Static) {
 			continue
 		}
 		for _, ix := range t.Indexes {
@@ -230,7 +239,8 @@ func findIndex(t *Table, filters []filter) *indexPlan {
 			switch {
 			case f.op == "=" && ix.Target == "" && f.in != nil && f.in.eq != nil:
 				return &indexPlan{ix: ix, f: f}
-			case f.op == "CONTAINS" && ix.Target == "values", f.op == "CONTAINS KEY" && ix.Target == "keys":
+			case f.op == "CONTAINS" && ix.Target == "values", f.op == "CONTAINS KEY" && ix.Target == "keys",
+				f.op == "ENTRY=" && ix.Target == "entries":
 				return &indexPlan{ix: ix, f: f}
 			case ix.sai() && ix.Target == "" && (f.op == "<" || f.op == "<=" || f.op == ">" || f.op == ">="):
 				return &indexPlan{ix: ix, f: f}
@@ -258,13 +268,23 @@ func (q *query) scanIndex(plan *indexPlan) error {
 	if st != vSet {
 		return invalidf("Invalid null value in condition for column %s", plan.f.col.Name)
 	}
+	if plan.f.op == "ENTRY=" {
+		k, kst, err := plan.f.key.bind(e)
+		if err != nil {
+			return err
+		}
+		if kst != vSet {
+			return invalidf("Invalid null value for map key of %s", plan.f.col.Name)
+		}
+		v = entryTuple(k, v)
+	}
 	enc, err := types.AppendComponent(nil, plan.ix.valueType(), v, false)
 	if err != nil {
 		return invalidf("%v", err)
 	}
 	var lo, hi []byte
 	switch plan.f.op {
-	case "=", "CONTAINS", "CONTAINS KEY":
+	case "=", "CONTAINS", "CONTAINS KEY", "ENTRY=":
 		lo, hi = enc, prefixEnd(enc)
 	case ">=":
 		lo = enc
@@ -310,6 +330,18 @@ func (q *query) scanIndex(plan *indexPlan) error {
 			continue
 		}
 		q.indexKey = key
+		if len(suffix) > 0 && suffix[0] == headerSuffix {
+			// A static column's entry: every row of the partition (the
+			// restriction stays a filter on each).
+			pkVals, err := splitPartitionKey(pk, len(q.s.t.PartitionKey))
+			if err != nil {
+				return err
+			}
+			if err := q.readPartition(p, pkVals); err != nil {
+				return err
+			}
+			continue
+		}
 		matched, err := q.readRowAt(src, p, pk, suffix, &plan.f)
 		if err != nil {
 			return err
@@ -443,4 +475,12 @@ func (q *query) readRowAt(src engineSource, p, pk, suffix []byte, f *filter) (bo
 		return false, err
 	}
 	return true, q.emitPartition(p, pkVals, static, dels, []kv{kvr})
+}
+
+// entryTuple is the indexed value of a map entry: the tuple (key, value).
+func entryTuple(k, v []byte) []byte {
+	out := binary.BigEndian.AppendUint32(nil, uint32(len(k)))
+	out = append(out, k...)
+	out = binary.BigEndian.AppendUint32(out, uint32(len(v)))
+	return append(out, v...)
 }

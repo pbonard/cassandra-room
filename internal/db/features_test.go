@@ -205,3 +205,32 @@ func rowsOf(t *testing.T, m message.Message) []string {
 	}
 	return out
 }
+
+// TestEntriesAndStaticIndexes covers map element restrictions, entries()
+// indexes and indexes on static columns.
+func TestEntriesAndStaticIndexes(t *testing.T) {
+	s := openTest(t, nil)
+	s.ok("CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+	s.ok("CREATE TABLE ks.m (k int PRIMARY KEY, attrs map<text, text>)")
+	s.ok("INSERT INTO ks.m (k, attrs) VALUES (1, {'color': 'red', 'size': 'L'})")
+	s.ok("INSERT INTO ks.m (k, attrs) VALUES (2, {'color': 'blue', 'size': 'L'})")
+	s.ok("INSERT INTO ks.m (k, attrs) VALUES (3, {'color': 'red'})")
+	s.fails("SELECT k FROM ks.m WHERE attrs['color'] = 'red'", "ALLOW FILTERING")
+	require.ElementsMatch(t, []string{"1", "3"}, s.rows("SELECT k FROM ks.m WHERE attrs['color'] = 'red' ALLOW FILTERING"))
+	s.ok("CREATE INDEX ON ks.m (entries(attrs))")
+	require.ElementsMatch(t, []string{"1", "3"}, s.rows("SELECT k FROM ks.m WHERE attrs['color'] = 'red'"))
+	require.ElementsMatch(t, []string{"1", "2"}, s.rows("SELECT k FROM ks.m WHERE attrs['size'] = 'L'"))
+	s.ok("UPDATE ks.m SET attrs['color'] = 'green' WHERE k = 1")
+	require.Equal(t, []string{"3"}, s.rows("SELECT k FROM ks.m WHERE attrs['color'] = 'red'"))
+	require.Equal(t, []string{"1"}, s.rows("SELECT k FROM ks.m WHERE attrs['color'] = ?", "green"))
+
+	s.ok("CREATE TABLE ks.s (k int, c int, owner text STATIC, v int, PRIMARY KEY (k, c))")
+	s.ok("INSERT INTO ks.s (k, c, owner, v) VALUES (1, 1, 'ann', 10)")
+	s.ok("INSERT INTO ks.s (k, c, v) VALUES (1, 2, 20)")
+	s.ok("INSERT INTO ks.s (k, c, owner, v) VALUES (2, 1, 'bob', 30)")
+	s.ok("CREATE INDEX ON ks.s (owner)")
+	require.Equal(t, []string{"1 1 10", "1 2 20"}, s.rows("SELECT k, c, v FROM ks.s WHERE owner = 'ann'"))
+	s.ok("UPDATE ks.s SET owner = 'bob' WHERE k = 1")
+	require.Empty(t, s.rows("SELECT k FROM ks.s WHERE owner = 'ann'"))
+	require.Len(t, s.rows("SELECT k FROM ks.s WHERE owner = 'bob'"), 3)
+}

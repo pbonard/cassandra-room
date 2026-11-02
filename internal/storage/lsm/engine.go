@@ -167,10 +167,12 @@ func Open(dir string, opts *Options) (*Engine, error) {
 func (e *Engine) newTable(id TableID) *Table {
 	t := &Table{e: e, id: id, dir: e.fs.PathJoin(e.tablesDir, id.dirName())}
 	t.mem = newMemTable(&e.memUsed)
+	var o TableOptions
 	if e.opts.TableOptions != nil {
-		t.opts = e.opts.TableOptions(id)
+		o = e.opts.TableOptions(id)
 	}
-	t.opts.ensureDefaults()
+	o.ensureDefaults()
+	t.opts.Store(&o)
 	return t
 }
 
@@ -279,7 +281,7 @@ func (e *Engine) recover() error {
 	for id, m := range recovered {
 		t := e.mu.tables[id]
 		alloc := func() uint64 { nextFileNum++; return nextFileNum - 1 }
-		metas, err := writeTable(e.fs, t.dir, alloc, e.writerOpts, e.merger, m, t.flushBoundaries(m), t.opts.fragmentSize(), t.timeSplitter(), e.opts.Now().Unix())
+		metas, err := writeTable(e.fs, t.dir, alloc, e.writerOpts, e.merger, m, t.flushBoundaries(m), t.o().fragmentSize(), t.timeSplitter(), e.opts.Now().Unix())
 		if err != nil {
 			return err
 		}
@@ -891,7 +893,7 @@ func (e *Engine) flushOne() error {
 		e.mu.nextFileNum++
 		return e.mu.nextFileNum - 1
 	}
-	metas, err := writeTable(e.fs, t.dir, alloc, e.writerOpts, e.merger, im.mem, t.flushBoundaries(im.mem), t.opts.fragmentSize(), t.timeSplitter(), e.opts.Now().Unix())
+	metas, err := writeTable(e.fs, t.dir, alloc, e.writerOpts, e.merger, im.mem, t.flushBoundaries(im.mem), t.o().fragmentSize(), t.timeSplitter(), e.opts.Now().Unix())
 	closeAll := func() {
 		for _, m := range metas {
 			if m.reader != nil {

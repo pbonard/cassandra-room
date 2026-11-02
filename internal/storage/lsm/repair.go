@@ -87,7 +87,7 @@ func (t *Table) MerkleTree(r TokenRange, depth int) (*MerkleTree, error) {
 	m := &MerkleTree{Range: r, Depth: depth, Leaves: make([]Hash, n)}
 	purger, _ := t.e.merger.(Purger)
 	nowSec := t.e.opts.Now().Unix()
-	gcBefore := t.opts.gcBefore(nowSec)
+	gcBefore := t.o().gcBefore(nowSec)
 	noOther := func(int64, int64) (int64, error) { return math.MaxInt64, nil }
 	var buf, msg []byte
 	for ok := it.First(); ok; ok = it.Next() {

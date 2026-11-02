@@ -96,6 +96,8 @@ type Relation struct {
 	// "IS NOT NULL".
 	Op    string
 	Value Term // for IN: a ListLiteral of the values, or a Marker
+	// MapKey is set for a map element restriction, m[key] = value.
+	MapKey Term
 }
 
 // Using is a USING clause.
