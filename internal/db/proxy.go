@@ -134,6 +134,7 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 			return err
 		}
 	}
+	d.cleanStreaming()
 	if len(d.local.Tokens) == 0 {
 		d.local.Tokens = cluster.RandomTokens(o.NumTokens)
 		d.ddlMu.Lock()
@@ -155,6 +156,7 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	m.Handle(cluster.VerbExecute, p.handleExecute)
 	m.Handle(cluster.VerbRepair, p.handleRepair)
 	m.Handle(cluster.VerbStreamPush, p.handleStreamPush)
+	m.Handle(cluster.VerbStreamFile, p.handleStreamFile)
 	m.Handle(cluster.VerbCounterMutation, p.handleCounterMutation)
 	for _, v := range []cluster.Verb{cluster.VerbLWTPrepare, cluster.VerbLWTPropose, cluster.VerbLWTCommit} {
 		m.Handle(v, p.handlePaxos(v))
@@ -272,7 +274,10 @@ func (p *proxy) join() error {
 	if err := p.bootstrap(); err != nil {
 		return err
 	}
-	return p.setNodeStatus("FINISH_JOIN", me.HostID, cluster.StatusNormal)
+	if err := p.setNodeStatus("FINISH_JOIN", me.HostID, cluster.StatusNormal); err != nil {
+		return err
+	}
+	return d.progress().clear("bootstrap")
 }
 
 // replace joins in place of a dead node (by address or host id): this
@@ -339,7 +344,10 @@ func (p *proxy) replace(me *cluster.Node, target string) error {
 		next.logDetail = fmt.Sprintf("%s replaced %s", n.HostID, old.HostID)
 		return nil, true, nil
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	return d.progress().clear("bootstrap")
 }
 
 // setStatus commits a change of this node's state.

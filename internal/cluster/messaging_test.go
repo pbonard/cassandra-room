@@ -102,7 +102,7 @@ func TestExpiredRequestsDropped(t *testing.T) {
 	a, b := startPair(t, MessagingOptions{})
 	var ran atomic.Int64
 	block := make(chan struct{})
-	b.Handle(VerbStreamPush, func(_ context.Context, _ string, p []byte) ([]byte, error) {
+	b.Handle(VerbStreamFile, func(_ context.Context, _ string, p []byte) ([]byte, error) {
 		if string(p) == "block" {
 			<-block
 		}
@@ -114,7 +114,7 @@ func TestExpiredRequestsDropped(t *testing.T) {
 	// Occupy every streaming worker.
 	for range stageWorkers[stageStreaming] {
 		go func() {
-			_, err := a.Request(context.Background(), b.Addr(), VerbStreamPush, []byte("block"))
+			_, err := a.Request(context.Background(), b.Addr(), VerbStreamFile, []byte("block"))
 			if err != nil {
 				t.Logf("blocker: %v", err)
 			}
@@ -123,7 +123,7 @@ func TestExpiredRequestsDropped(t *testing.T) {
 	require.Eventually(t, func() bool { return len(b.stages[stageStreaming]) == stageWorkers[stageStreaming] }, time.Second, time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	_, err := a.Request(ctx, b.Addr(), VerbStreamPush, []byte("late"))
+	_, err := a.Request(ctx, b.Addr(), VerbStreamFile, []byte("late"))
 	require.ErrorIs(t, err, ErrTimeout)
 	close(block)
 	for start := time.Now(); ran.Load() < int64(stageWorkers[stageStreaming]) && time.Since(start) < time.Second; {
@@ -131,7 +131,7 @@ func TestExpiredRequestsDropped(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 	require.EqualValues(t, stageWorkers[stageStreaming], ran.Load(), "the expired request never ran; dropped %v", b.Stats().Dropped)
-	require.EqualValues(t, 1, b.Stats().Dropped[VerbStreamPush])
+	require.EqualValues(t, 1, b.Stats().Dropped[VerbStreamFile])
 }
 
 // TestOverloadAndBackpressure checks the outbound limits and that a

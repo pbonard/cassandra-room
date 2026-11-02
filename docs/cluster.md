@@ -130,6 +130,16 @@ node, the coordinator in a cluster.
 
 ## Topology (admin endpoint)
 
+- **Streaming** (`internal/db/stream.go`) moves ranges as sstable files,
+  as Cassandra's entire-sstable streaming does: the source exports the
+  range (sstables wholly inside it hard-linked, the sections of the others
+  written out), the receiver pulls the files in 4 MiB chunks over the
+  large-message connection, imports them (hard-linked into the table, not
+  rewritten) and writes the index entries of the imported rows. A node
+  that must push a range asks the receiver to pull it. Bootstrap,
+  decommission and removenode record every range they finish
+  (`stream-progress.json`), so an interrupted operation run again resumes
+  where it stopped. Not done: sendfile (chunks go through messages).
 - **Bootstrap**: a new node catches up with the metadata, then commits its
   registration as JOINING (TCM's PrepareJoin: from that epoch writes also
   go to it), streams the ranges it will own from current replicas,

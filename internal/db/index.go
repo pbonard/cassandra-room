@@ -155,12 +155,34 @@ func (ix *Index) indexValues(cells []row.Cell, nowSec int64) (vals [][]byte, liv
 }
 
 // entryKey is the key of an index entry.
+//
+//	indexed value (byte-comparable component) | 0x10 | row key
+//
+// The separator matters: a component's 0x00 terminator followed by 0xFE
+// or 0xFF would read as an escaped zero byte, and row keys start with
+// token bytes that can be anything (Cassandra separates components the
+// same way).
 func (ix *Index) entryKey(v, rowKey []byte) ([]byte, error) {
 	k, err := types.AppendComponent(nil, ix.valueType(), v, false)
 	if err != nil {
 		return nil, err
 	}
+	k = append(k, entrySep)
 	return append(k, rowKey...), nil
+}
+
+const entrySep = 0x10
+
+// entryRowKey returns the row key of an index entry.
+func (ix *Index) entryRowKey(key []byte) ([]byte, error) {
+	_, rest, err := types.ReadComponent(key, ix.valueType(), false)
+	if err != nil {
+		return nil, err
+	}
+	if len(rest) == 0 || rest[0] != entrySep {
+		return nil, errBadKey
+	}
+	return rest[1:], nil
 }
 
 // addEntries adds the index entries of a row write to b.
@@ -232,6 +254,47 @@ func (d *DB) buildIndex(t *Table, ix *Index, nowSec int64) error {
 	return d.applyLocal(b.writes)
 }
 
+// buildIndexKeys writes an index's entries for the rows at keys.
+func (d *DB) buildIndexKeys(t *Table, ix *Index, keys [][]byte, nowSec int64) error {
+	lt, err := d.engine.Table(t.Storage)
+	if err != nil {
+		return err
+	}
+	only := *t
+	only.Indexes = []*Index{ix}
+	b := &mutation{}
+	for _, k := range keys {
+		if len(t.Clustering) > 0 {
+			_, _, rest, err := parsePartition(k)
+			if err != nil || len(rest) == 0 || (rest[0] < types.NullSep && rest[0] != headerSuffix) {
+				continue // a range tombstone
+			}
+		}
+		v, err := lt.Get(k)
+		if errors.Is(err, lsm.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		r, err := row.Decode(v)
+		if err != nil {
+			return err
+		}
+		cells := liveCells(r.Cells, r.Deletion.MarkedForDeleteAt, nowSec)
+		if err := only.addEntries(b, k, cells, nowSec); err != nil {
+			return err
+		}
+		if len(b.writes) >= 1000 {
+			if err := d.applyLocal(b.writes); err != nil {
+				return err
+			}
+			b = &mutation{}
+		}
+	}
+	return d.applyLocal(b.writes)
+}
+
 // indexPlan is a SELECT served by an index: the restriction it uses.
 type indexPlan struct {
 	ix *Index
@@ -296,6 +359,7 @@ func (q *query) scanIndex(plan *indexPlan) error {
 	if err != nil {
 		return invalidf("%v", err)
 	}
+	enc = append(enc, entrySep)
 	var lo, hi []byte
 	switch plan.f.op {
 	case "=", "CONTAINS", "CONTAINS KEY", "ENTRY=":
@@ -328,7 +392,7 @@ func (q *query) scanIndex(plan *indexPlan) error {
 	var stale [][]byte
 	for ok := it.First(); ok && !q.done(); ok = it.Next() {
 		key := slices.Clone(it.Key())
-		_, rest, err := types.ReadComponent(key, plan.ix.valueType(), false)
+		rest, err := plan.ix.entryRowKey(key)
 		if err != nil {
 			continue
 		}

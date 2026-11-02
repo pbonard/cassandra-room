@@ -154,7 +154,7 @@ func serveAdmin(addr string, d *db.DB) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		fmt.Fprintf(w, "repaired %d ranges: %d mismatching, %d rows streamed\n", st.Ranges, st.Mismatches, st.Streamed)
+		fmt.Fprintf(w, "repaired %d ranges: %d mismatching, %d bytes streamed\n", st.Ranges, st.Mismatches, st.Streamed)
 	})
 	mux.HandleFunc("POST /cleanup", func(w http.ResponseWriter, r *http.Request) {
 		n, err := d.Cleanup(r.URL.Query().Get("keyspace"))

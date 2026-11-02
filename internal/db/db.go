@@ -48,6 +48,9 @@ type Options struct {
 	Authenticator, Authorizer bool
 	// Now overrides the clock (tests).
 	Now func() time.Time
+	// StreamHook, in tests, runs before each range a resumable streaming
+	// operation streams; an error interrupts it.
+	StreamHook func(op, unit string) error
 }
 
 // DB is a single-node Cassandra database.
@@ -80,6 +83,12 @@ type DB struct {
 	counterMu sync.Mutex
 	// vecs holds the open vector indexes.
 	vecs vectorIndexes
+	// prog records the progress of resumable streaming operations.
+	progressOnce sync.Once
+	prog         *streamProgress
+	// streamHook, in tests, runs before each range a resumable operation
+	// streams.
+	streamHook func(op, unit string) error
 
 	// store runs statements' reads and writes: localStorage, or the
 	// cluster's coordinator.
@@ -136,7 +145,7 @@ func Open(dir string, opts Options) (*DB, error) {
 	if opts.Port == 0 {
 		opts.Port = 9042
 	}
-	d := &DB{opts: opts, fs: opts.FS, dir: dir, wo: lsm.NoSync}
+	d := &DB{opts: opts, fs: opts.FS, dir: dir, wo: lsm.NoSync, streamHook: opts.StreamHook}
 	d.store = localStorage{d}
 	if opts.SyncWrites {
 		d.wo = lsm.Sync

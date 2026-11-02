@@ -13,7 +13,6 @@ import (
 
 	"github.com/cassandra-room/cassandra-room/internal/cluster"
 	"github.com/cassandra-room/cassandra-room/internal/storage/lsm"
-	"github.com/cassandra-room/cassandra-room/internal/types"
 	"github.com/datastax/go-cassandra-native-protocol/message"
 )
 
@@ -64,73 +63,6 @@ func containsAddr(nodes []*cluster.Node, addr string) bool {
 	return slices.ContainsFunc(nodes, func(n *cluster.Node) bool { return n.Addr == addr })
 }
 
-// fetchRange copies a key range of a table from a node to this one.
-func (p *proxy) fetchRange(from string, id lsm.TableID, lo, hi []byte) (int, error) {
-	n := 0
-	for {
-		ctx, cancel := context.WithTimeout(context.Background(), p.opts.ReadTimeout)
-		b, err := p.m.Request(ctx, from, cluster.VerbReadRange, encodeKey(id, lo, hi))
-		cancel()
-		if err != nil {
-			return n, err
-		}
-		kvs, more, err := decodeKVs(b)
-		if err != nil {
-			return n, err
-		}
-		ws := make([]write, len(kvs))
-		for i, e := range kvs {
-			ws[i] = write{table: id, key: e.k, value: e.v}
-		}
-		if err := p.d.applyLocal(ws); err != nil {
-			return n, err
-		}
-		n += len(kvs)
-		if !more || len(kvs) == 0 {
-			return n, nil
-		}
-		lo = append(slices.Clone(kvs[len(kvs)-1].k), 0)
-	}
-}
-
-// pushRange sends a key range of a local table to a node.
-func (p *proxy) pushRange(to string, id lsm.TableID, lo, hi []byte) (int, error) {
-	lt, err := p.d.engine.Table(id)
-	if err != nil {
-		return 0, err
-	}
-	it, err := lt.NewIter(lo, hi)
-	if err != nil {
-		return 0, err
-	}
-	defer it.Close()
-	var ws []write
-	n := 0
-	flush := func() error {
-		if len(ws) == 0 {
-			return nil
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), p.opts.WriteTimeout*5)
-		defer cancel()
-		_, err := p.m.Request(ctx, to, cluster.VerbMutation, encodeWrites(ws))
-		ws = ws[:0]
-		return err
-	}
-	for ok := it.First(); ok; ok = it.Next() {
-		ws = append(ws, write{table: id, key: slices.Clone(it.Key()), value: slices.Clone(it.Value())})
-		n++
-		if len(ws) >= rangePage {
-			if err := flush(); err != nil {
-				return n, err
-			}
-		}
-	}
-	if err := it.Error(); err != nil {
-		return n, err
-	}
-	return n, flush()
-}
-
 // bootstrap streams to this joining node the ranges it will own, from
 // their current replicas, then rebuilds its local indexes.
 func (p *proxy) bootstrap() error {
@@ -166,7 +98,19 @@ func (p *proxy) bootstrap() error {
 			for _, src := range srcs {
 				err := func() error {
 					for _, kr := range keyRangesOf(r[0], r[1]) {
-						if _, err := p.fetchRange(src.Addr, t.Storage, kr[0], kr[1]); err != nil {
+						unit := progressUnit(t.Storage, kr[0], kr[1])
+						if p.d.progress().done("bootstrap", unit) {
+							continue // streamed before an interruption
+						}
+						if h := p.d.streamHook; h != nil {
+							if err := h("bootstrap", unit); err != nil {
+								return err
+							}
+						}
+						if _, err := p.streamBetween(src.Addr, p.self, t.Storage, kr[0], kr[1]); err != nil {
+							return err
+						}
+						if err := p.d.progress().mark("bootstrap", unit); err != nil {
 							return err
 						}
 					}
@@ -269,8 +213,15 @@ func (d *DB) Decommission() error {
 					continue
 				}
 				for _, kr := range keyRangesOf(r[0], r[1]) {
-					if _, err := p.pushRange(n.Addr, t.Storage, kr[0], kr[1]); err != nil {
+					unit := n.HostID + "/" + progressUnit(t.Storage, kr[0], kr[1])
+					if d.progress().done("decommission", unit) {
+						continue
+					}
+					if _, err := p.streamBetween(p.self, n.Addr, t.Storage, kr[0], kr[1]); err != nil {
 						return fmt.Errorf("db: decommission streaming to %s: %w", n.Addr, err)
+					}
+					if err := d.progress().mark("decommission", unit); err != nil {
+						return err
 					}
 				}
 			}
@@ -278,7 +229,10 @@ func (d *DB) Decommission() error {
 	}
 	p.replayHints()
 	// FinishLeave.
-	return p.setStatus("FINISH_LEAVE", cluster.StatusLeft)
+	if err := p.setStatus("FINISH_LEAVE", cluster.StatusLeft); err != nil {
+		return err
+	}
+	return d.progress().clear("decommission")
 }
 
 // ---- repair ----
@@ -308,7 +262,8 @@ func (p *proxy) handleRepair(ctx context.Context, _ string, payload []byte) ([]b
 
 // RepairStats summarise a repair.
 type RepairStats struct {
-	Ranges, Mismatches, Streamed int
+	Ranges, Mismatches int
+	Streamed           int64 // bytes
 }
 
 // Repair synchronizes this node's ranges of a keyspace's tables (all user
@@ -364,11 +319,11 @@ func (d *DB) Repair(keyspace string) (RepairStats, error) {
 					for _, dr := range diff {
 						st.Mismatches++
 						lo, hi := dr.Bounds()
-						n, err := p.fetchRange(peer.Addr, t.Storage, lo, hi)
+						n, err := p.streamBetween(peer.Addr, p.self, t.Storage, lo, hi)
 						if err != nil {
 							return st, err
 						}
-						m, err := p.pushRange(peer.Addr, t.Storage, lo, hi)
+						m, err := p.streamBetween(p.self, peer.Addr, t.Storage, lo, hi)
 						if err != nil {
 							return st, err
 						}
@@ -462,9 +417,8 @@ func (d *DB) Cleanup(keyspace string) (int, error) {
 			if err != nil {
 				return cleaned, err
 			}
-			vt := ix.valueType()
 			if err := it.Cleanup(func(key []byte) bool {
-				_, rest, err := types.ReadComponent(key, vt, false)
+				rest, err := ix.entryRowKey(key)
 				return err != nil || len(rest) < 8 || keep(tokenOf(rest))
 			}); err != nil {
 				return cleaned, err
@@ -473,25 +427,6 @@ func (d *DB) Cleanup(keyspace string) (int, error) {
 		cleaned++
 	}
 	return cleaned, nil
-}
-
-// streamRequest asks a node to push a key range of a table to another.
-type streamRequest struct {
-	Table  uint64
-	Lo, Hi []byte
-	To     string
-}
-
-func (p *proxy) handleStreamPush(ctx context.Context, _ string, payload []byte) ([]byte, error) {
-	var r streamRequest
-	if err := json.Unmarshal(payload, &r); err != nil {
-		return nil, err
-	}
-	n, err := p.pushRange(r.To, lsm.TableID(r.Table), r.Lo, r.Hi)
-	if err != nil {
-		return nil, err
-	}
-	return json.Marshal(n)
 }
 
 // RemoveNode removes a dead node from the cluster (nodetool removenode):
@@ -518,6 +453,7 @@ func (d *DB) RemoveNode(target string) error {
 	case slices.Contains(p.cmsMembers(), dead.Addr):
 		return fmt.Errorf("db: node %s is a member of the cluster metadata service; reconfigure it first", target)
 	}
+	op := "removenode-" + dead.HostID
 	if err := p.setNodeStatus("PREPARE_REMOVE", dead.HostID, cluster.StatusLeaving); err != nil {
 		return err
 	}
@@ -545,31 +481,24 @@ func (d *DB) RemoveNode(target string) error {
 					return fmt.Errorf("db: no live replica left for range (%d, %d] of %s", r[0], r[1], k.Name)
 				}
 				for _, kr := range keyRangesOf(r[0], r[1]) {
-					if err := p.streamBetween(src.Addr, n.Addr, t.Storage, kr[0], kr[1]); err != nil {
+					unit := n.HostID + "/" + progressUnit(t.Storage, kr[0], kr[1])
+					if d.progress().done(op, unit) {
+						continue
+					}
+					if _, err := p.streamBetween(src.Addr, n.Addr, t.Storage, kr[0], kr[1]); err != nil {
 						return fmt.Errorf("db: removenode streaming from %s to %s: %w", src.Addr, n.Addr, err)
+					}
+					if err := d.progress().mark(op, unit); err != nil {
+						return err
 					}
 				}
 			}
 		}
 	}
-	return p.setNodeStatus("FINISH_REMOVE", dead.HostID, cluster.StatusLeft)
-}
-
-// streamBetween copies a key range of a table from one node to another.
-func (p *proxy) streamBetween(from, to string, id lsm.TableID, lo, hi []byte) error {
-	switch {
-	case to == p.self:
-		_, err := p.fetchRange(from, id, lo, hi)
-		return err
-	case from == p.self:
-		_, err := p.pushRange(to, id, lo, hi)
+	if err := p.setNodeStatus("FINISH_REMOVE", dead.HostID, cluster.StatusLeft); err != nil {
 		return err
 	}
-	b, _ := json.Marshal(streamRequest{Table: uint64(id), Lo: lo, Hi: hi, To: to})
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-	_, err := p.m.Request(ctx, from, cluster.VerbStreamPush, b)
-	return err
+	return d.progress().clear(op)
 }
 
 // ReconfigureCMS sets the members of the cluster metadata service (TCM's

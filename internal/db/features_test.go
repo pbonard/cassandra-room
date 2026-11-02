@@ -234,3 +234,24 @@ func TestEntriesAndStaticIndexes(t *testing.T) {
 	require.Empty(t, s.rows("SELECT k FROM ks.s WHERE owner = 'ann'"))
 	require.Len(t, s.rows("SELECT k FROM ks.s WHERE owner = 'bob'"), 3)
 }
+
+// TestIndexEntryKeys covers index entries whose row key starts with 0xFF
+// or 0xFE (after a value's terminator they must not read as an escape),
+// and text values with zero bytes in range scans.
+func TestIndexEntryKeys(t *testing.T) {
+	s := openTest(t, nil)
+	s.ok("CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+	s.ok("CREATE TABLE ks.kv (k int PRIMARY KEY, v text)")
+	s.ok("CREATE INDEX ON ks.kv (v)")
+	for i := 0; i < 300; i++ {
+		s.ok(fmt.Sprintf("INSERT INTO ks.kv (k, v) VALUES (%d, 'v%d')", i, i%10))
+	}
+	require.Len(t, s.rows("SELECT k FROM ks.kv WHERE v = 'v3'"), 30)
+	s.ok("CREATE TABLE ks.r (k int PRIMARY KEY, v text)")
+	s.ok("CREATE INDEX ON ks.r (v) USING 'sai'")
+	s.ok("INSERT INTO ks.r (k, v) VALUES (1, 'a')")
+	s.ok("INSERT INTO ks.r (k, v) VALUES (2, ?)", []byte("a\x00b"))
+	s.ok("INSERT INTO ks.r (k, v) VALUES (3, 'b')")
+	require.ElementsMatch(t, []string{"2", "3"}, s.rows("SELECT k FROM ks.r WHERE v > 'a'"))
+	require.ElementsMatch(t, []string{"1"}, s.rows("SELECT k FROM ks.r WHERE v = 'a'"))
+}

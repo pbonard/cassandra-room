@@ -190,9 +190,12 @@ func stageOf(v Verb) int {
 		return stageGossip
 	case VerbPaxosPrepare, VerbPaxosAccept, VerbMetadataFetch, VerbMetadataPush:
 		return stageMetadata
-	case VerbStreamPush, VerbStreamFile, VerbRepair:
+	case VerbStreamFile:
 		return stageStreaming
 	}
+	// (Stream and repair orchestration, which wait on other nodes'
+	// streaming workers, run with statements, so two nodes streaming to
+	// each other cannot exhaust each other's streaming workers.)
 	return stageExecute
 }
 

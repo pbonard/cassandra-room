@@ -68,17 +68,21 @@ func (c *testCluster) add() int {
 }
 
 func (c *testCluster) startReplacing(i int, replace string) {
-	o := Options{FS: c.fs[i], Address: net.IPv4(127, 0, 0, byte(1+i))}
+	d, err := c.open(i, replace, nil)
+	require.NoError(c.t, err)
+	c.nodes[i] = d
+}
+
+func (c *testCluster) open(i int, replace string, hook func(op, unit string) error) (*DB, error) {
+	o := Options{FS: c.fs[i], Address: net.IPv4(127, 0, 0, byte(1+i)), StreamHook: hook}
 	if i < len(c.dcs) {
 		o.DataCenter = c.dcs[i]
 	}
-	d, err := Open("db", Options{FS: o.FS, Address: o.Address, DataCenter: o.DataCenter, Cluster: &ClusterOptions{
+	return Open("db", Options{FS: o.FS, Address: o.Address, DataCenter: o.DataCenter, StreamHook: hook, Cluster: &ClusterOptions{
 		ListenAddress: c.addrs[i], Seeds: []string{c.addrs[0]}, NumTokens: 8, ReplaceAddress: replace, Messaging: cluster.MessagingOptions{Compress: true},
 		Membership:   testMembership(),
 		WriteTimeout: time.Second, ReadTimeout: time.Second,
 	}})
-	require.NoError(c.t, err)
-	c.nodes[i] = d
 }
 
 func (c *testCluster) stop(i int) {
@@ -669,4 +673,45 @@ func TestClusterIndexPaging(t *testing.T) {
 	}
 	got := page(2, "SELECT k, c FROM ks.u WHERE color = 'red' LIMIT 60", 25)
 	require.Len(t, got, 60)
+}
+
+// TestClusterResumableBootstrap interrupts a bootstrap and restarts the
+// node: it streams only the ranges it had not finished, ends with every
+// row and indexes them.
+func TestClusterResumableBootstrap(t *testing.T) {
+	c := newTestCluster(t, 2)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
+	c.ok(0, quorum, "CREATE TABLE ks.kv (k int PRIMARY KEY, v text)")
+	c.ok(0, quorum, "CREATE INDEX ON ks.kv (v)")
+	time.Sleep(100 * time.Millisecond)
+	for i := 0; i < 300; i++ {
+		c.ok(i%2, quorum, "INSERT INTO ks.kv (k, v) VALUES (?, ?)", i, fmt.Sprint("v", i%10))
+	}
+	n := c.add()
+	var first []string
+	_, err := c.open(n, "", func(op, unit string) error {
+		if len(first) == 3 {
+			return errors.New("injected failure")
+		}
+		first = append(first, unit)
+		return nil
+	})
+	require.ErrorContains(t, err, "injected failure")
+	var second []string
+	d, err := c.open(n, "", func(op, unit string) error {
+		require.NotContains(t, first, unit, "a finished range is not streamed again")
+		second = append(second, unit)
+		return nil
+	})
+	require.NoError(t, err)
+	c.nodes[n] = d
+	require.NotEmpty(t, second)
+	require.Equal(t, "NORMAL", c.nodes[0].schema.Load().Nodes[d.local.HostID].Status)
+	require.Eventually(t, func() bool { return len(c.nodes[0].proxy.ring.Load().Nodes()) == 3 }, 5*time.Second, 10*time.Millisecond)
+	c.checkReplicas(300)
+	// The new node's index covers its rows: index queries through it.
+	require.Len(t, c.values(n, one, "SELECT k FROM ks.kv WHERE v = 'v3'"), 30)
+	_, err = d.readFile(streamProgressFile)
+	require.NoError(t, err)
+	require.Empty(t, d.progress().m["bootstrap"], "the progress is cleared once joined")
 }
