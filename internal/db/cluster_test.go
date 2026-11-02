@@ -237,3 +237,105 @@ func TestClusterCountersLWTAndIndexes(t *testing.T) {
 }
 
 var _ = errors.New
+
+func TestClusterBootstrapDecommissionRepair(t *testing.T) {
+	c := newTestCluster(t, 2)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
+	c.ok(0, quorum, "CREATE TABLE ks.kv (k int PRIMARY KEY, v text)")
+	time.Sleep(200 * time.Millisecond)
+	for i := 0; i < 300; i++ {
+		c.ok(i%2, quorum, "INSERT INTO ks.kv (k, v) VALUES (?, ?)", i, fmt.Sprint("v", i))
+	}
+	// A third node joins: it streams the ranges it now owns.
+	c.fs = append(c.fs, vfs.NewMem())
+	c.addrs = append(c.addrs, freeAddr(t))
+	c.nodes = append(c.nodes, nil)
+	c.start(2)
+	c.waitConverged()
+	require.Eventually(t, func() bool {
+		for _, d := range c.nodes {
+			if len(d.proxy.ring.Load().Nodes()) != 3 {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, 20*time.Millisecond, "every ring has the new node")
+	local := func(n int) int {
+		res := c.nodes[n].Execute(mustPrepare(t, c.nodes[n], "SELECT count(*) FROM ks.kv"), &RequestOptions{Consistency: one, local: true, forwarded: true})
+		v := res.(*message.RowsResult).Data[0][0]
+		return int(v[7]) | int(v[6])<<8
+	}
+	require.Greater(t, local(2), 100, "the new node has its share")
+	c.checkReplicas(300)
+	require.Len(t, c.values(2, all, "SELECT k FROM ks.kv"), 300)
+
+	// Replicas diverge (writes to node 1's engine only, for keys it
+	// replicates); repair syncs them.
+	k := c.nodes[1].schema.Load().Keyspaces["ks"]
+	replicaOf := func(i int, addr string) bool {
+		pk := []byte{byte(i >> 24), byte(i >> 16), byte(i >> 8), byte(i)}
+		return containsAddr(c.nodes[1].proxy.ring.Load().Replicas(k.Replication, Token(pk)), addr)
+	}
+	var diverged []int
+	for i := 0; len(diverged) < 20; i++ {
+		if !replicaOf(i, c.addrs[1]) {
+			continue
+		}
+		diverged = append(diverged, i)
+		pr := mustPrepare(t, c.nodes[1], fmt.Sprintf("UPDATE ks.kv SET v = 'r%d' WHERE k = %d", i, i))
+		e := &execCtx{d: c.nodes[1], now: time.Now(), cl: one}
+		e.nowSec = e.now.Unix()
+		mu := &mutation{}
+		require.NoError(t, pr.state.Load().stmt.(*modification).addMutations(e, mu))
+		require.NoError(t, c.nodes[1].applyLocal(mu.writes))
+	}
+	stats, err := c.nodes[1].Repair("ks")
+	require.NoError(t, err)
+	require.Positive(t, stats.Mismatches)
+	for _, i := range diverged {
+		for n := range c.nodes {
+			if !replicaOf(i, c.addrs[n]) {
+				continue
+			}
+			res := c.nodes[n].Execute(mustPrepare(t, c.nodes[n], fmt.Sprintf("SELECT v FROM ks.kv WHERE k = %d", i)), &RequestOptions{Consistency: one, local: true, forwarded: true})
+			require.Equal(t, fmt.Sprint("r", i), string(res.(*message.RowsResult).Data[0][0]), "node %d key %d", n, i)
+		}
+	}
+
+	// Node 0 leaves: its data moves to the others.
+	require.NoError(t, c.nodes[0].Decommission())
+	c.stop(0)
+	require.Eventually(t, func() bool {
+		return c.nodes[1].proxy.ring.Load() != nil && len(c.nodes[1].proxy.ring.Load().Nodes()) == 2
+	},
+		5*time.Second, 20*time.Millisecond)
+	require.Equal(t, 300, local(1))
+	require.Equal(t, 300, local(2))
+	require.Len(t, c.values(1, all, "SELECT k FROM ks.kv"), 300)
+}
+
+// checkReplicas checks that every row k < n is stored on each of its
+// replicas (read locally on each).
+func (c *testCluster) checkReplicas(n int) {
+	c.t.Helper()
+	var p *proxy
+	for _, d := range c.nodes {
+		if d != nil {
+			p = d.proxy
+			break
+		}
+	}
+	k := p.d.schema.Load().Keyspaces["ks"]
+	for i := 0; i < n; i++ {
+		pk := []byte{byte(i >> 24), byte(i >> 16), byte(i >> 8), byte(i)}
+		for _, r := range p.ring.Load().Replicas(k.Replication, Token(pk)) {
+			for j, d := range c.nodes {
+				if d == nil || c.addrs[j] != r.Addr {
+					continue
+				}
+				res := d.Execute(mustPrepare(c.t, d, fmt.Sprintf("SELECT v FROM ks.kv WHERE k = %d", i)), &RequestOptions{Consistency: one, local: true, forwarded: true})
+				require.Len(c.t, res.(*message.RowsResult).Data, 1, "row %d on replica %d", i, j)
+			}
+		}
+	}
+}

@@ -38,6 +38,33 @@ func NewRing(states []EndpointState) *Ring {
 	return r
 }
 
+// NewFutureRing builds the ring as it will be once joining nodes have
+// joined and leaving nodes have left (pending ranges).
+func NewFutureRing(states []EndpointState) *Ring {
+	var next []EndpointState
+	for _, s := range states {
+		switch s.Status {
+		case StatusJoining:
+			s.Status = StatusNormal
+			next = append(next, s)
+		case StatusNormal:
+			next = append(next, s)
+		}
+	}
+	return NewRing(next)
+}
+
+// Ranges returns the ring's ranges as (start, end] pairs, the first one
+// wrapping around the end of the token space.
+func (r *Ring) Ranges() [][2]int64 {
+	out := make([][2]int64, len(r.tokens))
+	for i, t := range r.tokens {
+		prev := r.tokens[(i+len(r.tokens)-1)%len(r.tokens)]
+		out[i] = [2]int64{prev, t}
+	}
+	return out
+}
+
 // Empty reports whether no node owns tokens yet.
 func (r *Ring) Empty() bool { return len(r.tokens) == 0 }
 

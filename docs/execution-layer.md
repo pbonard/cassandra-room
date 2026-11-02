@@ -128,15 +128,42 @@ unsafe_aggressive_sstable_expiration); SizeTiered and Leveled run as UCS with
 T4 and L10. gc_grace_seconds sets the purge horizon. Options changed by
 ALTER TABLE take effect when the server restarts.
 
+## Also supported
+
+- **Multi-cell columns** (row format v2): non-frozen `list`, `set`, `map`
+  and user types store one cell per element, keyed by a path (the
+  byte-comparable element or key, a time-ordered id for lists, the field
+  index for UDTs). Overwriting a collection writes a complex deletion at
+  ts-1 first, as Cassandra's setters do. All collection operations work:
+  `+`/`-`, prepend, `m[k] = v`, `l[i] = v`, `u.f = v`, element deletes; list
+  index operations read before writing.
+- **User-defined types**: CREATE/ALTER/DROP TYPE, frozen and non-frozen,
+  `{field: value}` literals, `system_schema.types`, DESCRIBE.
+- **Counters**: counter tables with Cassandra's validation; a counter cell
+  holds a context of per-node shards (id, clock, count) merged by clock,
+  updated by read-modify-write of the node's own shard. Deleting a counter
+  is final, as Cassandra documents (this also keeps merging associative).
+- **JSON**: SELECT JSON, INSERT JSON (DEFAULT NULL/UNSET), toJson(),
+  fromJson().
+- **GROUP BY** on a primary key prefix, **arithmetic** in selections,
+  **conditional batches** (one partition).
+- **Secondary indexes** (legacy and `StorageAttachedIndex`): an index is a
+  storage table keyed by (value, partition, clustering), written in the
+  row's batch; reads verify entries against the base row and delete stale
+  ones. SAI indexes also serve ranges.
+- **Authentication and authorization**: PasswordAuthenticator (SASL PLAIN,
+  bcrypt), roles, GRANT/REVOKE on keyspaces/tables/roles, LIST
+  ROLES/USERS/PERMISSIONS.
+- **Clusters**: see `docs/cluster.md`.
+
 ## Not supported yet
 
-- non-frozen collections and UDTs (they need multi-cell columns), counters,
-  vectors
-- secondary indexes, materialized views, triggers, user-defined functions
-- INSERT JSON / SELECT JSON, GROUP BY, arithmetic in selections, LIKE
-- conditional batches, IN on the partition key in conditional statements
-- authentication and authorization, TLS
-- consistency levels are accepted and ignored (one replica)
+- vectors, user-defined functions and aggregates, materialized views,
+  triggers, LIKE, data masking
+- `entries()` indexes, indexes on keys or static columns
+- counters in a cluster must update one partition per statement
+- options changed by ALTER TABLE take effect at restart
+- partition and range deletions are never purged
 
 ## Tests
 

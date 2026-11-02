@@ -102,7 +102,13 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 			return err
 		}
 	}
-	if len(d.local.Tokens) == 0 {
+	newNode := len(d.local.Tokens) == 0
+	isSeed := slices.Contains(o.Seeds, o.ListenAddress)
+	status := cluster.StatusNormal
+	if newNode && len(o.Seeds) > 0 && !isSeed {
+		status = cluster.StatusJoining
+	}
+	if newNode {
 		d.local.Tokens = cluster.RandomTokens(o.NumTokens)
 		d.ddlMu.Lock()
 		err := d.saveSchema(d.schema.Load())
@@ -123,10 +129,11 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	m.Handle(cluster.VerbSchemaPush, p.handleSchemaPush)
 	m.Handle(cluster.VerbExecute, p.handleExecute)
 	m.Handle(cluster.VerbStream, p.handleStream)
+	m.Handle(cluster.VerbRepair, p.handleRepair)
 	v := d.schema.Load().Version
 	p.g = cluster.NewGossiper(m, cluster.EndpointState{
 		HostID: d.local.HostID, DataCenter: d.opts.DataCenter, Rack: d.opts.Rack, Tokens: d.local.Tokens,
-		Status: cluster.StatusNormal, NativeAddr: d.opts.Address.String(), NativePort: d.opts.Port,
+		Status: status, NativeAddr: d.opts.Address.String(), NativePort: d.opts.Port,
 		SchemaVersion: types.FormatUUID(v[:]), ReleaseVersion: ReleaseVersion, SchemaEpoch: d.epoch,
 	}, o.Seeds)
 	if o.GossipInterval > 0 {
@@ -143,6 +150,19 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	m.Start()
 	p.topologyChanged()
 	p.g.Start()
+	if status == cluster.StatusJoining {
+		// Learn the ring, then stream the ranges this node will own before
+		// serving them (auto_bootstrap).
+		time.Sleep(3 * p.gossipInterval())
+		p.ring.Store(cluster.NewRing(p.g.States()))
+		if !p.ring.Load().Empty() {
+			if err := p.bootstrap(); err != nil {
+				p.stop()
+				return err
+			}
+		}
+		p.g.Update(func(s *cluster.EndpointState) { s.Status = cluster.StatusNormal })
+	}
 	p.wg.Add(1)
 	go p.background()
 	return nil
@@ -344,6 +364,14 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 				perNode[r.Addr] = append(perNode[r.Addr], w)
 			} else {
 				hints = append(hints, hint{hostID: r.HostID, w: w})
+			}
+		}
+		// Nodes joining or taking over the range get the write too, not
+		// counted for the consistency level.
+		for _, r := range p.pendingReplicas(k, w.token, g.reps) {
+			if p.g.IsAlive(r.Addr) {
+				nodes[r.Addr] = r
+				perNode[r.Addr] = append(perNode[r.Addr], w)
 			}
 		}
 	}

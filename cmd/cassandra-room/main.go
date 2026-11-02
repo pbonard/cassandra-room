@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -37,6 +39,7 @@ func main() {
 		numTokens             = flag.Int("num-tokens", 16, "Number of tokens (vnodes) of this node")
 		dataCenter            = flag.String("dc", "datacenter1", "Data center of this node")
 		rack                  = flag.String("rack", "rack1", "Rack of this node")
+		adminAddress          = flag.String("admin-address", "", "HTTP address for nodetool-style operations: GET /status, POST /repair?keyspace=, POST /decommission")
 	)
 	flag.Parse()
 
@@ -74,6 +77,10 @@ func main() {
 			log.Printf("closing the database: %v", err)
 		}
 	}()
+
+	if *adminAddress != "" {
+		go serveAdmin(*adminAddress, database)
+	}
 
 	srv := server.New(database)
 	if *maxConcurrentRequests > 0 {
@@ -119,3 +126,29 @@ func main() {
 }
 
 //reviewed
+
+// serveAdmin serves the operations nodetool provides over JMX.
+func serveAdmin(addr string, d *db.DB) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, d.Status())
+	})
+	mux.HandleFunc("POST /repair", func(w http.ResponseWriter, r *http.Request) {
+		st, err := d.Repair(r.URL.Query().Get("keyspace"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintf(w, "repaired %d ranges: %d mismatching, %d rows streamed\n", st.Ranges, st.Mismatches, st.Streamed)
+	})
+	mux.HandleFunc("POST /decommission", func(w http.ResponseWriter, _ *http.Request) {
+		if err := d.Decommission(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintln(w, "decommissioned: the node has left the ring and can be stopped")
+	})
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Printf("admin endpoint: %v", err)
+	}
+}
