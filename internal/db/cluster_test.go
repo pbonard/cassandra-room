@@ -23,6 +23,7 @@ import (
 // in-memory file system that survives restarts.
 type testCluster struct {
 	dcs   []string // data center per node ("" for the default)
+	tweak func(*ClusterOptions)
 	t     *testing.T
 	fs    []vfs.FS
 	addrs []string
@@ -78,11 +79,15 @@ func (c *testCluster) open(i int, replace string, hook func(op, unit string) err
 	if i < len(c.dcs) {
 		o.DataCenter = c.dcs[i]
 	}
-	return Open("db", Options{FS: o.FS, Address: o.Address, DataCenter: o.DataCenter, StreamHook: hook, Cluster: &ClusterOptions{
+	co := &ClusterOptions{
 		ListenAddress: c.addrs[i], Seeds: []string{c.addrs[0]}, NumTokens: 8, ReplaceAddress: replace, Messaging: cluster.MessagingOptions{Compress: true},
 		Membership:   testMembership(),
 		WriteTimeout: time.Second, ReadTimeout: time.Second,
-	}})
+	}
+	if c.tweak != nil {
+		c.tweak(co)
+	}
+	return Open("db", Options{FS: o.FS, Address: o.Address, DataCenter: o.DataCenter, StreamHook: hook, Cluster: co})
 }
 
 func (c *testCluster) stop(i int) {
@@ -714,4 +719,45 @@ func TestClusterResumableBootstrap(t *testing.T) {
 	_, err = d.readFile(streamProgressFile)
 	require.NoError(t, err)
 	require.Empty(t, d.progress().m["bootstrap"], "the progress is cleared once joined")
+}
+
+// TestClusterHintWindowAndTTL checks that a node down longer than the hint
+// window gets no more hints, and that hints expire with their tables'
+// gc_grace_seconds.
+func TestClusterHintWindowAndTTL(t *testing.T) {
+	c := &testCluster{t: t, tweak: func(o *ClusterOptions) { o.MaxHintWindow = 1500 * time.Millisecond }}
+	for i := 0; i < 2; i++ {
+		c.add()
+	}
+	for i := range c.nodes {
+		c.start(i)
+	}
+	t.Cleanup(func() {
+		for _, d := range c.nodes {
+			if d != nil {
+				d.Close()
+			}
+		}
+	})
+	c.waitConverged()
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
+	c.ok(0, quorum, "CREATE TABLE ks.kv (k int PRIMARY KEY, v text)")
+	c.ok(0, quorum, "CREATE TABLE ks.short (k int PRIMARY KEY, v text) WITH gc_grace_seconds = 1")
+	time.Sleep(100 * time.Millisecond)
+	c.stop(1)
+	require.Eventually(t, func() bool { return !c.nodes[0].proxy.g.IsAlive(c.addrs[1]) }, 5*time.Second, 10*time.Millisecond)
+	c.ok(0, one, "INSERT INTO ks.kv (k, v) VALUES (1, 'hinted')")
+	c.ok(0, one, "INSERT INTO ks.short (k, v) VALUES (1, 'expires')")
+	time.Sleep(2 * time.Second) // past the window and the short table's gc_grace
+	c.ok(0, one, "INSERT INTO ks.kv (k, v) VALUES (2, 'not hinted')")
+	c.start(1)
+	c.waitConverged()
+	local := func(q string) int {
+		res := c.nodes[1].Execute(mustPrepare(t, c.nodes[1], q), &RequestOptions{Consistency: one, local: true, forwarded: true})
+		return len(res.(*message.RowsResult).Data)
+	}
+	require.Eventually(t, func() bool { return local("SELECT k FROM ks.kv WHERE k = 1") == 1 }, 10*time.Second, 50*time.Millisecond, "the hint within the window is delivered")
+	time.Sleep(300 * time.Millisecond)
+	require.Zero(t, local("SELECT k FROM ks.kv WHERE k = 2"), "no hint once the node was down past the window")
+	require.Zero(t, local("SELECT k FROM ks.short WHERE k = 1"), "the hint expired with gc_grace_seconds")
 }

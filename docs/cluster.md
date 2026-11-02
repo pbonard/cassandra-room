@@ -90,7 +90,11 @@ node, the coordinator in a cluster.
   for the consistency level's blockFor acks per partition. Too few live
   replicas: `Unavailable`; no answer in time: `WriteTimeout`. Down or
   failing replicas get **hints**, stored locally and replayed when they come
-  back (and every 5 s). Nodes joining or taking over a range also receive
+  back (and every 5 s), as Cassandra's hinted handoff: no hints for a node
+  down longer than `max_hint_window` (3 h); a hint expires after the
+  smallest `gc_grace_seconds` of its tables (none for tables with 0);
+  replay is throttled to `hinted_handoff_throttle` (1 MiB/s) shared by the
+  nodes being replayed to; hints for nodes that left are dropped. Nodes joining or taking over a range also receive
   its writes (pending ranges).
 - **Reads** of a row ask one replica (this node first) for the data and
   the others blockFor needs for a digest; matching digests answer at once,

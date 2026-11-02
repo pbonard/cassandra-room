@@ -42,6 +42,14 @@ type ClusterOptions struct {
 	// WriteTimeout and ReadTimeout bound requests to replicas
 	// (write_request_timeout, read_request_timeout): 2 s and 5 s.
 	WriteTimeout, ReadTimeout time.Duration
+	// Hinted handoff: MaxHintWindow is how long a node may be down and
+	// still get hints (max_hint_window, default 3h); HintThrottle the
+	// bytes per second hints are replayed at, shared by the nodes being
+	// replayed to (hinted_handoff_throttle, default 1 MiB/s); DisableHints
+	// turns hints off (hinted_handoff_enabled: false).
+	MaxHintWindow time.Duration
+	HintThrottle  int64
+	DisableHints  bool
 	// Messaging configures internode encryption and compression.
 	Messaging cluster.MessagingOptions
 	// Membership tunes failure detection and gossip (memberlist's LAN
@@ -72,6 +80,9 @@ type proxy struct {
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
 	hintMu   sync.Mutex
+	// downSince is when each node was last seen going down.
+	downSince sync.Map // addr -> time.Time
+	started   time.Time
 	seq      atomic.Uint64
 }
 
@@ -129,6 +140,12 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	if o.ReadTimeout <= 0 {
 		o.ReadTimeout = 5 * time.Second
 	}
+	if o.MaxHintWindow <= 0 {
+		o.MaxHintWindow = 3 * time.Hour
+	}
+	if o.HintThrottle <= 0 {
+		o.HintThrottle = 1 << 20
+	}
 	if _, err := d.engine.Table(hintsStorage); errors.Is(err, lsm.ErrUnknownTable) {
 		if _, err := d.engine.CreateTable(hintsStorage); err != nil {
 			return err
@@ -148,7 +165,7 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	if err != nil {
 		return err
 	}
-	p := &proxy{d: d, m: m, opts: *o, self: m.Addr(), stopCh: make(chan struct{})}
+	p := &proxy{d: d, m: m, opts: *o, self: m.Addr(), stopCh: make(chan struct{}), started: time.Now()}
 	m.Handle(cluster.VerbMutation, p.handleMutation)
 	m.Handle(cluster.VerbReadRow, p.handleReadRow)
 	m.Handle(cluster.VerbReadDigest, p.handleReadDigest)
@@ -184,7 +201,10 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	p.g.OnChange(p.membershipChanged)
 	p.g.OnLiveness(func(addr string, up bool) {
 		if up {
+			p.downSince.Delete(addr)
 			go p.replayHints()
+		} else {
+			p.downSince.LoadOrStore(addr, time.Now())
 		}
 	})
 	d.proxy = p
@@ -785,31 +805,67 @@ type hint struct {
 }
 
 func (p *proxy) storeHints(hs []hint) {
-	if len(hs) == 0 {
+	if len(hs) == 0 || p.opts.DisableHints {
 		return
 	}
+	dir := p.d.schema.Load().Nodes
 	by := map[string][]write{}
 	for _, h := range hs {
+		if n := dir[h.hostID]; n == nil || n.Status == cluster.StatusLeft || !p.withinHintWindow(n) {
+			continue
+		}
 		by[h.hostID] = append(by[h.hostID], h.w)
 	}
 	var ws []write
-	now := time.Now().UnixMicro()
+	now := time.Now()
 	for host, writes := range by {
 		id, err := types.ParseUUID(host)
 		if err != nil {
 			continue
 		}
-		key := append(id[:], binary.BigEndian.AppendUint64(nil, uint64(now))...)
+		// A hint lives as long as the smallest gc_grace_seconds of its
+		// tables: replayed later, it could resurrect deleted data.
+		ttl := p.hintTTL(writes)
+		if ttl == 0 {
+			continue
+		}
+		key := append(id[:], binary.BigEndian.AppendUint64(nil, uint64(now.UnixMicro()))...)
 		key = binary.BigEndian.AppendUint64(key, p.seq.Add(1))
 		v := row.Append(nil, &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: row.NoTimestamp},
-			Cells: []row.Cell{{Column: 1, Timestamp: now, LocalDeletionTime: row.NoDeletionTime, Value: encodeWrites(writes)}}})
+			Cells: []row.Cell{{Column: 1, Timestamp: now.UnixMicro(), TTL: uint32(ttl), LocalDeletionTime: now.Unix() + ttl, Value: encodeWrites(writes)}}})
 		ws = append(ws, write{table: hintsStorage, key: key, value: v})
 	}
 	_ = p.d.applyLocal(ws)
 }
 
+// withinHintWindow reports whether a node has been down for less than
+// max_hint_window (a node down since before this node started counts
+// from the start).
+func (p *proxy) withinHintWindow(n *cluster.Node) bool {
+	since := p.started
+	if v, ok := p.downSince.Load(n.Addr); ok {
+		since = v.(time.Time)
+	} else if p.g.IsAlive(n.Addr) {
+		return true // up (the write failed or timed out)
+	}
+	return time.Since(since) < p.opts.MaxHintWindow
+}
+
+// hintTTL is the smallest gc_grace_seconds of the writes' tables.
+func (p *proxy) hintTTL(ws []write) int64 {
+	s := p.d.schema.Load()
+	ttl := int64(math.MaxInt32)
+	for _, w := range ws {
+		if t := s.byStorage[w.table]; t != nil { // (index entries follow their table)
+			ttl = min(ttl, int64(t.Params.GCGraceSeconds))
+		}
+	}
+	return ttl
+}
+
 // replayHints sends stored hints to the live nodes they are for, deleting
-// the delivered ones.
+// the delivered ones, at hinted_handoff_throttle bytes per second shared
+// by the nodes being replayed to. Hints for nodes that left are dropped.
 func (p *proxy) replayHints() {
 	if !p.hintMu.TryLock() {
 		return
@@ -819,40 +875,74 @@ func (p *proxy) replayHints() {
 	if err != nil {
 		return
 	}
-	byHost := map[string]*cluster.Node{}
-	for _, n := range p.d.schema.Load().Nodes {
-		if n.Addr != p.self && p.g.IsAlive(n.Addr) {
-			byHost[n.HostID] = n
+	dir := p.d.schema.Load().Nodes
+	others := 0
+	for _, n := range dir {
+		if n.Addr != p.self && n.Status != cluster.StatusLeft {
+			others++
 		}
 	}
-	for host, node := range byHost {
-		id, err := types.ParseUUID(host)
+	rate := float64(p.opts.HintThrottle) / float64(max(others, 1))
+	it, err := lt.NewIter(nil, nil)
+	if err != nil {
+		return
+	}
+	defer it.Close()
+	nowSec := time.Now().Unix()
+	var done []write
+	tombstone := func(k []byte) {
+		now := time.Now()
+		done = append(done, write{table: hintsStorage, key: slices.Clone(k),
+			value: row.Append(nil, &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: now.UnixMicro(), LocalDeletionTime: now.Unix()}})})
+	}
+	failed := map[string]bool{}
+	for ok := it.First(); ok; ok = it.Next() {
+		k := it.Key()
+		if len(k) < 16 {
+			continue
+		}
+		host := types.FormatUUID(k[:16])
+		n := dir[host]
+		if n == nil || n.Status == cluster.StatusLeft {
+			tombstone(k) // the node left: nobody will take these
+			continue
+		}
+		if failed[host] || n.Addr == p.self || !p.g.IsAlive(n.Addr) {
+			continue
+		}
+		r, err := row.Decode(it.Value())
 		if err != nil {
 			continue
 		}
-		it, err := lt.NewIter(id[:], prefixEnd(id[:]))
+		live := r.Live(nowSec)
+		if len(live) == 0 {
+			continue // expired (purged by compaction)
+		}
+		payload := live[0].Value
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), p.opts.WriteTimeout)
+		_, err = p.m.Request(ctx, n.Addr, cluster.VerbMutation, payload)
+		cancel()
 		if err != nil {
+			failed[host] = true
 			continue
 		}
-		var done []write
-		for ok := it.First(); ok; ok = it.Next() {
-			r, err := row.Decode(it.Value())
-			if err != nil || len(r.Cells) == 0 {
-				continue
+		tombstone(k)
+		// Throttle: this hint's bytes take len/rate seconds.
+		if wait := time.Duration(float64(len(payload))/rate*float64(time.Second)) - time.Since(start); wait > 0 {
+			select {
+			case <-time.After(wait):
+			case <-p.stopCh:
+				_ = p.d.applyLocal(done)
+				return
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), p.opts.WriteTimeout)
-			_, err = p.m.Request(ctx, node.Addr, cluster.VerbMutation, r.Cells[0].Value)
-			cancel()
-			if err != nil {
-				break
-			}
-			now := time.Now()
-			done = append(done, write{table: hintsStorage, key: slices.Clone(it.Key()),
-				value: row.Append(nil, &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: now.UnixMicro(), LocalDeletionTime: now.Unix()}})})
 		}
-		it.Close()
-		_ = p.d.applyLocal(done)
+		if len(done) >= 256 {
+			_ = p.d.applyLocal(done)
+			done = nil
+		}
 	}
+	_ = p.d.applyLocal(done)
 }
 
 // ---- reads ----
