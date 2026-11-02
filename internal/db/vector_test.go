@@ -31,6 +31,7 @@ func TestVectors(t *testing.T) {
 	s.fails("CREATE INDEX ON ks.items (v) USING 'sai' WITH OPTIONS = {'maximum_node_connections': '0'}", "maximum_node_connections")
 	s.ok("CREATE INDEX ON ks.items (v) USING 'sai' WITH OPTIONS = {'optimize_for': 'recall', 'maximum_node_connections': '24'}")
 	s.fails("SELECT id FROM ks.items ORDER BY v ANN OF [1, 0, 0]", "requires a LIMIT")
+	s.fails("SELECT id FROM ks.items ORDER BY v ANN OF [1, 0, 0] LIMIT 1001", "not greater than 1000")
 	require.Equal(t, []string{"1", "2"}, s.rows("SELECT id FROM ks.items ORDER BY v ANN OF [1, 0, 0] LIMIT 2"))
 	all := s.rows("SELECT id FROM ks.items ORDER BY v ANN OF [1, 0, 0] LIMIT 10")
 	require.Len(t, all, 5)

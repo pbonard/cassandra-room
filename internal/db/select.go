@@ -672,6 +672,9 @@ func (q *query) run() (message.Message, error) {
 		if q.annQuery, err = s.ann.query(e); err != nil {
 			return nil, err
 		}
+		if q.limit > maxANNLimit {
+			return nil, invalidf("Use of ANN OF in an ORDER BY clause requires a LIMIT that is not greater than %d. LIMIT was %d", maxANNLimit, q.limit)
+		}
 		q.annLimit, q.limit, q.pageSize = q.limit, math.MaxInt64, 0
 	}
 	if s.aggregate || len(s.groupBy) > 0 {

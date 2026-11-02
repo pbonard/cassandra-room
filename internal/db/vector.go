@@ -52,6 +52,10 @@ var similarities = map[string]similarity{
 	},
 }
 
+// maxANNLimit is the largest LIMIT of an ANN query
+// (SAI_VECTOR_SEARCH_MAX_TOP_K): results are merged in memory.
+const maxANNLimit = 1000
+
 type annOrder struct {
 	col *Column
 	t   term

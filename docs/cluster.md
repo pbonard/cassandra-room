@@ -118,8 +118,13 @@ node, the coordinator in a cluster.
   Each replica's promise, accepted proposal and last commit are cells of a
   `system.paxos`-like table, synced before answering. SERIAL reads finish
   rounds in progress first. Any node can coordinate.
-- **Secondary index** queries are gathered from every live node, each
-  answering for the partitions it is the first live replica of.
+- **Secondary index** queries walk the ring's token ranges in order, as
+  Cassandra's index range reads do: the coordinator asks one live replica
+  of each range to read its local index for that range, until the page is
+  full, and the paging state records the next range (and the replica's
+  own paging state inside it). LIMIT holds across pages. ANN queries ask
+  every node for its best rows and merge them by score (LIMIT at most
+  1000).
 - Drivers see the cluster through `system.peers`/`peers_v2` and route
   token-aware.
 

@@ -2,6 +2,7 @@ package db
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -9,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"slices"
 	"sort"
@@ -1445,9 +1447,14 @@ type forwarded struct {
 	Timestamp *int64
 	NowInSec  *int32
 	User      string
-	Local     bool             // read only this node's data (index scatter)
-	Batch     []forwardedChild `json:",omitempty"`
-	BatchType uint8
+	Local     bool // read only this node's data (index scatter)
+	// TokenRange restricts an index query to the tokens (lo, hi]; PageSize
+	// and Paging page it.
+	TokenRange *[2]int64        `json:",omitempty"`
+	PageSize   int32            `json:",omitempty"`
+	Paging     []byte           `json:",omitempty"`
+	Batch      []forwardedChild `json:",omitempty"`
+	BatchType  uint8
 }
 
 type forwardedChild struct {
@@ -1520,7 +1527,8 @@ func (p *proxy) handleExecute(ctx context.Context, _ string, payload []byte) ([]
 		return nil, err
 	}
 	o := &RequestOptions{Consistency: primitive.ConsistencyLevel(f.CL), SerialConsistency: primitive.ConsistencyLevel(f.Serial), Timestamp: f.Timestamp, NowInSec: f.NowInSec,
-		User: f.User, Version: primitive.ProtocolVersion4, forwarded: true, local: f.Local}
+		User: f.User, Version: primitive.ProtocolVersion4, forwarded: true, local: f.Local,
+		PageSize: f.PageSize, PagingState: f.Paging, tokenRange: f.TokenRange}
 	var res message.Message
 	if f.Batch != nil {
 		children := make([]BatchChild, len(f.Batch))
@@ -1678,10 +1686,151 @@ func tokenStrings(ts []int64) []string {
 	return out
 }
 
-// scatter runs an index query on every live node, each reading its local
-// index for the partitions it is the first live replica of, and merges
-// the rows (secondary indexes are local to each node, as in Cassandra).
+// scatter runs an index query across the cluster. Secondary indexes are
+// local to each node, so, as Cassandra's range reads with an index do, the
+// coordinator walks the ring's token ranges in order and asks one live
+// replica of each to read its index for that range, until the page is
+// full; the paging state says where to resume. ANN queries instead ask
+// every node for its best rows and merge them by score.
 func (p *proxy) scatter(pr *Prepared, e *execCtx, o *RequestOptions) message.Message {
+	sel := pr.state.Load().stmt.(*selectStmt)
+	if sel.ann != nil {
+		return p.scatterANN(pr, e, o, sel)
+	}
+	k := p.d.schema.Load().Keyspaces[sel.t.Keyspace]
+	limit, ok, err := bindInt(e, sel.limit, "limit")
+	if err != nil {
+		return ErrorMessage(err)
+	}
+	if !ok {
+		limit = math.MaxInt64
+	}
+	segs := p.tokenSegments()
+	st := scatterState{next: segs[0][1], remaining: limit}
+	if len(o.PagingState) > 0 {
+		if st, err = decodeScatterState(o.PagingState); err != nil {
+			return ErrorMessage(invalidf("Invalid value for the paging state"))
+		}
+	}
+	pageSize := int64(o.PageSize)
+	if pageSize <= 0 {
+		pageSize = math.MaxInt64
+	}
+	vals, null, unset := packValues(e.values)
+	out := &message.RowsResult{Metadata: &message.RowsMetadata{Columns: sel.metadata(), ColumnCount: int32(len(sel.metadata()))}, Data: message.RowSet{}}
+	more := false
+	for i, seg := range segs {
+		if seg[1] < st.next {
+			continue // done in an earlier page
+		}
+		want := min(pageSize-int64(len(out.Data)), st.remaining)
+		if want <= 0 {
+			// The page is full: resume at this segment.
+			st.next, st.inner, more = seg[1], nil, st.remaining > 0
+			break
+		}
+		reps, live := p.replicas(k, seg[1], primitive.ConsistencyLevelOne)
+		if live == 0 {
+			return ErrorMessage(&unavailableError{cl: primitive.ConsistencyLevelOne, required: 1, alive: 0})
+		}
+		f := &forwarded{Keyspace: pr.Keyspace, Query: pr.Query, Values: vals, Null: null, Unset: unset,
+			CL: uint16(primitive.ConsistencyLevelOne), Timestamp: o.Timestamp, NowInSec: o.NowInSec, User: o.User,
+			Local: true, TokenRange: &[2]int64{seg[0], seg[1]}, Paging: st.inner}
+		if want < math.MaxInt32 {
+			f.PageSize = int32(want)
+		}
+		var res message.Message
+		for _, r := range reps[:live] {
+			res = p.forward(r.Addr, f)
+			if _, failed := res.(*message.WriteTimeout); !failed {
+				break // (forward reports an unreachable node as a timeout; try the next replica)
+			}
+		}
+		rows, ok := res.(*message.RowsResult)
+		if !ok {
+			return res
+		}
+		out.Data = append(out.Data, rows.Data...)
+		st.remaining -= int64(len(rows.Data))
+		st.inner = nil
+		if rows.Metadata != nil && rows.Metadata.PagingState != nil && st.remaining > 0 {
+			// More in this segment.
+			st.next, st.inner, more = seg[1], rows.Metadata.PagingState, true
+			break
+		}
+		if i+1 < len(segs) {
+			st.next = segs[i+1][1]
+		} else {
+			st.next = math.MaxInt64
+		}
+	}
+	md := *out.Metadata
+	md.PagingState = nil
+	if more {
+		md.PagingState = st.encode()
+	}
+	out.Metadata = &md
+	return out
+}
+
+// tokenSegments are the ring's ranges as (lo, hi] in token order, the
+// range that wraps around split in two.
+func (p *proxy) tokenSegments() [][2]int64 {
+	var out [][2]int64
+	for _, r := range p.ring.Load().Ranges() {
+		if r[0] < r[1] {
+			out = append(out, r)
+			continue
+		}
+		out = append(out, [2]int64{math.MinInt64, r[1]})
+		if r[0] != math.MaxInt64 {
+			out = append(out, [2]int64{r[0], math.MaxInt64})
+		}
+	}
+	slices.SortFunc(out, func(a, b [2]int64) int { return cmp.Compare(a[1], b[1]) })
+	if len(out) == 0 {
+		out = [][2]int64{{math.MinInt64, math.MaxInt64}}
+	}
+	return out
+}
+
+// scatterState is a scattered query's paging state: the segment ending
+// at next is the first one not done (inner is its replica's paging state,
+// if under way), and remaining rows are left of the limit.
+type scatterState struct {
+	next      int64
+	inner     []byte
+	remaining int64
+}
+
+func (s scatterState) encode() []byte {
+	b := binary.AppendVarint([]byte{'S'}, s.next)
+	b = binary.AppendVarint(b, s.remaining)
+	return append(b, s.inner...)
+}
+
+func decodeScatterState(b []byte) (scatterState, error) {
+	bad := errors.New("db: bad scatter paging state")
+	if len(b) < 3 || b[0] != 'S' {
+		return scatterState{}, bad
+	}
+	var s scatterState
+	var n, m int
+	if s.next, n = binary.Varint(b[1:]); n <= 0 {
+		return s, bad
+	}
+	if s.remaining, m = binary.Varint(b[1+n:]); m <= 0 {
+		return s, bad
+	}
+	if rest := b[1+n+m:]; len(rest) > 0 {
+		s.inner = rest
+	}
+	return s, nil
+}
+
+// scatterANN asks every live node for its best rows of an ANN query (for
+// the partitions it is the first replica of) and merges them by score.
+func (p *proxy) scatterANN(pr *Prepared, e *execCtx, o *RequestOptions, sel *selectStmt) message.Message {
 	vals, null, unset := packValues(e.values)
 	f := &forwarded{Keyspace: pr.Keyspace, Query: pr.Query, Values: vals, Null: null, Unset: unset,
 		CL: uint16(primitive.ConsistencyLevelOne), Timestamp: o.Timestamp, NowInSec: o.NowInSec, User: o.User, Local: true}
@@ -1712,15 +1861,8 @@ func (p *proxy) scatter(pr *Prepared, e *execCtx, o *RequestOptions) message.Mes
 		}
 		out.Data = append(out.Data, rows.Data...)
 	}
-	st := pr.state.Load()
-	if sel, ok := st.stmt.(*selectStmt); ok {
-		limit, ok, _ := bindInt(e, sel.limit, "limit")
-		if sel.ann != nil {
-			mergeANN(out, limit)
-		} else if ok && int64(len(out.Data)) > limit {
-			out.Data = out.Data[:limit]
-		}
-	}
+	limit, _, _ := bindInt(e, sel.limit, "limit")
+	mergeANN(out, limit)
 	out.Metadata.PagingState = nil
 	return out
 }

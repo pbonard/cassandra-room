@@ -340,7 +340,7 @@ func (q *query) scanIndex(plan *indexPlan) error {
 		if q.ranges != nil && !q.inRanges(suffix) {
 			continue
 		}
-		if px := q.e.d.proxy; px != nil && !px.ownsPrimary(q.s.t.Keyspace, tokenOf(p)) {
+		if !q.owns(p) {
 			continue
 		}
 		q.indexKey = key
@@ -499,4 +499,23 @@ func entryTuple(k, v []byte) []byte {
 	out = append(out, k...)
 	out = binary.BigEndian.AppendUint32(out, uint32(len(v)))
 	return append(out, v...)
+}
+
+// owns reports whether a scattered index query answers for a partition:
+// one in its token range, or, without one, a partition this node is the
+// first live replica of.
+func (q *query) owns(p []byte) bool {
+	if r := q.e.tokenRange; r != nil {
+		return inTokenRange(tokenOf(p), r[0], r[1])
+	}
+	px := q.e.d.proxy
+	return px == nil || px.ownsPrimary(q.s.t.Keyspace, tokenOf(p))
+}
+
+// inTokenRange reports whether tok is in (lo, hi], wrapping if lo >= hi.
+func inTokenRange(tok, lo, hi int64) bool {
+	if lo < hi {
+		return tok > lo && tok <= hi
+	}
+	return tok > lo || tok <= hi
 }

@@ -164,6 +164,8 @@ type execCtx struct {
 	counterDeltas bool
 	// local restricts reads to this node (replica-side reads).
 	local bool
+	// tokenRange restricts a scattered index query to (lo, hi].
+	tokenRange *[2]int64
 }
 
 // readStore is where the statement reads: the cluster, or this node.
@@ -201,8 +203,10 @@ type RequestOptions struct {
 	Consistency       primitive.ConsistencyLevel
 	SerialConsistency primitive.ConsistencyLevel
 	// forwarded marks a statement another node sent to run here; local
-	// restricts its reads to this node.
+	// restricts its reads to this node, tokenRange an index query to the
+	// tokens (lo, hi].
 	forwarded, local bool
+	tokenRange       *[2]int64
 }
 
 // OptionsOf converts protocol query options.
@@ -222,7 +226,7 @@ func OptionsOf(o *message.QueryOptions, v primitive.ProtocolVersion) *RequestOpt
 }
 
 func (d *DB) newCtx(o *RequestOptions, st *prepState) (*execCtx, error) {
-	e := &execCtx{d: d, now: d.opts.Now(), page: int(o.PageSize), paging: o.PagingState, noMeta: o.SkipMeta, version: o.Version, user: o.User, cl: o.Consistency, serial: o.SerialConsistency, local: o.local}
+	e := &execCtx{d: d, now: d.opts.Now(), page: int(o.PageSize), paging: o.PagingState, noMeta: o.SkipMeta, version: o.Version, user: o.User, cl: o.Consistency, serial: o.SerialConsistency, local: o.local, tokenRange: o.tokenRange}
 	e.nowSec = e.now.Unix()
 	if o.NowInSec != nil {
 		e.nowSec = int64(*o.NowInSec)

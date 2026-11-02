@@ -610,3 +610,63 @@ func TestClusterVectorSearch(t *testing.T) {
 		require.Len(t, rows.Metadata.Columns, 1, "no score column")
 	}
 }
+
+// TestClusterIndexPaging pages through a secondary index query in a
+// cluster: the coordinator walks the token ranges, each page resuming
+// where the last stopped, with no row missed or repeated, and LIMIT holds
+// across pages.
+func TestClusterIndexPaging(t *testing.T) {
+	c := newTestCluster(t, 3)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
+	c.ok(0, quorum, "CREATE TABLE ks.u (k int, c int, color text, PRIMARY KEY (k, c))")
+	c.ok(1, quorum, "CREATE INDEX ON ks.u (color)")
+	time.Sleep(100 * time.Millisecond)
+	for k := 0; k < 100; k++ {
+		for cc := 0; cc < 3; cc++ {
+			color := "red"
+			if (k+cc)%4 == 0 {
+				color = "blue"
+			}
+			c.ok(k%3, quorum, "INSERT INTO ks.u (k, c, color) VALUES (?, ?, ?)", k, cc, color)
+		}
+	}
+	page := func(node int, q string, size int32) []string {
+		d := c.nodes[node]
+		pr := mustPrepare(t, d, q)
+		var all []string
+		var state []byte
+		for pages := 0; ; pages++ {
+			require.Less(t, pages, 1000)
+			res := d.Execute(pr, &RequestOptions{Consistency: one, PageSize: size, PagingState: state})
+			rows, ok := res.(*message.RowsResult)
+			require.True(t, ok, "%v", res)
+			require.LessOrEqual(t, len(rows.Data), int(size))
+			for _, r := range rows.Data {
+				all = append(all, fmt.Sprintf("%d/%d", be32(r[0]), be32(r[1])))
+			}
+			if rows.Metadata.PagingState == nil {
+				return all
+			}
+			state = rows.Metadata.PagingState
+		}
+	}
+	want := 0
+	for k := 0; k < 100; k++ {
+		for cc := 0; cc < 3; cc++ {
+			if (k+cc)%4 != 0 {
+				want++
+			}
+		}
+	}
+	for n := range c.nodes {
+		got := page(n, "SELECT k, c FROM ks.u WHERE color = 'red'", 25)
+		require.Len(t, got, want, "node %d", n)
+		seen := map[string]bool{}
+		for _, g := range got {
+			require.False(t, seen[g], "node %d: %s twice", n, g)
+			seen[g] = true
+		}
+	}
+	got := page(2, "SELECT k, c FROM ks.u WHERE color = 'red' LIMIT 60", 25)
+	require.Len(t, got, 60)
+}

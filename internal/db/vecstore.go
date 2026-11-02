@@ -287,7 +287,7 @@ func (q *query) annSearch(ix *Index) error {
 			if q.ranges != nil && !q.inRanges(suffix) {
 				continue
 			}
-			if px := q.e.d.proxy; px != nil && !px.ownsPrimary(q.s.t.Keyspace, tokenOf(p)) {
+			if !q.owns(p) {
 				continue
 			}
 			found, err := q.readRowAt(src, p, pk, suffix, nil)
