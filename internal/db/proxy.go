@@ -40,6 +40,8 @@ type ClusterOptions struct {
 	// WriteTimeout and ReadTimeout bound requests to replicas
 	// (write_request_timeout, read_request_timeout): 2 s and 5 s.
 	WriteTimeout, ReadTimeout time.Duration
+	// Messaging configures internode encryption and compression.
+	Messaging cluster.MessagingOptions
 	// Membership tunes failure detection and gossip (memberlist's LAN
 	// defaults if nil).
 	Membership *cluster.Config
@@ -139,7 +141,7 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 			return err
 		}
 	}
-	m, err := cluster.NewMessaging(o.ListenAddress)
+	m, err := cluster.NewMessagingWith(o.ListenAddress, o.Messaging)
 	if err != nil {
 		return err
 	}

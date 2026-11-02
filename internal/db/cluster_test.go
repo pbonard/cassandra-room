@@ -72,7 +72,7 @@ func (c *testCluster) startReplacing(i int, replace string) {
 		o.DataCenter = c.dcs[i]
 	}
 	d, err := Open("db", Options{FS: o.FS, Address: o.Address, DataCenter: o.DataCenter, Cluster: &ClusterOptions{
-		ListenAddress: c.addrs[i], Seeds: []string{c.addrs[0]}, NumTokens: 8, ReplaceAddress: replace,
+		ListenAddress: c.addrs[i], Seeds: []string{c.addrs[0]}, NumTokens: 8, ReplaceAddress: replace, Messaging: cluster.MessagingOptions{Compress: true},
 		Membership:   testMembership(),
 		WriteTimeout: time.Second, ReadTimeout: time.Second,
 	}})

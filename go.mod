@@ -7,7 +7,9 @@ require (
 	github.com/cockroachdb/pebble v0.0.0-20261021160554-a995e890c06e
 	github.com/datastax/go-cassandra-native-protocol v0.0.0-20260130100129-9d5b43677a33
 	github.com/gocql/gocql v1.7.0
+	github.com/pierrec/lz4/v4 v4.0.3
 	github.com/stretchr/testify v1.9.0
+	golang.org/x/crypto v0.58.0
 	gopkg.in/inf.v0 v0.9.1
 )
 
@@ -37,7 +39,6 @@ require (
 	github.com/kr/text v0.2.0 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.4 // indirect
 	github.com/minio/minlz v1.0.2-0.20260119185444-845e64f85661 // indirect
-	github.com/pierrec/lz4/v4 v4.0.3 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/prometheus/client_golang v1.16.0 // indirect
@@ -47,7 +48,6 @@ require (
 	github.com/puzpuzpuz/xsync/v3 v3.5.1 // indirect
 	github.com/rogpeppe/go-internal v1.9.0 // indirect
 	github.com/zeebo/xxh3 v1.0.2 // indirect
-	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.43.0 // indirect

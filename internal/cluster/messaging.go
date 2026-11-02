@@ -8,6 +8,7 @@ package cluster
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/pierrec/lz4/v4"
 )
 
 // Verb identifies a message's handler (Verb).
@@ -66,6 +69,18 @@ type Messaging struct {
 	wg     sync.WaitGroup
 	// dialTimeout bounds connection attempts.
 	dialTimeout time.Duration
+	opts        MessagingOptions
+}
+
+// MessagingOptions configure internode connections
+// (server_encryption_options, internode_compression).
+type MessagingOptions struct {
+	// TLS, if set, encrypts every connection; the same configuration
+	// serves and dials, so nodes authenticate each other.
+	TLS *tls.Config
+	// Compress compresses frame payloads above a few hundred bytes with
+	// LZ4, as Cassandra's internode_compression: all.
+	Compress bool
 }
 
 const (
@@ -80,13 +95,57 @@ var ErrTimeout = errors.New("cluster: request timed out")
 
 // NewMessaging listens on addr ("host:port").
 func NewMessaging(addr string) (*Messaging, error) {
+	return NewMessagingWith(addr, MessagingOptions{})
+}
+
+// NewMessagingWith listens on addr with options.
+func NewMessagingWith(addr string, o MessagingOptions) (*Messaging, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 	m := &Messaging{addr: ln.Addr().String(), ln: ln, handlers: map[Verb]Handler{},
-		conns: map[string]*outConn{}, inbound: map[net.Conn]struct{}{}, dialTimeout: 2 * time.Second}
+		conns: map[string]*outConn{}, inbound: map[net.Conn]struct{}{}, dialTimeout: 2 * time.Second, opts: o}
+	if o.TLS != nil {
+		m.ln = tls.NewListener(ln, o.TLS)
+	}
 	return m, nil
+}
+
+const (
+	compressedFlag = 0x80
+	compressMin    = 512
+)
+
+// pack compresses a payload if worth it, returning the kind flag.
+func (m *Messaging) pack(payload []byte) (byte, []byte) {
+	if !m.opts.Compress || len(payload) < compressMin {
+		return 0, payload
+	}
+	buf := make([]byte, binary.MaxVarintLen64+lz4.CompressBlockBound(len(payload)))
+	n := binary.PutUvarint(buf, uint64(len(payload)))
+	var c lz4.Compressor
+	k, err := c.CompressBlock(payload, buf[n:])
+	if err != nil || k == 0 || n+k >= len(payload) {
+		return 0, payload
+	}
+	return compressedFlag, buf[:n+k]
+}
+
+func unpack(kind byte, payload []byte) (byte, []byte, error) {
+	if kind&compressedFlag == 0 {
+		return kind, payload, nil
+	}
+	size, n := binary.Uvarint(payload)
+	if n <= 0 || size > maxFrame {
+		return 0, nil, errors.New("cluster: corrupt compressed frame")
+	}
+	out := make([]byte, size)
+	k, err := lz4.UncompressBlock(payload[n:], out)
+	if err != nil || uint64(k) != size {
+		return 0, nil, errors.New("cluster: corrupt compressed frame")
+	}
+	return kind &^ compressedFlag, out, nil
 }
 
 // Addr returns the address the node listens on.
@@ -156,7 +215,10 @@ func readFrame(r io.Reader) (kind byte, verb Verb, id uint64, payload []byte, er
 	}
 	kind, verb, id = hdr[4], Verb(hdr[5]), binary.BigEndian.Uint64(hdr[6:])
 	payload = make([]byte, n-10)
-	_, err = io.ReadFull(r, payload)
+	if _, err = io.ReadFull(r, payload); err != nil {
+		return
+	}
+	kind, payload, err = unpack(kind, payload)
 	return
 }
 
@@ -197,8 +259,9 @@ func (m *Messaging) serve(c net.Conn) {
 			if herr != nil {
 				k, resp = kindError, []byte(herr.Error())
 			}
+			flag, resp := m.pack(resp)
 			wmu.Lock()
-			_ = writeFrame(c, k, verb, id, resp)
+			_ = writeFrame(c, k|flag, verb, id, resp)
 			wmu.Unlock()
 		}()
 	}
@@ -254,6 +317,20 @@ func (m *Messaging) conn(to string) (*outConn, error) {
 	}
 	if tc, ok := c.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
+	}
+	if m.opts.TLS != nil {
+		cfg := m.opts.TLS.Clone()
+		if cfg.ServerName == "" {
+			cfg.ServerName, _, _ = net.SplitHostPort(to)
+		}
+		tc := tls.Client(c, cfg)
+		_ = tc.SetDeadline(time.Now().Add(m.dialTimeout))
+		if err := tc.Handshake(); err != nil {
+			c.Close()
+			return nil, err
+		}
+		_ = tc.SetDeadline(time.Time{})
+		c = tc
 	}
 	oc := &outConn{c: c, pending: map[uint64]chan result{}}
 	if err := writeFrame(c, kindRequest, 0, 0, []byte(m.addr)); err != nil {
@@ -315,8 +392,9 @@ func (m *Messaging) Request(ctx context.Context, to string, verb Verb, payload [
 	}
 	oc.pending[id] = ch
 	oc.mu.Unlock()
+	flag, packed := m.pack(payload)
 	oc.wmu.Lock()
-	err = writeFrame(oc.c, kindRequest, verb, id, payload)
+	err = writeFrame(oc.c, kindRequest|flag, verb, id, packed)
 	oc.wmu.Unlock()
 	if err != nil {
 		oc.close(err)

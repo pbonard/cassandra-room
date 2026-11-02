@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cassandra-room/cassandra-room/internal/cluster"
 	"github.com/cassandra-room/cassandra-room/internal/db"
 	"github.com/cassandra-room/cassandra-room/internal/server"
 )
@@ -36,6 +37,11 @@ func main() {
 		authorizer            = flag.String("authorizer", "AllowAllAuthorizer", "AllowAllAuthorizer or CassandraAuthorizer")
 		listenAddress         = flag.String("listen-address", "", "Internode address host:port (listen_address and storage_port); empty runs a single node")
 		seeds                 = flag.String("seeds", "", "Comma-separated internode addresses of seed nodes")
+		internodeCert         = flag.String("internode-cert", "", "PEM certificate for internode TLS (with -internode-key and -internode-ca)")
+		internodeKey          = flag.String("internode-key", "", "PEM private key for internode TLS")
+		internodeCA           = flag.String("internode-ca", "", "PEM CA that peers' certificates must chain to")
+		internodeVerifyHost   = flag.Bool("internode-verify-hostname", false, "Also check peers' certificate names (require_endpoint_verification)")
+		internodeCompression  = flag.Bool("internode-compression", true, "Compress internode messages with LZ4")
 		replaceAddress        = flag.String("replace-address", "", "Replace a dead node (its internode address or host id) on first boot")
 		numTokens             = flag.Int("num-tokens", 16, "Number of tokens (vnodes) of this node")
 		dataCenter            = flag.String("dc", "datacenter1", "Data center of this node")
@@ -61,6 +67,14 @@ func main() {
 	opts.DataCenter, opts.Rack = *dataCenter, *rack
 	if *listenAddress != "" {
 		opts.Cluster = &db.ClusterOptions{ListenAddress: *listenAddress, NumTokens: *numTokens, ReplaceAddress: *replaceAddress}
+		opts.Cluster.Messaging.Compress = *internodeCompression
+		if *internodeCert != "" {
+			cfg, err := cluster.TLSConfig(*internodeCert, *internodeKey, *internodeCA, *internodeVerifyHost)
+			if err != nil {
+				log.Fatal(err)
+			}
+			opts.Cluster.Messaging.TLS = cfg
+		}
 		for _, s := range strings.Split(*seeds, ",") {
 			if s = strings.TrimSpace(s); s != "" {
 				opts.Cluster.Seeds = append(opts.Cluster.Seeds, s)

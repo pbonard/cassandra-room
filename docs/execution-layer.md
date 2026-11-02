@@ -171,7 +171,6 @@ sstables or the memtables.
 - vectors, user-defined functions and aggregates, materialized views,
   triggers, LIKE, data masking
 - `entries()` indexes, indexes on keys or static columns
-- counters in a cluster must update one partition per statement
 - options changed by ALTER TABLE take effect at restart
 
 

@@ -18,7 +18,10 @@ jobs are split: **gossip only says who is alive**, and **cluster metadata
 is a linearized log of epochs**.
 
 - **Messaging** (`MessagingService`): framed request/response over one TCP
-  connection per peer.
+  connection per peer; optionally mutually authenticated TLS
+  (`-internode-cert/-key/-ca`, checking the CA chain, and names with
+  `-internode-verify-hostname`) and LZ4 compression of payloads over
+  512 bytes (`-internode-compression`, on by default).
 - **Membership** (`membership.go`, after hashicorp/memberlist: SWIM with
   the Lifeguard extensions):
   - every probe interval (1 s) a node pings one member, in shuffled
@@ -72,15 +75,23 @@ node, the coordinator in a cluster.
   failing replicas get **hints**, stored locally and replayed when they come
   back (and every 5 s). Nodes joining or taking over a range also receive
   its writes (pending ranges).
-- **Reads** ask blockFor replicas (this node first), retry another replica
-  on failure, and merge the raw row fragments they return; row fragments
-  merge by timestamp, so the merge is the reconciliation. Replicas that
+- **Reads** of a row ask one replica (this node first) for the data and
+  the others blockFor needs for a digest; matching digests answer at once,
+  a mismatch reads full rows from everyone who answered and merges them
+  (row fragments merge by timestamp, so the merge is the reconciliation).
+  A replica slower than the 99th percentile of recent replica reads, or
+  failing, gets another replica asked in its place (speculative retry). Replicas that
   returned less get the merged row (blocking read repair). Range scans read
   one ring range at a time, in pages, cutting each page at the first
   replica page that was truncated.
 - **Schema** and role changes are metadata commits (above), from any node.
-- **Counters** run on the partition's first live replica, where counter
-  shards are read locally.
+- **Counters** are CounterMutations: the coordinator builds deltas, each
+  partition's first live replica (its leader) turns them into its counter
+  shard and replicates the result; a statement or batch may span
+  partitions.
+- **EACH_QUORUM** under NetworkTopologyStrategy needs a quorum in every
+  data center, for reads and writes; writes also wait for pending
+  replicas on top of any consistency level (blockForWrite).
 - **Lightweight transactions** run single-decree Paxos per partition among
   its replicas (Cassandra's Paxos v1, as ScyllaDB's `service/paxos`):
   prepare (finishing an accepted but uncommitted round, repairing replicas
