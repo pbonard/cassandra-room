@@ -417,8 +417,13 @@ func TestClusterPaxos(t *testing.T) {
 	t.Logf("applied %d, unknown outcome %d, final %d", applied.Load(), unknown.Load(), v)
 	require.GreaterOrEqual(t, int64(v), applied.Load())
 	require.LessOrEqual(t, int64(v), applied.Load()+unknown.Load())
+	// The commit is acknowledged at QUORUM; the last replica learns it
+	// shortly after.
 	for i := range c.nodes {
-		require.Equal(t, final, c.values(i, one, "SELECT v FROM ks.c WHERE k = 1"), "node %d", i)
+		require.Eventually(t, func() bool {
+			got := c.values(i, one, "SELECT v FROM ks.c WHERE k = 1")
+			return len(got) == 1 && got[0] == final[0]
+		}, 5*time.Second, 10*time.Millisecond, "node %d", i)
 	}
 
 	// A coordinator that died after its proposal was accepted by two
@@ -444,7 +449,10 @@ func TestClusterPaxos(t *testing.T) {
 	}
 	require.Equal(t, final, c.values(2, one, "SELECT v FROM ks.c WHERE k = 1"), "not committed yet")
 	require.Equal(t, []string{"1000"}, c.values(2, serial, "SELECT v FROM ks.c WHERE k = 1"))
-	require.Equal(t, []string{"1000"}, c.values(2, one, "SELECT v FROM ks.c WHERE k = 1"), "committed everywhere")
+	require.Eventually(t, func() bool {
+		got := c.values(2, one, "SELECT v FROM ks.c WHERE k = 1")
+		return len(got) == 1 && got[0] == "1000"
+	}, 5*time.Second, 10*time.Millisecond, "committed everywhere")
 
 	// One replica down: quorum still decides; two down: unavailable.
 	c.stop(2)
