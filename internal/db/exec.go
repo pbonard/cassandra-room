@@ -158,6 +158,17 @@ type execCtx struct {
 	version primitive.ProtocolVersion
 	json    map[*jsonSource]map[string]any // INSERT JSON objects, decoded
 	user    string                         // the logged-in role
+	cl      primitive.ConsistencyLevel
+	// local restricts reads to this node (replica-side reads).
+	local bool
+}
+
+// readStore is where the statement reads: the cluster, or this node.
+func (e *execCtx) readStore() storage {
+	if e.local {
+		return localStorage{e.d}
+	}
+	return e.d.store
 }
 
 func (e *execCtx) timestamp() int64 {
@@ -182,6 +193,11 @@ type RequestOptions struct {
 	Version          primitive.ProtocolVersion
 	// User is the session's logged-in role, checked by the authorizer.
 	User string
+	// Consistency is the request's consistency level.
+	Consistency primitive.ConsistencyLevel
+	// forwarded marks a statement another node sent to run here; local
+	// restricts its reads to this node.
+	forwarded, local bool
 }
 
 // OptionsOf converts protocol query options.
@@ -191,13 +207,14 @@ func OptionsOf(o *message.QueryOptions, v primitive.ProtocolVersion) *RequestOpt
 		return out
 	}
 	out.Values, out.Named = o.PositionalValues, o.NamedValues
+	out.Consistency = o.Consistency
 	out.PageSize, out.PagingState = o.PageSize, o.PagingState
 	out.Timestamp, out.NowInSec, out.SkipMeta = o.DefaultTimestamp, o.NowInSeconds, o.SkipMetadata
 	return out
 }
 
 func (d *DB) newCtx(o *RequestOptions, st *prepState) (*execCtx, error) {
-	e := &execCtx{d: d, now: d.opts.Now(), page: int(o.PageSize), paging: o.PagingState, noMeta: o.SkipMeta, version: o.Version, user: o.User}
+	e := &execCtx{d: d, now: d.opts.Now(), page: int(o.PageSize), paging: o.PagingState, noMeta: o.SkipMeta, version: o.Version, user: o.User, cl: o.Consistency, local: o.local}
 	e.nowSec = e.now.Unix()
 	if o.NowInSec != nil {
 		e.nowSec = int64(*o.NowInSec)
@@ -254,12 +271,25 @@ func (d *DB) Execute(p *Prepared, o *RequestOptions) message.Message {
 			return ErrorMessage(err)
 		}
 	}
+	if d.proxy != nil && !o.forwarded {
+		if to := d.proxy.route(st, e); to != "" {
+			vals, null, unset := packValues(e.values)
+			return d.proxy.forward(to, &forwarded{Keyspace: p.Keyspace, Query: p.Query, Values: vals, Null: null, Unset: unset,
+				CL: uint16(o.Consistency), Timestamp: o.Timestamp, NowInSec: o.NowInSec, User: o.User})
+		}
+		if sel, ok := st.stmt.(*selectStmt); ok && sel.index != nil {
+			return d.proxy.scatter(p, e, o)
+		}
+	}
 	res, err := st.stmt.execute(e)
 	if err != nil {
 		return ErrorMessage(err)
 	}
 	if sc, ok := res.(*message.SchemaChangeResult); ok && sc.ChangeType == primitive.SchemaChangeTypeCreated {
 		d.grantCreator(o.User, sc)
+	}
+	if _, ddl := st.stmt.(*ddlStmt); ddl && d.proxy != nil {
+		d.proxy.pushSchema()
 	}
 	if rows, ok := res.(*message.RowsResult); ok {
 		switch {
@@ -286,7 +316,7 @@ func (d *DB) ExecuteBatch(typ primitive.BatchType, children []BatchChild, o *Req
 	}
 	var mods []boundModification
 	conditional := false
-	ctx := &execCtx{d: d, now: d.opts.Now()}
+	ctx := &execCtx{d: d, now: d.opts.Now(), cl: o.Consistency, user: o.User}
 	ctx.nowSec = ctx.now.Unix()
 	if o.NowInSec != nil {
 		ctx.nowSec = int64(*o.NowInSec)
@@ -321,6 +351,16 @@ func (d *DB) ExecuteBatch(typ primitive.BatchType, children []BatchChild, o *Req
 		child := *ctx
 		child.values = c.Values
 		mods = append(mods, boundModification{m: m, e: &child})
+	}
+	if d.proxy != nil && !o.forwarded && (conditional || mods[0].m.isCounter()) {
+		if to := d.proxy.partitionLeader(mods[0].m, mods[0].e); to != "" {
+			f := &forwarded{CL: uint16(o.Consistency), Timestamp: o.Timestamp, NowInSec: o.NowInSec, User: o.User, BatchType: uint8(typ)}
+			for _, c := range children {
+				vals, null, unset := packValues(c.Values)
+				f.Batch = append(f.Batch, forwardedChild{Keyspace: c.Prepared.Keyspace, Query: c.Prepared.Query, Values: vals, Null: null, Unset: unset})
+			}
+			return d.proxy.forward(to, f)
+		}
 	}
 	if conditional {
 		res, err := d.executeCAS(mods, ctx)

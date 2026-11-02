@@ -216,7 +216,14 @@ type authStmt struct {
 
 func (d *DB) saveRoles(m map[string]*Role) error {
 	d.roles.Store(&m)
-	return d.saveSchema(d.schema.Load())
+	d.epoch++
+	if err := d.saveSchema(d.schema.Load()); err != nil {
+		return err
+	}
+	if d.proxy != nil {
+		d.proxy.pushSchema()
+	}
+	return nil
 }
 
 func cloneRoles(m map[string]*Role) map[string]*Role {

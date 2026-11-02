@@ -3,6 +3,7 @@ package db
 import (
 	"bytes"
 	"encoding/binary"
+	"net"
 	"slices"
 	"sort"
 	"strconv"
@@ -110,6 +111,10 @@ func virtualRows(ks, table string) func(d *DB) []map[string][]byte {
 	switch ks + "." + table {
 	case "system.local":
 		return localRows
+	case "system.peers":
+		return func(d *DB) []map[string][]byte { return peerRows(d, false) }
+	case "system.peers_v2":
+		return func(d *DB) []map[string][]byte { return peerRows(d, true) }
 	case "system_schema.keyspaces":
 		return keyspaceRows
 	case "system_schema.tables":
@@ -182,9 +187,50 @@ func localRows(d *DB) []map[string][]byte {
 		"rpc_address":             addr,
 		"rpc_port":                intV(d.opts.Port),
 		"schema_version":          uuidV(v[:]),
-		// One node owns the whole ring.
-		"tokens": textSetV("-9223372036854775808"),
+		"tokens":                  textSetV(d.localTokens()...),
 	}}
+}
+
+// localTokens are the node's tokens; a single node owns the whole ring.
+func (d *DB) localTokens() []string {
+	if d.proxy == nil {
+		return []string{"-9223372036854775808"}
+	}
+	return tokenStrings(d.local.Tokens)
+}
+
+func peerRows(d *DB, v2 bool) []map[string][]byte {
+	if d.proxy == nil {
+		return nil
+	}
+	var out []map[string][]byte
+	for _, s := range d.proxy.peers() {
+		hostID, _ := types.ParseUUID(s.HostID)
+		schemaID, _ := types.ParseUUID(s.SchemaVersion)
+		r := map[string][]byte{
+			"peer":            ipBytes(s.Addr),
+			"data_center":     textV(s.DataCenter),
+			"host_id":         uuidV(hostID[:]),
+			"rack":            textV(s.Rack),
+			"release_version": textV(s.ReleaseVersion),
+			"schema_version":  uuidV(schemaID[:]),
+			"tokens":          textSetV(tokenStrings(s.Tokens)...),
+		}
+		if v2 {
+			_, port, _ := net.SplitHostPort(s.Addr)
+			pn, _ := strconv.Atoi(port)
+			r["peer_port"] = intV(pn)
+			r["native_address"] = ipBytes(s.NativeAddr)
+			r["native_port"] = intV(s.NativePort)
+			r["preferred_ip"] = ipBytes(s.Addr)
+			r["preferred_port"] = intV(pn)
+		} else {
+			r["rpc_address"] = ipBytes(s.NativeAddr)
+			r["preferred_ip"] = ipBytes(s.Addr)
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 func sortedKeyspaces(d *DB) []*Keyspace {
@@ -306,9 +352,20 @@ func newVirtualSource(d *DB, t *Table) *virtualSource {
 		r := &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: row.NoTimestamp},
 			Cells: []row.Cell{{Column: 0, LocalDeletionTime: row.NoDeletionTime}}}
 		for _, c := range t.Columns {
-			if v, ok := m[c.Name]; ok && v != nil {
-				r.Cells = append(r.Cells, row.Cell{Column: c.ID, LocalDeletionTime: row.NoDeletionTime, Value: v})
+			v, ok := m[c.Name]
+			if !ok || v == nil {
+				continue
 			}
+			if c.Type.IsMultiCell() {
+				cells, err := d.elementCells(c, v, 0, false, func(p, x []byte) row.Cell {
+					return row.Cell{Column: c.ID, Path: p, LocalDeletionTime: row.NoDeletionTime, Value: x}
+				})
+				if err == nil {
+					r.Cells = append(r.Cells, cells...)
+				}
+				continue
+			}
+			r.Cells = append(r.Cells, row.Cell{Column: c.ID, LocalDeletionTime: row.NoDeletionTime, Value: v})
 		}
 		sortCells(r.Cells)
 		entries = append(entries, entry{key, row.Append(nil, r)})

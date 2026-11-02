@@ -6,6 +6,7 @@ import (
 
 	"github.com/cassandra-room/cassandra-room/internal/cql"
 	"github.com/datastax/go-cassandra-native-protocol/message"
+	"github.com/datastax/go-cassandra-native-protocol/primitive"
 )
 
 // requestError is an error reported to the client with a protocol error
@@ -54,6 +55,21 @@ func alreadyExists(ks, table string) error {
 // ErrorMessage converts an error to the protocol's error message.
 func ErrorMessage(err error) message.Message {
 	var re *requestError
+	var ue2 *unavailableError
+	var te *timeoutError
+	switch {
+	case errors.As(err, &ue2):
+		return &message.Unavailable{ErrorMessage: ue2.Error(), Consistency: ue2.cl, Required: int32(ue2.required), Alive: int32(ue2.alive)}
+	case errors.As(err, &te):
+		if te.write {
+			wt := primitive.WriteTypeSimple
+			if te.batch {
+				wt = primitive.WriteTypeUnloggedBatch
+			}
+			return &message.WriteTimeout{ErrorMessage: te.Error(), Consistency: te.cl, Received: int32(te.received), BlockFor: int32(te.blockFor), WriteType: wt}
+		}
+		return &message.ReadTimeout{ErrorMessage: te.Error(), Consistency: te.cl, Received: int32(te.received), BlockFor: int32(te.blockFor)}
+	}
 	var se *cql.SyntaxError
 	var ue *cql.UnsupportedError
 	switch {

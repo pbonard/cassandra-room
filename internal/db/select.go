@@ -548,11 +548,10 @@ func (s *selectStmt) execute(e *execCtx) (message.Message, error) {
 	} else {
 		d.tableMu.RLock()
 		defer d.tableMu.RUnlock()
-		lt, err := d.engine.Table(s.t.Storage)
-		if err != nil {
-			return nil, invalidf("table %s.%s was dropped", s.t.Keyspace, s.t.Name)
+		var err error
+		if src, err = e.readStore().source(s.t, s.t.Storage, e.cl); err != nil {
+			return nil, err
 		}
-		src = engineSource{lt}
 	}
 	q := &query{s: s, e: e, src: src}
 	return q.run()

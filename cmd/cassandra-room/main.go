@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -31,6 +32,11 @@ func main() {
 		clusterName           = flag.String("cluster-name", "Test Cluster", "Cluster name reported in system.local")
 		authenticator         = flag.String("authenticator", "AllowAllAuthenticator", "AllowAllAuthenticator or PasswordAuthenticator (default superuser cassandra/cassandra)")
 		authorizer            = flag.String("authorizer", "AllowAllAuthorizer", "AllowAllAuthorizer or CassandraAuthorizer")
+		listenAddress         = flag.String("listen-address", "", "Internode address host:port (listen_address and storage_port); empty runs a single node")
+		seeds                 = flag.String("seeds", "", "Comma-separated internode addresses of seed nodes")
+		numTokens             = flag.Int("num-tokens", 16, "Number of tokens (vnodes) of this node")
+		dataCenter            = flag.String("dc", "datacenter1", "Data center of this node")
+		rack                  = flag.String("rack", "rack1", "Rack of this node")
 	)
 	flag.Parse()
 
@@ -48,6 +54,15 @@ func main() {
 	}
 	opts := db.Options{SyncWrites: *commitlogSync == "batch", ClusterName: *clusterName, Address: ip, Port: port,
 		Authenticator: *authenticator == "PasswordAuthenticator", Authorizer: *authorizer == "CassandraAuthorizer"}
+	opts.DataCenter, opts.Rack = *dataCenter, *rack
+	if *listenAddress != "" {
+		opts.Cluster = &db.ClusterOptions{ListenAddress: *listenAddress, NumTokens: *numTokens}
+		for _, s := range strings.Split(*seeds, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				opts.Cluster.Seeds = append(opts.Cluster.Seeds, s)
+			}
+		}
+	}
 	opts.Engine.WALSyncPeriod = *commitlogSyncPeriod
 	opts.Engine.MemTableBudget = *memtableSpace
 	database, err := db.Open(*dataDir, opts)

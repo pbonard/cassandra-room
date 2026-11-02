@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strconv"
 	"testing"
@@ -235,4 +236,85 @@ func TestGocqlAuth(t *testing.T) {
 	require.Equal(t, gocql.ErrCodeUnauthorized, reqErr.Code())
 	require.NoError(t, admin.Query("GRANT SELECT ON ks.t TO app").Exec())
 	require.NoError(t, app.Query("SELECT * FROM ks.t").Exec())
+}
+
+// TestGocqlCluster runs gocql against three nodes on 127.0.0.1-3 (same
+// native port), found through system.peers.
+func TestGocqlCluster(t *testing.T) {
+	var lns []net.Listener
+	var port int
+	for attempt := 0; attempt < 20 && len(lns) < 3; attempt++ {
+		for _, l := range lns {
+			l.Close()
+		}
+		lns = nil
+		first, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		port = first.Addr().(*net.TCPAddr).Port
+		lns = append(lns, first)
+		for i := 2; i <= 3; i++ {
+			l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.%d:%d", i, port))
+			if err != nil {
+				break
+			}
+			lns = append(lns, l)
+		}
+	}
+	require.Len(t, lns, 3)
+	var storage []string
+	for i := 0; i < 3; i++ {
+		l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.%d:0", i+1))
+		require.NoError(t, err)
+		storage = append(storage, l.Addr().String())
+		l.Close()
+	}
+	for i := 0; i < 3; i++ {
+		d, err := db.Open("db", db.Options{FS: vfs.NewMem(), Address: net.IPv4(127, 0, 0, byte(i+1)), Port: port,
+			Cluster: &db.ClusterOptions{ListenAddress: storage[i], Seeds: []string{storage[0]}, NumTokens: 8,
+				GossipInterval: 50 * time.Millisecond, DownAfter: time.Second}})
+		require.NoError(t, err)
+		srv := New(d)
+		go func(ln net.Listener) { _ = srv.Serve(ln) }(lns[i])
+		t.Cleanup(func() {
+			_ = srv.Shutdown(context.Background())
+			_ = d.Close()
+		})
+	}
+	time.Sleep(500 * time.Millisecond) // gossip settles
+	cluster := gocql.NewCluster("127.0.0.1")
+	cluster.Port = port
+	cluster.ProtoVersion = 4
+	cluster.Consistency = gocql.Quorum
+	cluster.Timeout = 5 * time.Second
+	s, err := cluster.CreateSession()
+	require.NoError(t, err)
+	defer s.Close()
+	require.NoError(t, s.Query("CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}").Exec())
+	require.NoError(t, s.Query("CREATE TABLE ks.kv (k int PRIMARY KEY, v text)").Exec())
+	time.Sleep(300 * time.Millisecond) // schema reaches every node
+	for i := 0; i < 200; i++ {
+		require.NoError(t, s.Query("INSERT INTO ks.kv (k, v) VALUES (?, ?)", i, fmt.Sprint(i)).Exec())
+	}
+	var n int
+	require.NoError(t, s.Query("SELECT count(*) FROM ks.kv").Scan(&n))
+	require.Equal(t, 200, n)
+	hosts := map[string]bool{}
+	iter := s.Query("SELECT k, v FROM ks.kv WHERE k = 5").Consistency(gocql.All).Iter()
+	var k int
+	var v string
+	for iter.Scan(&k, &v) {
+		hosts[iter.Host().ConnectAddress().String()] = true
+	}
+	require.NoError(t, iter.Close())
+	require.Equal(t, "5", v)
+	// The driver sees all three nodes and their tokens.
+	require.Eventually(t, func() bool {
+		seen := map[string]bool{}
+		for i := 0; i < 50; i++ {
+			it := s.Query("SELECT v FROM ks.kv WHERE k = ?", i).Iter()
+			seen[it.Host().ConnectAddress().String()] = true
+			it.Close()
+		}
+		return len(seen) == 3
+	}, 5*time.Second, 100*time.Millisecond, "token-aware routing reaches every node")
 }

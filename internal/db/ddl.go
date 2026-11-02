@@ -333,6 +333,7 @@ func (s *ddlStmt) execute(e *execCtx) (message.Message, error) {
 		}
 	}
 	next.finish()
+	d.epoch++
 	if err := d.saveSchema(next); err != nil {
 		return nil, err
 	}

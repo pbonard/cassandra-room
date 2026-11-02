@@ -40,6 +40,8 @@ type Options struct {
 	// clients connect to; Port its native transport port.
 	Address net.IP
 	Port    int
+	// Cluster, if set, makes the database a node of a cluster.
+	Cluster *ClusterOptions
 	// Authenticator requires clients to log in (PasswordAuthenticator);
 	// Authorizer checks permissions (CassandraAuthorizer).
 	Authenticator, Authorizer bool
@@ -67,6 +69,7 @@ type DB struct {
 	pending atomic.Pointer[Table]
 
 	lastTS atomic.Int64
+	epoch  int64 // the schema epoch, guarded by ddlMu
 
 	// hostID is the node's id, which owns its shard of counters.
 	hostID [16]byte
@@ -78,6 +81,11 @@ type DB struct {
 	counterMu sync.Mutex
 
 	roles atomic.Pointer[map[string]*Role]
+
+	// store runs statements' reads and writes: localStorage, or the
+	// cluster's coordinator.
+	store storage
+	proxy *proxy
 }
 
 // localState is persisted with the schema.
@@ -85,10 +93,14 @@ type localState struct {
 	HostID        string
 	NextStorageID uint64
 	Bootstrapped  bool
+	Tokens        []int64 `json:",omitempty"`
 }
 
 // schemaFile is the durable form of the schema.
 type schemaFile struct {
+	// Epoch counts schema changes cluster-wide: a node adopts a pushed
+	// schema with a higher epoch.
+	Epoch     int64
 	Local     localState
 	Keyspaces []*Keyspace
 	Tables    []json.RawMessage
@@ -121,6 +133,7 @@ func Open(dir string, opts Options) (*DB, error) {
 		opts.Port = 9042
 	}
 	d := &DB{opts: opts, fs: opts.FS, dir: dir, wo: lsm.NoSync}
+	d.store = localStorage{d}
 	if opts.SyncWrites {
 		d.wo = lsm.Sync
 	}
@@ -166,6 +179,12 @@ func Open(dir string, opts Options) (*DB, error) {
 		e.Close()
 		return nil, err
 	}
+	if opts.Cluster != nil {
+		if err := d.startCluster(opts.Cluster); err != nil {
+			e.Close()
+			return nil, err
+		}
+	}
 	if !d.local.Bootstrapped {
 		d.local.Bootstrapped = true
 		if err := d.saveSchema(d.schema.Load()); err != nil {
@@ -178,6 +197,9 @@ func Open(dir string, opts Options) (*DB, error) {
 
 // Close closes the database.
 func (d *DB) Close() error {
+	if d.proxy != nil {
+		d.proxy.stop()
+	}
 	d.tableMu.Lock()
 	defer d.tableMu.Unlock()
 	return d.engine.Close()
@@ -205,7 +227,6 @@ func (d *DB) engineTableOptions(id lsm.TableID) lsm.TableOptions {
 }
 
 func (d *DB) loadSchema() error {
-	s := &Schema{Keyspaces: map[string]*Keyspace{}}
 	f, err := d.fs.Open(d.fs.PathJoin(d.dir, schemaFileName))
 	switch {
 	case err == nil:
@@ -214,51 +235,69 @@ func (d *DB) loadSchema() error {
 		if err != nil {
 			return err
 		}
-		var sf schemaFile
-		if err := json.Unmarshal(b, &sf); err != nil {
-			return fmt.Errorf("db: corrupt schema file: %w", err)
+		s, sf, err := parseSchemaFile(b)
+		if err != nil {
+			return err
 		}
-		d.local = sf.Local
-		roles := map[string]*Role{}
-		for _, r := range sf.Roles {
-			roles[r.Name] = r
-		}
-		d.roles.Store(&roles)
-		for _, k := range sf.Keyspaces {
-			k.Tables = map[string]*Table{}
-			if err := k.buildTypes(); err != nil {
-				return fmt.Errorf("db: corrupt schema file: %w", err)
-			}
-			s.Keyspaces[k.Name] = k
-		}
-		for _, raw := range sf.Tables {
-			var head struct{ Keyspace string }
-			if err := json.Unmarshal(raw, &head); err != nil {
-				return fmt.Errorf("db: corrupt schema file: %w", err)
-			}
-			k, ok := s.Keyspaces[head.Keyspace]
-			if !ok {
-				return fmt.Errorf("db: corrupt schema file: table without keyspace %s", head.Keyspace)
-			}
-			t, err := unmarshalTable(raw, k.resolve)
-			if err != nil {
-				return fmt.Errorf("db: corrupt schema file: %w", err)
-			}
-			k.Tables[t.Name] = t
-		}
+		d.local, d.epoch = sf.Local, sf.Epoch
+		d.roles.Store(rolesOf(sf))
+		d.schema.Store(s)
+		return nil
 	case oserrorIsNotExist(err):
 		var id [16]byte
 		_, _ = rand.Read(id[:])
 		id[6] = id[6]&0x0f | 0x40
 		id[8] = id[8]&0x3f | 0x80
 		d.local = localState{HostID: types.FormatUUID(id[:]), NextStorageID: 1}
-	default:
-		return err
+		s := &Schema{Keyspaces: map[string]*Keyspace{}}
+		addSystemKeyspaces(s)
+		s.finish()
+		d.schema.Store(s)
+		return nil
+	}
+	return err
+}
+
+func rolesOf(sf *schemaFile) *map[string]*Role {
+	roles := map[string]*Role{}
+	for _, r := range sf.Roles {
+		roles[r.Name] = r
+	}
+	return &roles
+}
+
+// parseSchemaFile decodes a schema file.
+func parseSchemaFile(b []byte) (*Schema, *schemaFile, error) {
+	s := &Schema{Keyspaces: map[string]*Keyspace{}}
+	var sf schemaFile
+	if err := json.Unmarshal(b, &sf); err != nil {
+		return nil, nil, fmt.Errorf("db: corrupt schema file: %w", err)
+	}
+	for _, k := range sf.Keyspaces {
+		k.Tables = map[string]*Table{}
+		if err := k.buildTypes(); err != nil {
+			return nil, nil, fmt.Errorf("db: corrupt schema file: %w", err)
+		}
+		s.Keyspaces[k.Name] = k
+	}
+	for _, raw := range sf.Tables {
+		var head struct{ Keyspace string }
+		if err := json.Unmarshal(raw, &head); err != nil {
+			return nil, nil, fmt.Errorf("db: corrupt schema file: %w", err)
+		}
+		k, ok := s.Keyspaces[head.Keyspace]
+		if !ok {
+			return nil, nil, fmt.Errorf("db: corrupt schema file: table without keyspace %s", head.Keyspace)
+		}
+		t, err := unmarshalTable(raw, k.resolve)
+		if err != nil {
+			return nil, nil, fmt.Errorf("db: corrupt schema file: %w", err)
+		}
+		k.Tables[t.Name] = t
 	}
 	addSystemKeyspaces(s)
 	s.finish()
-	d.schema.Store(s)
-	return nil
+	return s, &sf, nil
 }
 
 func oserrorIsNotExist(err error) bool { return errors.Is(err, os.ErrNotExist) }
@@ -266,7 +305,7 @@ func oserrorIsNotExist(err error) bool { return errors.Is(err, os.ErrNotExist) }
 // saveSchema writes the schema file atomically: a new file, synced, then
 // renamed over the old one.
 func (d *DB) saveSchema(s *Schema) error {
-	sf := schemaFile{Local: d.local}
+	sf := schemaFile{Local: d.local, Epoch: d.epoch}
 	if r := d.roles.Load(); r != nil {
 		for _, role := range *r {
 			sf.Roles = append(sf.Roles, role)

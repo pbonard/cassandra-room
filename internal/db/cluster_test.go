@@ -1,0 +1,239 @@
+package db
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"sort"
+	"testing"
+	"time"
+
+	"github.com/cockroachdb/pebble/vfs"
+	"github.com/datastax/go-cassandra-native-protocol/message"
+	"github.com/datastax/go-cassandra-native-protocol/primitive"
+	"github.com/stretchr/testify/require"
+)
+
+// testCluster is a cluster of in-process nodes, each with its own
+// in-memory file system that survives restarts.
+type testCluster struct {
+	t     *testing.T
+	fs    []vfs.FS
+	addrs []string
+	nodes []*DB
+}
+
+func freeAddr(t *testing.T) string {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	return ln.Addr().String()
+}
+
+func newTestCluster(t *testing.T, n int) *testCluster {
+	c := &testCluster{t: t}
+	for i := 0; i < n; i++ {
+		c.fs = append(c.fs, vfs.NewMem())
+		c.addrs = append(c.addrs, freeAddr(t))
+		c.nodes = append(c.nodes, nil)
+	}
+	for i := range c.nodes {
+		c.start(i)
+	}
+	t.Cleanup(func() {
+		for _, d := range c.nodes {
+			if d != nil {
+				d.Close()
+			}
+		}
+	})
+	c.waitConverged()
+	return c
+}
+
+func (c *testCluster) start(i int) {
+	d, err := Open("db", Options{FS: c.fs[i], Address: net.IPv4(127, 0, 0, byte(1+i)), Cluster: &ClusterOptions{
+		ListenAddress: c.addrs[i], Seeds: []string{c.addrs[0]}, NumTokens: 8,
+		GossipInterval: 50 * time.Millisecond, DownAfter: 400 * time.Millisecond,
+		WriteTimeout: time.Second, ReadTimeout: time.Second,
+	}})
+	require.NoError(c.t, err)
+	c.nodes[i] = d
+}
+
+func (c *testCluster) stop(i int) {
+	require.NoError(c.t, c.nodes[i].Close())
+	c.nodes[i] = nil
+}
+
+// waitConverged waits until every running node sees every running node up.
+func (c *testCluster) waitConverged() {
+	require.Eventually(c.t, func() bool {
+		for i, d := range c.nodes {
+			if d == nil {
+				continue
+			}
+			for j, o := range c.nodes {
+				if o != nil && i != j && !d.proxy.g.IsAlive(c.addrs[j]) {
+					return false
+				}
+			}
+		}
+		return true
+	}, 10*time.Second, 20*time.Millisecond)
+}
+
+func (c *testCluster) exec(node int, cl primitive.ConsistencyLevel, q string, args ...any) message.Message {
+	c.t.Helper()
+	s := &session{t: c.t, d: c.nodes[node]}
+	p, err := s.d.Prepare("", q)
+	if err != nil {
+		return ErrorMessage(err)
+	}
+	vals := make([]*primitive.Value, len(args))
+	for i, a := range args {
+		switch v := a.(type) {
+		case int:
+			vals[i] = primitive.NewValue([]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)})
+		case string:
+			vals[i] = primitive.NewValue([]byte(v))
+		}
+	}
+	return s.d.Execute(p, &RequestOptions{Values: vals, Consistency: cl})
+}
+
+func (c *testCluster) ok(node int, cl primitive.ConsistencyLevel, q string, args ...any) message.Message {
+	c.t.Helper()
+	res := c.exec(node, cl, q, args...)
+	if e, ok := res.(message.Error); ok {
+		c.t.Fatalf("node %d: %s: %T %s", node, q, e, e.GetErrorMessage())
+	}
+	return res
+}
+
+func (c *testCluster) values(node int, cl primitive.ConsistencyLevel, q string, args ...any) []string {
+	c.t.Helper()
+	res := c.ok(node, cl, q, args...).(*message.RowsResult)
+	var out []string
+	for _, r := range res.Data {
+		s := ""
+		for i, v := range r {
+			if i > 0 {
+				s += " "
+			}
+			if v == nil {
+				s += "null"
+			} else if len(v) == 4 && res.Metadata.Columns[i].Type.AsCql() == "int" {
+				s += fmt.Sprint(int32(be32(v)))
+			} else {
+				s += string(v)
+			}
+		}
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
+
+const (
+	one    = primitive.ConsistencyLevelOne
+	quorum = primitive.ConsistencyLevelQuorum
+	all    = primitive.ConsistencyLevelAll
+)
+
+func TestClusterReplication(t *testing.T) {
+	c := newTestCluster(t, 3)
+	// A schema change on any node reaches every node.
+	c.ok(1, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}")
+	c.ok(2, quorum, "CREATE TABLE ks.kv (k int PRIMARY KEY, v text)")
+	require.Eventually(t, func() bool {
+		for _, d := range c.nodes {
+			if _, err := d.schema.Load().table("ks", "kv"); err != nil {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, 20*time.Millisecond)
+	for i := 0; i < 100; i++ {
+		c.ok(i%3, quorum, "INSERT INTO ks.kv (k, v) VALUES (?, ?)", i, fmt.Sprint("v", i))
+	}
+	// Every node holds every row (RF 3): read locally on each.
+	for n := range c.nodes {
+		res := c.nodes[n].Execute(mustPrepare(t, c.nodes[n], "SELECT count(*) FROM ks.kv"), &RequestOptions{Consistency: one, local: true, forwarded: true})
+		require.Equal(t, []byte{0, 0, 0, 0, 0, 0, 0, 100}, []byte(res.(*message.RowsResult).Data[0][0]), "node %d", n)
+	}
+	require.Equal(t, []string{"v42"}, c.values(2, all, "SELECT v FROM ks.kv WHERE k = 42"))
+	require.Len(t, c.values(0, quorum, "SELECT k FROM ks.kv"), 100)
+
+	// A node goes down: QUORUM still works, ALL is unavailable.
+	c.stop(2)
+	require.Eventually(t, func() bool { return !c.nodes[0].proxy.g.IsAlive(c.addrs[2]) && !c.nodes[1].proxy.g.IsAlive(c.addrs[2]) },
+		5*time.Second, 20*time.Millisecond)
+	c.ok(0, quorum, "UPDATE ks.kv SET v = 'missed' WHERE k = 7")
+	res := c.exec(0, all, "SELECT v FROM ks.kv WHERE k = 7")
+	ue, ok := res.(*message.Unavailable)
+	require.True(t, ok, "%v", res)
+	require.EqualValues(t, 3, ue.Required)
+	require.EqualValues(t, 2, ue.Alive)
+	require.Equal(t, []string{"missed"}, c.values(1, quorum, "SELECT v FROM ks.kv WHERE k = 7"))
+
+	// It comes back and receives the hint.
+	c.start(2)
+	c.waitConverged()
+	require.Eventually(t, func() bool {
+		res := c.nodes[2].Execute(mustPrepare(t, c.nodes[2], "SELECT v FROM ks.kv WHERE k = 7"), &RequestOptions{Consistency: one, local: true, forwarded: true})
+		rows := res.(*message.RowsResult).Data
+		return len(rows) == 1 && string(rows[0][0]) == "missed"
+	}, 10*time.Second, 50*time.Millisecond, "hint replayed")
+
+	// Read repair: a write only one replica has is merged at ALL and
+	// repaired on the others.
+	// Write to node 0's engine only: the other replicas miss it.
+	pr := mustPrepare(t, c.nodes[0], "UPDATE ks.kv SET v = 'local-only' WHERE k = 8")
+	mod := pr.state.Load().stmt.(*modification)
+	e := &execCtx{d: c.nodes[0], now: time.Now(), cl: one}
+	e.nowSec = e.now.Unix()
+	mu := &mutation{}
+	require.NoError(t, mod.addMutations(e, mu))
+	require.NoError(t, c.nodes[0].applyLocal(mu.writes))
+	res = c.nodes[1].Execute(mustPrepare(t, c.nodes[1], "SELECT v FROM ks.kv WHERE k = 8"), &RequestOptions{Consistency: one, local: true, forwarded: true})
+	require.Equal(t, "v8", string(res.(*message.RowsResult).Data[0][0]), "node 1 does not have it yet")
+	require.Equal(t, []string{"local-only"}, c.values(1, all, "SELECT v FROM ks.kv WHERE k = 8"))
+	for n := range c.nodes {
+		res := c.nodes[n].Execute(mustPrepare(t, c.nodes[n], "SELECT v FROM ks.kv WHERE k = 8"), &RequestOptions{Consistency: one, local: true, forwarded: true})
+		require.Equal(t, "local-only", string(res.(*message.RowsResult).Data[0][0]), "node %d repaired", n)
+	}
+}
+
+func mustPrepare(t *testing.T, d *DB, q string) *Prepared {
+	p, err := d.Prepare("", q)
+	require.NoError(t, err)
+	return p
+}
+
+func TestClusterCountersLWTAndIndexes(t *testing.T) {
+	c := newTestCluster(t, 3)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
+	c.ok(0, quorum, "CREATE TABLE ks.cnt (k int PRIMARY KEY, n counter)")
+	c.ok(0, quorum, "CREATE TABLE ks.u (k int PRIMARY KEY, email text)")
+	c.ok(1, quorum, "CREATE INDEX ON ks.u (email)")
+	time.Sleep(200 * time.Millisecond)
+	// Counter updates from every node go to the partition's leader.
+	for i := 0; i < 30; i++ {
+		c.ok(i%3, quorum, "UPDATE ks.cnt SET n = n + 1 WHERE k = 1")
+	}
+	res := c.ok(2, quorum, "SELECT n FROM ks.cnt WHERE k = 1").(*message.RowsResult)
+	require.Equal(t, []byte{0, 0, 0, 0, 0, 0, 0, 30}, []byte(res.Data[0][0]))
+	// LWT from different coordinators.
+	res = c.ok(0, quorum, "INSERT INTO ks.u (k, email) VALUES (1, 'a') IF NOT EXISTS").(*message.RowsResult)
+	require.Equal(t, []byte{1}, []byte(res.Data[0][0]))
+	res = c.ok(1, quorum, "INSERT INTO ks.u (k, email) VALUES (1, 'b') IF NOT EXISTS").(*message.RowsResult)
+	require.Equal(t, []byte{0}, []byte(res.Data[0][0]))
+	for i := 2; i < 40; i++ {
+		c.ok(i%3, quorum, "INSERT INTO ks.u (k, email) VALUES (?, ?)", i, fmt.Sprint("e", i%4))
+	}
+	// Index queries gather every node's local index, each partition once.
+	require.Equal(t, []string{"13", "17", "21", "25", "29", "33", "37", "5", "9"}, c.values(2, one, "SELECT k FROM ks.u WHERE email = 'e1'"))
+}
+
+var _ = errors.New

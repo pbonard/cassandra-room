@@ -363,7 +363,7 @@ func (d *DB) applyModifications(mods []boundModification, batchCtx *execCtx) err
 // update counters).
 func (d *DB) applyLocked(mods []boundModification) error {
 	batchCtx := mods[0].e
-	b := lsm.NewBatch()
+	b := &mutation{}
 	if len(mods) > 1 {
 		batchCtx.timestamp() // one timestamp for the whole batch
 		for i := range mods {
@@ -375,18 +375,7 @@ func (d *DB) applyLocked(mods []boundModification) error {
 			return err
 		}
 	}
-	if b.Count() == 0 {
-		return nil
-	}
-	d.tableMu.RLock()
-	defer d.tableMu.RUnlock()
-	if err := d.engine.Apply(b, d.wo); err != nil {
-		if strings.Contains(err.Error(), lsm.ErrUnknownTable.Error()) {
-			return invalidf("table %s.%s was dropped", mods[0].m.t.Keyspace, mods[0].m.t.Name)
-		}
-		return err
-	}
-	return nil
+	return d.store.apply(b, batchCtx.cl)
 }
 
 // writeParams binds USING TIMESTAMP and TTL.
@@ -416,7 +405,7 @@ func (m *modification) writeParams(e *execCtx) (ts int64, ttl int64, err error) 
 	return ts, ttl, nil
 }
 
-func (m *modification) addMutations(e *execCtx, b *lsm.Batch) error {
+func (m *modification) addMutations(e *execCtx, b *mutation) error {
 	t := m.t
 	ts, ttl, err := m.writeParams(e)
 	if err != nil {
@@ -462,7 +451,14 @@ func (m *modification) addMutations(e *execCtx, b *lsm.Batch) error {
 		if !needRead {
 			return cells, statics, nil
 		}
-		cur, err := e.d.readCurrent(e, t, p, key)
+		// Counter shards are read on this node, the counter's leader.
+		re := e
+		if m.isCounter() && e.d.proxy != nil {
+			local := *e
+			local.local = true
+			re = &local
+		}
+		cur, err := e.d.readCurrent(re, t, p, key)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -470,7 +466,7 @@ func (m *modification) addMutations(e *execCtx, b *lsm.Batch) error {
 	}
 	put := func(key []byte, r *row.Row) {
 		buf = row.Append(buf[:0], r)
-		b.Put(t.Storage, key, buf)
+		b.put(t.Storage, key, buf, tokenOf(key))
 		if len(t.Indexes) > 0 && len(r.Cells) > 0 && (len(t.Clustering) == 0 || key[len(key)-1] == types.Terminator) {
 			if err := t.addEntries(b, key, r.Cells, e.nowSec); err != nil {
 				panic(err) // values were validated
@@ -558,14 +554,14 @@ func (c *current) of(col *Column) []row.Cell {
 func (d *DB) readCurrent(e *execCtx, t *Table, p, key []byte) (*current, error) {
 	d.tableMu.RLock()
 	defer d.tableMu.RUnlock()
-	lt, err := d.engine.Table(t.Storage)
+	lt, err := e.readStore().source(t, t.Storage, e.cl)
 	if err != nil {
-		return nil, invalidf("table %s.%s was dropped", t.Keyspace, t.Name)
+		return nil, err
 	}
 	cur := &current{}
 	dels := deletions{partition: row.NoTimestamp}
 	if len(t.Clustering) > 0 {
-		it, err := lt.NewIter(append(slices.Clip(p), headerSuffix), append(slices.Clip(p), tombstoneSuffix+1))
+		it, err := lt.iter(append(slices.Clip(p), headerSuffix), append(slices.Clip(p), tombstoneSuffix+1))
 		if err != nil {
 			return nil, err
 		}
@@ -609,7 +605,7 @@ func (d *DB) readCurrent(e *execCtx, t *Table, p, key []byte) (*current, error) 
 	if len(key) > len(p) && key[len(p)] == headerSuffix {
 		return cur, nil
 	}
-	v, err := lt.Get(key)
+	v, err := lt.get(key)
 	if errors.Is(err, lsm.ErrNotFound) {
 		return cur, nil
 	}

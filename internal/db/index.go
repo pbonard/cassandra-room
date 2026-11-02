@@ -147,7 +147,7 @@ func (ix *Index) entryKey(v, rowKey []byte) ([]byte, error) {
 }
 
 // addEntries adds the index entries of a row write to b.
-func (t *Table) addEntries(b *lsm.Batch, rowKey []byte, cells []row.Cell, nowSec int64) error {
+func (t *Table) addEntries(b *mutation, rowKey []byte, cells []row.Cell, nowSec int64) error {
 	for _, ix := range t.Indexes {
 		vals, live := ix.indexValues(cells, nowSec)
 		for i, v := range vals {
@@ -160,7 +160,7 @@ func (t *Table) addEntries(b *lsm.Batch, rowKey []byte, cells []row.Cell, nowSec
 			if c.TTL > 0 {
 				marker.TTL, marker.LocalDeletionTime = c.TTL, c.LocalDeletionTime
 			}
-			b.Put(ix.Storage, key, row.Append(nil, &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: row.NoTimestamp}, Cells: []row.Cell{marker}}))
+			b.put(ix.Storage, key, row.Append(nil, &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: row.NoTimestamp}, Cells: []row.Cell{marker}}), tokenOf(rowKey))
 		}
 	}
 	return nil
@@ -179,7 +179,7 @@ func (d *DB) buildIndex(t *Table, ix *Index, nowSec int64) error {
 	defer it.Close()
 	only := *t
 	only.Indexes = []*Index{ix}
-	b := lsm.NewBatch()
+	b := &mutation{}
 	for ok := it.First(); ok; ok = it.Next() {
 		k := it.Key()
 		if len(t.Clustering) > 0 {
@@ -196,17 +196,17 @@ func (d *DB) buildIndex(t *Table, ix *Index, nowSec int64) error {
 		if err := only.addEntries(b, slices.Clone(k), cells, nowSec); err != nil {
 			return err
 		}
-		if b.Count() >= 1000 {
-			if err := d.engine.Apply(b, lsm.NoSync); err != nil {
+		if len(b.writes) >= 1000 {
+			if err := d.applyLocal(b.writes); err != nil {
 				return err
 			}
-			b = lsm.NewBatch()
+			b = &mutation{}
 		}
 	}
 	if err := it.Error(); err != nil {
 		return err
 	}
-	return d.engine.Apply(b, lsm.Sync)
+	return d.applyLocal(b.writes)
 }
 
 // indexPlan is a SELECT served by an index: the restriction it uses.
@@ -280,7 +280,11 @@ func (q *query) scanIndex(plan *indexPlan) error {
 	}
 	src, ok := q.src.(engineSource)
 	if !ok {
-		return invalidf("indexes are not supported on virtual tables")
+		lt, err := q.e.d.engine.Table(q.s.t.Storage)
+		if err != nil {
+			return invalidf("table %s.%s was dropped", q.s.t.Keyspace, q.s.t.Name)
+		}
+		src = engineSource{lt}
 	}
 	it, err := q.e.d.engineIndexIter(plan.ix, lo, hi)
 	if err != nil {
@@ -300,6 +304,9 @@ func (q *query) scanIndex(plan *indexPlan) error {
 		}
 		p := rest[:len(rest)-len(suffix)]
 		if q.ranges != nil && !q.inRanges(suffix) {
+			continue
+		}
+		if px := q.e.d.proxy; px != nil && !px.ownsPrimary(q.s.t.Keyspace, tokenOf(p)) {
 			continue
 		}
 		q.indexKey = key

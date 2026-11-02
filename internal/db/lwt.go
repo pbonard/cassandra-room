@@ -7,6 +7,7 @@ import (
 	"github.com/cassandra-room/cassandra-room/internal/cql"
 	"github.com/cassandra-room/cassandra-room/internal/types"
 	"github.com/datastax/go-cassandra-native-protocol/message"
+	"github.com/datastax/go-cassandra-native-protocol/primitive"
 )
 
 // Lightweight transactions on one node: the condition is read and the
@@ -116,7 +117,8 @@ func (d *DB) executeCAS(mods []boundModification, batchCtx *execCtx) (message.Me
 		if m.cond == nil {
 			continue
 		}
-		res, err := m.cond.read.execute(&execCtx{d: d, values: e.values, now: e.now, nowSec: e.nowSec})
+		// Conditions read at QUORUM (SERIAL, without Paxos).
+		res, err := m.cond.read.execute(&execCtx{d: d, values: e.values, now: e.now, nowSec: e.nowSec, cl: serialRead(e.cl)})
 		if err != nil {
 			return nil, err
 		}
@@ -233,4 +235,12 @@ func (f *filter) matchesCAS(e *execCtx, r map[*Column][]byte) (bool, error) {
 		return c >= 0, nil
 	}
 	return false, invalidf("Unsupported operator %s in condition", f.op)
+}
+
+func serialRead(cl primitive.ConsistencyLevel) primitive.ConsistencyLevel {
+	switch cl {
+	case primitive.ConsistencyLevelLocalSerial, primitive.ConsistencyLevelLocalQuorum, primitive.ConsistencyLevelLocalOne:
+		return primitive.ConsistencyLevelLocalQuorum
+	}
+	return primitive.ConsistencyLevelQuorum
 }
