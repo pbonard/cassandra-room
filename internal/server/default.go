@@ -20,7 +20,4 @@ const (
 
 	// DefaultPreparedCacheCapacity is the maximum number of prepared statements cached in LRU.
 	DefaultPreparedCacheCapacity = 4096
-
-	// DefaultStatementCacheCapacity is the maximum number of raw CQL ASTs cached in LRU.
-	DefaultStatementCacheCapacity = 2048
 )

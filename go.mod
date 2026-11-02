@@ -3,7 +3,7 @@ module github.com/cassandra-room/cassandra-room
 go 1.27.0
 
 require (
-	github.com/antlr4-go/antlr/v4 v4.13.1
+	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/cockroachdb/pebble v0.0.0-20261021160554-a995e890c06e
 	github.com/datastax/go-cassandra-native-protocol v0.0.0-20260130100129-9d5b43677a33
 	github.com/stretchr/testify v1.9.0
@@ -16,7 +16,6 @@ require (
 	github.com/RaduBerinde/btreemap v0.0.0-20260105202824-d3184786f603 // indirect
 	github.com/RaduBerinde/tdigest v0.0.0-20251022152254-90e030c3a314 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cockroachdb/crlib v0.0.0-20251122031428-fe658a2dbda1 // indirect
 	github.com/cockroachdb/errors v1.11.3 // indirect
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b // indirect

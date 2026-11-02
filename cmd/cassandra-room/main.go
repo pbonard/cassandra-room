@@ -8,9 +8,11 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
+	"github.com/cassandra-room/cassandra-room/internal/db"
 	"github.com/cassandra-room/cassandra-room/internal/server"
 )
 
@@ -22,10 +24,40 @@ func main() {
 		maxFrameSize          = flag.Int("max-frame-size", server.DefaultMaxFrameSize, "Maximum allowed CQL frame body size in bytes")
 		writeTimeout          = flag.Duration("write-timeout", server.DefaultWriteTimeout, "Per-frame socket write deadline")
 		shutdownTimeout       = flag.Duration("shutdown-timeout", 15*time.Second, "Graceful shutdown deadline for draining in-flight requests")
+		dataDir               = flag.String("data-dir", "data", "Directory of the database (data_file_directories, commitlog_directory)")
+		commitlogSync         = flag.String("commitlog-sync", "periodic", "periodic: fsync the commit log every -commitlog-sync-period; batch: fsync before acknowledging each write")
+		commitlogSyncPeriod   = flag.Duration("commitlog-sync-period", 10*time.Second, "Commit log fsync period in periodic mode (commitlog_sync_period)")
+		memtableSpace         = flag.Int64("memtable-space", 0, "Memtable space in bytes across all tables (memtable_heap_space); 0 uses the default")
+		clusterName           = flag.String("cluster-name", "Test Cluster", "Cluster name reported in system.local")
 	)
 	flag.Parse()
 
-	srv := server.New(nil)
+	if *commitlogSync != "periodic" && *commitlogSync != "batch" {
+		log.Fatalf("-commitlog-sync must be periodic or batch, got %q", *commitlogSync)
+	}
+	host, portStr, err := net.SplitHostPort(*addr)
+	if err != nil {
+		log.Fatalf("invalid -addr %q: %v", *addr, err)
+	}
+	port, _ := strconv.Atoi(portStr)
+	ip := net.ParseIP(host)
+	if ip == nil || ip.IsUnspecified() {
+		ip = net.IPv4(127, 0, 0, 1)
+	}
+	opts := db.Options{SyncWrites: *commitlogSync == "batch", ClusterName: *clusterName, Address: ip, Port: port}
+	opts.Engine.WALSyncPeriod = *commitlogSyncPeriod
+	opts.Engine.MemTableBudget = *memtableSpace
+	database, err := db.Open(*dataDir, opts)
+	if err != nil {
+		log.Fatalf("failed to open the database in %s: %v", *dataDir, err)
+	}
+	defer func() {
+		if err := database.Close(); err != nil {
+			log.Printf("closing the database: %v", err)
+		}
+	}()
+
+	srv := server.New(database)
 	if *maxConcurrentRequests > 0 {
 		srv.SetMaxConcurrentRequests(*maxConcurrentRequests)
 	}

@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cassandra-room/cassandra-room/internal/cql"
 	"github.com/datastax/go-cassandra-native-protocol/frame"
 	"github.com/datastax/go-cassandra-native-protocol/message"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
@@ -448,16 +447,12 @@ func (s *Server) isBarrierRawFrame(session *Session, rf *frame.RawFrame, claimed
 		}
 		query := string(rf.Body[pos : pos+qLen])
 		// Fast zero-allocation pre-check: skip whitespace and comments and check
-		// whether the first keyword is "USE" before invoking ANTLR on the reader goroutine.
+		// whether the first keyword is "USE" before preparing it on the reader goroutine.
 		if !hasLeadingKeywordUse(query) {
 			return false, nil
 		}
-		stmt, err := s.parseCached(query)
-		if err != nil {
-			return false, nil
-		}
-		_, isUse := stmt.(*cql.UseStatement)
-		return isUse, nil
+		p, err := s.statement(session.Keyspace(), query)
+		return err == nil && p.IsUse(), nil
 	case primitive.OpCodeExecute:
 		if pos+2 > len(rf.Body) {
 			return false, nil
@@ -468,11 +463,7 @@ func (s *Server) isBarrierRawFrame(session *Session, rf *frame.RawFrame, claimed
 			return false, nil
 		}
 		prep, ok := s.lookupPrepared(rf.Body[pos : pos+idLen])
-		if !ok {
-			return false, nil
-		}
-		_, isUse := prep.Statement.(*cql.UseStatement)
-		return isUse, nil
+		return ok && prep.IsUse(), nil
 	default:
 		return false, nil
 	}

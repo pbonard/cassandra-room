@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cassandra-room/cassandra-room/internal/cql"
+	"github.com/cassandra-room/cassandra-room/internal/db"
 	"github.com/datastax/go-cassandra-native-protocol/compression/lz4"
 	"github.com/datastax/go-cassandra-native-protocol/compression/snappy"
 	"github.com/datastax/go-cassandra-native-protocol/message"
@@ -95,105 +95,97 @@ func (s *Server) handleMessage(
 		return &message.Ready{}
 
 	case *message.Query:
-		var ksOverride string
-		if m.Options != nil {
-			ksOverride = m.Options.Keyspace
+		ks := session.Keyspace()
+		if m.Options != nil && m.Options.Keyspace != "" {
+			ks = m.Options.Keyspace
 		}
-		stmt, err := s.parseCached(m.Query)
+		p, err := s.statement(ks, m.Query)
 		if err != nil {
-			return &message.SyntaxError{ErrorMessage: err.Error()}
+			return db.ErrorMessage(err)
 		}
-		_, _, bindNames := session.extractStatementMeta(ksOverride, stmt)
-		values, err := resolveValues(m.Options, bindNames)
-		if err != nil {
-			return &message.Invalid{ErrorMessage: err.Error()}
-		}
-		return session.executeStatement(ctx, ksOverride, stmt, values)
+		return s.execute(ctx, session, p, db.OptionsOf(m.Options, version))
 
 	case *message.Prepare:
-		stmt, err := s.parseCached(m.Query)
+		ks := session.Keyspace()
+		if m.Keyspace != "" {
+			ks = m.Keyspace
+		}
+		p, err := s.statement(ks, m.Query)
 		if err != nil {
-			return &message.SyntaxError{ErrorMessage: err.Error()}
+			return db.ErrorMessage(err)
 		}
-		if err := session.validateStatementKeyspace(m.Keyspace, stmt); err != nil {
-			return &message.Invalid{ErrorMessage: err.Error()}
-		}
-		prep := s.registerPrepared(session, m.Keyspace, m.Query, stmt)
+		vars, result, resultID := p.Metadata()
 		return &message.PreparedResult{
-			PreparedQueryId:   prep.ID,
-			ResultMetadataId:  prep.ResultMetadataID,
-			VariablesMetadata: prep.VariablesMetadata,
-			ResultMetadata:    prep.ResultMetadata,
+			PreparedQueryId:   p.ID,
+			ResultMetadataId:  resultID,
+			VariablesMetadata: vars,
+			ResultMetadata:    result,
 		}
 
 	case *message.Execute:
-		prep, ok := s.lookupPrepared(m.QueryId)
+		p, ok := s.lookupPrepared(m.QueryId)
 		if !ok {
 			return &message.Unprepared{
 				Id:           m.QueryId,
 				ErrorMessage: fmt.Sprintf("unprepared query id %x", m.QueryId),
 			}
 		}
-		values, err := resolveValues(m.Options, prep.BindNames)
-		if err != nil {
-			return &message.Invalid{ErrorMessage: err.Error()}
+		o := db.OptionsOf(m.Options, version)
+		if version >= primitive.ProtocolVersion5 {
+			o.ResultMetadataID = m.ResultMetadataId
 		}
-		// A prepared statement is bound to the keyspace in which it was prepared.
-		return session.executeStatement(ctx, prep.Keyspace, prep.Statement, values)
+		return s.execute(ctx, session, p, o)
 
 	case *message.Batch:
-		for _, child := range m.Children {
-			var childStmt cql.Statement
-			var childKS string
-			var bindNames []string
-
+		ks := session.Keyspace()
+		if m.Keyspace != "" {
+			ks = m.Keyspace
+		}
+		children := make([]db.BatchChild, len(m.Children))
+		for i, child := range m.Children {
 			if len(child.Id) > 0 {
-				prep, ok := s.lookupPrepared(child.Id)
+				p, ok := s.lookupPrepared(child.Id)
 				if !ok {
 					return &message.Unprepared{
 						Id:           child.Id,
 						ErrorMessage: fmt.Sprintf("unprepared batch child id %x", child.Id),
 					}
 				}
-				childStmt = prep.Statement
-				// Prepared child uses the keyspace captured at PREPARE time.
-				childKS = prep.Keyspace
-				bindNames = prep.BindNames
-			} else {
-				parsed, err := s.parseCached(child.Query)
-				if err != nil {
-					return &message.SyntaxError{ErrorMessage: err.Error()}
-				}
-				childStmt = parsed
-				// Raw query child uses the Batch request's Keyspace override (if any).
-				childKS = m.Keyspace
-				_, _, bindNames = session.extractStatementMeta(childKS, childStmt)
+				children[i] = db.BatchChild{Prepared: p, Values: child.Values}
+				continue
 			}
-
-			if len(child.Values) != len(bindNames) {
-				return &message.Invalid{
-					ErrorMessage: fmt.Sprintf("expected %d bound values in batch child, got %d", len(bindNames), len(child.Values)),
-				}
+			p, err := s.statement(ks, child.Query)
+			if err != nil {
+				return db.ErrorMessage(err)
 			}
-
-			switch childStmt.(type) {
-			case *cql.InsertStatement, *cql.UpdateStatement, *cql.DeleteStatement:
-			default:
-				return &message.Invalid{
-					ErrorMessage: fmt.Sprintf("only INSERT, UPDATE, and DELETE are allowed in BATCH, got %T", childStmt),
-				}
-			}
-
-			resp := session.executeStatement(ctx, childKS, childStmt, child.Values)
-			if errMsg, isErr := resp.(message.Error); isErr {
-				return errMsg
+			children[i] = db.BatchChild{Prepared: p, Values: child.Values}
+		}
+		if s.testHook != nil {
+			if err := s.testHook(ctx, "BATCH"); err != nil {
+				return &message.ServerError{ErrorMessage: err.Error()}
 			}
 		}
-		return &message.VoidResult{}
+		return s.db.ExecuteBatch(m.Type, children, &db.RequestOptions{
+			Timestamp: m.DefaultTimestamp, NowInSec: m.NowInSeconds, Version: version,
+		})
 
 	default:
 		return &message.ProtocolError{
 			ErrorMessage: fmt.Sprintf("unsupported request opcode: %v", msg.GetOpCode()),
 		}
 	}
+}
+
+// execute runs a statement and applies a USE to the session.
+func (s *Server) execute(ctx context.Context, session *Session, p *db.Prepared, o *db.RequestOptions) message.Message {
+	if s.testHook != nil {
+		if err := s.testHook(ctx, p.Query); err != nil {
+			return &message.ServerError{ErrorMessage: err.Error()}
+		}
+	}
+	res := s.db.Execute(p, o)
+	if sk, ok := res.(*message.SetKeyspaceResult); ok && session != nil {
+		session.setKeyspace(sk.Keyspace)
+	}
+	return res
 }

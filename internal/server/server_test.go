@@ -13,11 +13,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cassandra-room/cassandra-room/internal/cql"
+	"github.com/cassandra-room/cassandra-room/internal/db"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/datastax/go-cassandra-native-protocol/compression"
 	"github.com/datastax/go-cassandra-native-protocol/compression/lz4"
 	"github.com/datastax/go-cassandra-native-protocol/compression/snappy"
-	"github.com/datastax/go-cassandra-native-protocol/datatype"
 	"github.com/datastax/go-cassandra-native-protocol/frame"
 	"github.com/datastax/go-cassandra-native-protocol/message"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
@@ -56,18 +56,63 @@ func roundTripCompressed(t *testing.T, compCodec frame.Codec, conn net.Conn, str
 	return respFrame
 }
 
+func newTestServer(t testing.TB) *Server {
+	t.Helper()
+	d, err := db.Open("db", db.Options{FS: vfs.NewMem()})
+	require.NoError(t, err)
+	t.Cleanup(func() { d.Close() })
+	return New(d)
+}
+
+func mustExec(t testing.TB, srv *Server, ks, q string, values ...*primitive.Value) message.Message {
+	t.Helper()
+	p, err := srv.db.Prepare(ks, q)
+	require.NoError(t, err, q)
+	res := srv.db.Execute(p, &db.RequestOptions{Values: values})
+	if e, ok := res.(message.Error); ok {
+		t.Fatalf("%s: %s", q, e.GetErrorMessage())
+	}
+	return res
+}
+
+var largePayload = bytes.Repeat([]byte("X"), 200*1024) // 200 KiB > segment.MaxPayloadLength (128 KiB - 1)
+
+// newFixtureServer returns a server with the keyspaces and tables the
+// protocol tests query.
+func newFixtureServer(t testing.TB) *Server {
+	srv := newTestServer(t)
+	keyspaces := []string{"cycling", "other_ks", "ks_comment", "ks_prepared", "explicit_v5_ks"}
+	for i := 0; i < 8; i++ {
+		keyspaces = append(keyspaces, fmt.Sprintf("ks_%d", i))
+	}
+	for _, ks := range keyspaces {
+		mustExec(t, srv, "", "CREATE KEYSPACE "+ks+" WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+	}
+	for _, q := range []string{
+		"CREATE TABLE cycling.riders (id int PRIMARY KEY, name text)",
+		"CREATE TABLE cycling.slow_table (id int PRIMARY KEY)",
+		"CREATE TABLE cycling.fast_table (id int PRIMARY KEY)",
+		"CREATE TABLE cycling.hold (id int PRIMARY KEY)",
+		"CREATE TABLE cycling.fast (id int PRIMARY KEY)",
+		"CREATE TABLE cycling.large_rows (id int PRIMARY KEY, blob_col blob)",
+		"CREATE TABLE ks_prepared.tbl (id int PRIMARY KEY)",
+		"CREATE TABLE explicit_v5_ks.riders (id int PRIMARY KEY, name text)",
+	} {
+		mustExec(t, srv, "", q)
+	}
+	for i := 0; i < 8; i++ {
+		mustExec(t, srv, "", fmt.Sprintf("CREATE TABLE ks_%d.riders (id int PRIMARY KEY)", i))
+	}
+	mustExec(t, srv, "cycling", "INSERT INTO large_rows (id, blob_col) VALUES (1, ?)", primitive.NewValue(largePayload))
+	return srv
+}
+
 func TestNativeProtocolWithCQLParser(t *testing.T) {
-	var (
-		mu       sync.Mutex
-		requests []*Request
-	)
-	srv := New(func(req *Request) (message.Message, error) {
-		mu.Lock()
-		requests = append(requests, req)
-		mu.Unlock()
-		// Return nil to let the server's default protocol response builder handle the result
-		return nil, nil
-	})
+	srv := newTestServer(t)
+	for _, ks := range []string{"temp_ks", "other_ks"} {
+		mustExec(t, srv, "", "CREATE KEYSPACE "+ks+" WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+	}
+	mustExec(t, srv, "other_ks", "CREATE TABLE riders (id uuid PRIMARY KEY, name text)")
 
 	clientConn, done := startPipeConn(srv)
 	codec := frame.NewCodec()
@@ -99,8 +144,8 @@ func TestNativeProtocolWithCQLParser(t *testing.T) {
 	require.Equal(t, primitive.SchemaChangeTargetKeyspace, sc.Target)
 	require.Equal(t, "cycling", sc.Keyspace)
 
-	// 4. Per-query Keyspace option reaches QueryHandler.Keyspace and does NOT permanently mutate session keyspace
-	sess := &Session{handler: srv.handler}
+	// 4. Per-query Keyspace option applies to the query and does NOT permanently mutate session keyspace
+	sess := &Session{}
 	sess.setInitializedWithVersion(primitive.ProtocolVersion4)
 	resp = srv.handleFrameWithContext(context.Background(), sess, frame.NewFrame(primitive.ProtocolVersion4, 4, &message.Query{
 		Query:   "CREATE TABLE temp_riders (id uuid PRIMARY KEY);",
@@ -109,7 +154,6 @@ func TestNativeProtocolWithCQLParser(t *testing.T) {
 	sc, ok = resp.Body.Message.(*message.SchemaChangeResult)
 	require.True(t, ok)
 	require.Equal(t, "temp_ks", sc.Keyspace)
-	require.Equal(t, "temp_ks", requests[len(requests)-1].Keyspace)
 	require.Empty(t, sess.Keyspace())
 
 	// Subsequent unqualified query and PREPARE without USE must fail with Invalid because session keyspace is still empty
@@ -133,7 +177,7 @@ func TestNativeProtocolWithCQLParser(t *testing.T) {
 
 	// 6. QUERY: CREATE TABLE (using session's active keyspace "cycling") -> RESULT SCHEMA_CHANGE (CREATED TABLE)
 	resp = roundTrip(t, codec, clientConn, 7, &message.Query{
-		Query: "CREATE TABLE riders (id uuid PRIMARY KEY, name text, embedding vector<float, 3>);",
+		Query: "CREATE TABLE riders (id uuid PRIMARY KEY, name text);",
 	})
 	sc, ok = resp.Body.Message.(*message.SchemaChangeResult)
 	require.True(t, ok)
@@ -164,6 +208,7 @@ func TestNativeProtocolWithCQLParser(t *testing.T) {
 	require.True(t, ok)
 	require.NotEqual(t, prepRes.PreparedQueryId, prepOther.PreparedQueryId)
 
+	riderID := []byte{0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17, 0x40, 0x00}
 	// 8. EXECUTE the first prepared statement (prepared in "cycling") even though session is now in "other_ks"
 	resp = roundTrip(t, codec, clientConn, 11, &message.Execute{
 		QueryId:          prepRes.PreparedQueryId,
@@ -172,16 +217,21 @@ func TestNativeProtocolWithCQLParser(t *testing.T) {
 			Consistency: primitive.ConsistencyLevelOne,
 			NamedValues: map[string]*primitive.Value{
 				"name": primitive.NewValue([]byte("Alice")),
-				"id":   primitive.NewValue([]byte("uuid-bytes")),
+				"id":   primitive.NewValue(riderID),
 			},
 		},
 	})
 	require.IsType(t, &message.VoidResult{}, resp.Body.Message)
-	lastReq := requests[len(requests)-1]
-	require.Equal(t, "cycling", lastReq.Keyspace)
-	require.Len(t, lastReq.Values, 2)
-	require.Equal(t, "uuid-bytes", string(lastReq.Values[0].Contents))
-	require.Equal(t, "Alice", string(lastReq.Values[1].Contents))
+	check := roundTrip(t, codec, clientConn, 111, &message.Query{Query: "SELECT name FROM cycling.riders WHERE id = 123e4567-e89b-12d3-a456-426614174000"})
+	require.Equal(t, message.RowSet{{[]byte("Alice")}}, check.Body.Message.(*message.RowsResult).Data)
+	// A value of the wrong size for its type is rejected.
+	bad := roundTrip(t, codec, clientConn, 112, &message.Execute{
+		QueryId: prepRes.PreparedQueryId,
+		Options: &message.QueryOptions{NamedValues: map[string]*primitive.Value{
+			"name": primitive.NewValue([]byte("Alice")), "id": primitive.NewValue([]byte("uuid-bytes")),
+		}},
+	})
+	require.IsType(t, &message.Invalid{}, bad.Body.Message)
 
 	// Verify missing or mismatched bind values return Invalid instead of nil values
 	respMissingBind := roundTrip(t, codec, clientConn, 12, &message.Execute{
@@ -190,7 +240,7 @@ func TestNativeProtocolWithCQLParser(t *testing.T) {
 		Options: &message.QueryOptions{
 			Consistency: primitive.ConsistencyLevelOne,
 			NamedValues: map[string]*primitive.Value{
-				"id": primitive.NewValue([]byte("uuid-only")),
+				"id": primitive.NewValue(riderID),
 			},
 		},
 	})
@@ -199,17 +249,19 @@ func TestNativeProtocolWithCQLParser(t *testing.T) {
 	// Switch back to cycling for remaining queries
 	_ = roundTrip(t, codec, clientConn, 13, &message.Query{Query: "USE cycling;"})
 
-	// 9. QUERY: SELECT COUNT(*), id AS rider_id, Name, "ExactCol" FROM riders -> RESULT ROWS with proper column names
+	// 9. QUERY: SELECT COUNT(*), id AS rider_id, Name FROM riders -> RESULT ROWS with proper column names
 	resp = roundTrip(t, codec, clientConn, 14, &message.Query{
-		Query: `SELECT COUNT(*), id AS rider_id, Name, "ExactCol" FROM riders WHERE id = 123e4567-e89b-12d3-a456-426614174000;`,
+		Query: `SELECT COUNT(*), id AS rider_id, Name FROM riders WHERE id = 123e4567-e89b-12d3-a456-426614174000;`,
 	})
 	rowsRes, ok := resp.Body.Message.(*message.RowsResult)
 	require.True(t, ok)
-	require.Equal(t, int32(4), rowsRes.Metadata.ColumnCount)
+	require.Equal(t, int32(3), rowsRes.Metadata.ColumnCount)
 	require.Equal(t, "count", rowsRes.Metadata.Columns[0].Name)
 	require.Equal(t, "rider_id", rowsRes.Metadata.Columns[1].Name)
 	require.Equal(t, "name", rowsRes.Metadata.Columns[2].Name)
-	require.Equal(t, "ExactCol", rowsRes.Metadata.Columns[3].Name)
+	require.Equal(t, []byte{0, 0, 0, 0, 0, 0, 0, 1}, []byte(rowsRes.Data[0][0]))
+	resp = roundTrip(t, codec, clientConn, 140, &message.Query{Query: `SELECT "ExactCol" FROM riders`})
+	require.IsType(t, &message.Invalid{}, resp.Body.Message)
 
 	// 10. BATCH with both raw CQL and prepared ID -> RESULT VOID
 	resp = roundTrip(t, codec, clientConn, 15, &message.Batch{
@@ -219,7 +271,7 @@ func TestNativeProtocolWithCQLParser(t *testing.T) {
 			{
 				Id: prepRes.PreparedQueryId,
 				Values: []*primitive.Value{
-					primitive.NewValue([]byte("uuid-2")),
+					primitive.NewValue(append([]byte{0x22}, riderID[1:]...)),
 					primitive.NewValue([]byte("Bob")),
 				},
 			},
@@ -247,13 +299,14 @@ func TestMultiConnectionAndStreamMultiplexing(t *testing.T) {
 	slowStarted := make(chan struct{})
 	var once sync.Once
 
-	srv := New(func(req *Request) (message.Message, error) {
-		if sel, ok := req.Statement.(*cql.SelectStatement); ok && sel.Table == "slow_table" {
+	srv := newFixtureServer(t)
+	srv.testHook = func(_ context.Context, q string) error {
+		if strings.Contains(q, "slow_table") {
 			once.Do(func() { close(slowStarted) })
 			<-slowDone
 		}
-		return nil, nil
-	})
+		return nil
+	}
 
 	// Test 1: In-connection stream multiplexing (fast stream finishes while slow stream is blocked on the SAME connection)
 	clientConn, done := startPipeConn(srv)
@@ -349,17 +402,18 @@ func TestAdmissionControlThrowOnOverload(t *testing.T) {
 	blockCh := make(chan struct{})
 	startedCh := make(chan struct{})
 
-	srv := New(func(req *Request) (message.Message, error) {
-		if sel, ok := req.Statement.(*cql.SelectStatement); ok && sel.Table == "hold" {
+	srv := newFixtureServer(t)
+	srv.testHook = func(_ context.Context, q string) error {
+		if strings.Contains(q, "cycling.hold") {
 			close(startedCh)
 			<-blockCh
 		}
-		return nil, nil
-	})
+		return nil
+	}
 	srv.SetMaxConcurrentRequests(1)
 
 	// Session 1 occupies the single global admission slot
-	s1 := &Session{handler: srv.handler}
+	s1 := &Session{}
 	s1.setInitializedWithVersion(primitive.ProtocolVersion4)
 	done1 := make(chan *frame.Frame, 1)
 	go func() {
@@ -370,7 +424,7 @@ func TestAdmissionControlThrowOnOverload(t *testing.T) {
 	<-startedCh
 
 	// Session 2 has THROW_ON_OVERLOAD=1 set via STARTUP and should immediately receive Overloaded (0x1001)
-	s2 := &Session{handler: srv.handler}
+	s2 := &Session{}
 	_ = srv.handleFrameWithContext(context.Background(), s2, frame.NewFrame(primitive.ProtocolVersion4, 1, message.NewStartup(
 		message.StartupOptionThrowOnOverload, "1",
 	)))
@@ -385,7 +439,7 @@ func TestAdmissionControlThrowOnOverload(t *testing.T) {
 }
 
 func TestFrameBoundariesAndMaliciousLengths(t *testing.T) {
-	srv := New(nil)
+	srv := newFixtureServer(t)
 	clientConn, done := startPipeConn(srv)
 	rawCodec := frame.NewRawCodec()
 	_ = roundTrip(t, rawCodec, clientConn, 1, message.NewStartup())
@@ -459,7 +513,7 @@ func TestFrameBoundariesAndMaliciousLengths(t *testing.T) {
 }
 
 func TestUseBarrierWithCommentsAndPreparedExecute(t *testing.T) {
-	srv := New(nil)
+	srv := newFixtureServer(t)
 	clientConn, done := startPipeConn(srv)
 	codec := frame.NewCodec()
 	_ = roundTrip(t, codec, clientConn, 0, message.NewStartup())
@@ -503,12 +557,13 @@ func TestCloseAndShutdownCancelBlockedHandler(t *testing.T) {
 	handlerStarted := make(chan struct{})
 	handlerCanceled := make(chan error, 1)
 
-	srv := New(func(req *Request) (message.Message, error) {
+	srv := newFixtureServer(t)
+	srv.testHook = func(ctx context.Context, _ string) error {
 		close(handlerStarted)
-		<-req.Ctx.Done()
-		handlerCanceled <- req.Ctx.Err()
-		return nil, req.Ctx.Err()
-	})
+		<-ctx.Done()
+		handlerCanceled <- ctx.Err()
+		return ctx.Err()
+	}
 
 	clientConn, _ := startPipeConn(srv)
 	codec := frame.NewCodec()
@@ -537,11 +592,12 @@ func TestCloseAndShutdownCancelBlockedHandler(t *testing.T) {
 func TestGracefulShutdownDeliversInFlightResponses(t *testing.T) {
 	handlerStarted := make(chan struct{})
 
-	srv := New(func(req *Request) (message.Message, error) {
+	srv := newFixtureServer(t)
+	srv.testHook = func(context.Context, string) error {
 		close(handlerStarted)
 		time.Sleep(50 * time.Millisecond)
-		return nil, nil
-	})
+		return nil
+	}
 
 	clientConn, _ := startPipeConn(srv)
 	codec := frame.NewCodec()
@@ -591,7 +647,7 @@ func FuzzRawFrameBounds(f *testing.F) {
 	f.Add(uint8(primitive.OpCodeBatch), uint8(0), []byte{0x00, 0x00, 0x01, 0x00, 0x7F, 0xFF, 0xFF, 0xFF})
 	f.Add(uint8(primitive.OpCodeStartup), uint8(primitive.HeaderFlagCustomPayload), []byte{0x00, 0x01, 0x00, 0x01, 'a', 0x7F, 0xFF, 0xFF, 0xFF})
 
-	srv := New(nil)
+	srv := newTestServer(f)
 	rawCodec := frame.NewRawCodec()
 
 	f.Fuzz(func(t *testing.T, opCode uint8, flags uint8, body []byte) {
@@ -626,7 +682,7 @@ func FuzzRawFrameBounds(f *testing.F) {
 }
 
 func TestCompressionLZ4AndSnappy(t *testing.T) {
-	srv := New(nil)
+	srv := newFixtureServer(t)
 
 	cases := []struct {
 		name string
@@ -773,7 +829,7 @@ func TestCompressionLZ4AndSnappy(t *testing.T) {
 			srv.SetMaxInFlightBytes(512)
 			defer srv.SetMaxInFlightBytes(DefaultMaxInFlightBytes)
 
-			repetitiveQuery := "SELECT id FROM riders WHERE name = '" + strings.Repeat("A", 2500) + "';"
+			repetitiveQuery := "SELECT id FROM riders WHERE name = '" + strings.Repeat("A", 2500) + "' ALLOW FILTERING;"
 			overloadResp := roundTripCompressed(t, compCodec, clientConn, 9, &message.Query{
 				Query: repetitiveQuery,
 			})
@@ -794,7 +850,7 @@ func TestCompressionLZ4AndSnappy(t *testing.T) {
 			require.IsType(t, &message.Ready{}, readyResp2.Body.Message)
 
 			bigQualResp := roundTripCompressed(t, compCodec, cConn2, 2, &message.Query{
-				Query: "SELECT id FROM cycling.riders WHERE name = '" + strings.Repeat("B", 2500) + "';",
+				Query: "SELECT id FROM cycling.riders WHERE name = '" + strings.Repeat("B", 2500) + "' ALLOW FILTERING;",
 			})
 			require.IsType(t, &message.RowsResult{}, bigQualResp.Body.Message)
 
@@ -805,23 +861,7 @@ func TestCompressionLZ4AndSnappy(t *testing.T) {
 }
 
 func TestProtocolV5SegmentFraming(t *testing.T) {
-	largePayload := bytes.Repeat([]byte("X"), 200*1024) // 200 KiB > segment.MaxPayloadLength (128 KiB - 1)
-	srv := New(func(req *Request) (message.Message, error) {
-		if sel, ok := req.Statement.(*cql.SelectStatement); ok && sel.Table == "large_rows" {
-			return &message.RowsResult{
-				Metadata: &message.RowsMetadata{
-					ColumnCount: 1,
-					Columns: []*message.ColumnMetadata{
-						{Keyspace: "cycling", Table: "large_rows", Name: "blob_col", Type: datatype.Varchar},
-					},
-				},
-				Data: message.RowSet{
-					message.Row{largePayload},
-				},
-			}, nil
-		}
-		return nil, nil
-	})
+	srv := newFixtureServer(t)
 
 	for _, compName := range []string{"", "lz4"} {
 		name := compName
@@ -920,7 +960,7 @@ func TestProtocolV5SegmentFraming(t *testing.T) {
 				Options: &message.QueryOptions{
 					Consistency: primitive.ConsistencyLevelOne,
 					NamedValues: map[string]*primitive.Value{
-						"id":   primitive.NewValue([]byte("v5-id")),
+						"id":   primitive.NewValue([]byte{0, 0, 0, 5}),
 						"name": primitive.NewValue([]byte("v5-rider")),
 					},
 				},
@@ -937,7 +977,7 @@ func TestProtocolV5SegmentFraming(t *testing.T) {
 			// 6. Send a multi-segment frame (IsSelfContained: false) split across 3 segments
 			var multiFrameBuf bytes.Buffer
 			require.NoError(t, rawCodec.EncodeFrame(frame.NewFrame(primitive.ProtocolVersion5, 7, &message.Query{
-				Query: "SELECT id, name FROM riders WHERE name = '" + strings.Repeat("V", 512) + "';",
+				Query: "SELECT id, name FROM riders WHERE name = '" + strings.Repeat("V", 512) + "' ALLOW FILTERING;",
 			}), &multiFrameBuf))
 			fullBytes := multiFrameBuf.Bytes()
 			part1 := fullBytes[:15]
@@ -1157,7 +1197,7 @@ func TestProtocolV5SegmentFraming(t *testing.T) {
 		// Send a ~550-byte query split across 3 segments on stream 55 (exceeds 64-byte budget)
 		var bigBuf bytes.Buffer
 		require.NoError(t, rawCodec.EncodeFrame(frame.NewFrame(primitive.ProtocolVersion5, 55, &message.Query{
-			Query: "SELECT id FROM cycling.riders WHERE name = '" + strings.Repeat("O", 512) + "';",
+			Query: "SELECT id FROM cycling.riders WHERE name = '" + strings.Repeat("O", 512) + "' ALLOW FILTERING;",
 		}), &bigBuf))
 		fullBytes := bigBuf.Bytes()
 

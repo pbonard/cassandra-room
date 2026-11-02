@@ -12,29 +12,29 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cassandra-room/cassandra-room/internal/cql"
+	"github.com/cassandra-room/cassandra-room/internal/db"
 	"github.com/datastax/go-cassandra-native-protocol/frame"
 	"github.com/datastax/go-cassandra-native-protocol/message"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
 )
 
-// QueryHandler is an optional callback that allows plugging custom execution logic
-// (e.g., storage engine / coordinator) for parsed CQL statements.
-type QueryHandler func(req *Request) (message.Message, error)
-
 // Server is a concurrent CQL native protocol server that accepts multiple TCP connections,
 // multiplexes up to 32k stream IDs per connection, enforces global admission control
-// (both request count and in-flight byte budgets), caches parsed ASTs and prepared
-// statements in sharded bounded LRUs, and decodes wire frames using
-// datastax/go-cassandra-native-protocol.
+// (both request count and in-flight byte budgets), caches prepared statements
+// in a sharded bounded LRU, decodes wire frames using
+// datastax/go-cassandra-native-protocol, and executes statements on the
+// database.
 type Server struct {
 	codec             frame.RawCodec
-	handler           QueryHandler
+	db                *db.DB
 	maxStreamsPerConn int
 	admission         *admissionController
 
-	preparedCache *lruCache[*preparedStmt]
-	stmtCache     *lruCache[cql.Statement]
+	// statements caches prepared statements by id, for EXECUTE and for
+	// unprepared QUERY messages alike.
+	statements *lruCache[*db.Prepared]
+	// testHook, if set, runs before each statement executes (tests).
+	testHook func(ctx context.Context, query string) error
 
 	mu           sync.RWMutex
 	maxFrameSize int
@@ -48,9 +48,8 @@ type Server struct {
 	connWG       sync.WaitGroup
 }
 
-// New creates a new CQL protocol server. If handler is nil, the server uses its
-// built-in default execution router.
-func New(handler QueryHandler) *Server {
+// New creates a CQL protocol server executing statements on d.
+func New(d *db.DB) *Server {
 	maxGlobal := runtime.NumCPU() * 64
 	if maxGlobal < 256 {
 		maxGlobal = 256
@@ -58,11 +57,10 @@ func New(handler QueryHandler) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
 		codec:             frame.NewRawCodec(),
-		handler:           handler,
+		db:                d,
 		maxStreamsPerConn: DefaultMaxConcurrentStreamsPerConn,
 		admission:         newAdmissionController(maxGlobal, DefaultMaxInFlightBytes),
-		preparedCache:     newLRUCache[*preparedStmt](DefaultPreparedCacheCapacity),
-		stmtCache:         newLRUCache[cql.Statement](DefaultStatementCacheCapacity),
+		statements:        newLRUCache[*db.Prepared](DefaultPreparedCacheCapacity),
 		maxFrameSize:      DefaultMaxFrameSize,
 		writeTimeout:      DefaultWriteTimeout,
 		listeners:         make(map[net.Listener]struct{}),
@@ -204,9 +202,7 @@ func (s *Server) serveConn(conn net.Conn) error {
 		s.connWG.Done()
 	}()
 
-	session := &Session{
-		handler: s.handler,
-	}
+	session := &Session{}
 	reader := bufioReaderPool.Get().(*bufio.Reader)
 	reader.Reset(conn)
 	defer func() {
