@@ -78,6 +78,8 @@ type DB struct {
 	// counterMu serializes counter updates, which read the node's shard
 	// before writing it (Cassandra's counter locks).
 	counterMu sync.Mutex
+	// vecs holds the open vector indexes.
+	vecs vectorIndexes
 
 	// store runs statements' reads and writes: localStorage, or the
 	// cluster's coordinator.

@@ -1705,7 +1705,10 @@ func (p *proxy) scatter(pr *Prepared, e *execCtx, o *RequestOptions) message.Mes
 	}
 	st := pr.state.Load()
 	if sel, ok := st.stmt.(*selectStmt); ok {
-		if limit, ok, _ := bindInt(e, sel.limit, "limit"); ok && int64(len(out.Data)) > limit {
+		limit, ok, _ := bindInt(e, sel.limit, "limit")
+		if sel.ann != nil {
+			mergeANN(out, limit)
+		} else if ok && int64(len(out.Data)) > limit {
 			out.Data = out.Data[:limit]
 		}
 	}

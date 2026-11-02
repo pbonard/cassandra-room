@@ -89,6 +89,11 @@ func newIndex(t *Table, st *cql.CreateIndex) (*Index, error) {
 	if c.Type.Kind == types.Vector && !ix.sai() {
 		return nil, invalidf("Vector column %s can only be indexed with 'sai' (StorageAttachedIndex)", c.Name)
 	}
+	if c.Type.Kind == types.Vector {
+		if _, err := vectorOptions(ix); err != nil {
+			return nil, err
+		}
+	}
 	multi := c.Type.IsMultiCell()
 	switch ix.Target {
 	case "":
@@ -183,6 +188,9 @@ func (t *Table) addEntries(b *mutation, rowKey []byte, cells []row.Cell, nowSec 
 
 // buildIndex writes the entries of the table's existing rows.
 func (d *DB) buildIndex(t *Table, ix *Index, nowSec int64) error {
+	if isFloatVector(ix.col.Type) {
+		return d.buildVectorIndex(t, ix)
+	}
 	lt, err := d.engine.Table(t.Storage)
 	if err != nil {
 		return err
@@ -477,8 +485,10 @@ func (q *query) readRowAt(src engineSource, p, pk, suffix []byte, f *filter) (bo
 	if err != nil || rd == nil {
 		return false, err
 	}
-	if ok, err := f.matches(q.e, rd); err != nil || !ok {
-		return false, err
+	if f != nil {
+		if ok, err := f.matches(q.e, rd); err != nil || !ok {
+			return false, err
+		}
 	}
 	return true, q.emitPartition(p, pkVals, static, dels, []kv{kvr})
 }

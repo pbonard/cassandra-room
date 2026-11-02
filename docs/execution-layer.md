@@ -174,8 +174,25 @@ sent to drivers as Cassandra's custom `VectorType(... , n)`. The
 functions score two vectors; `ORDER BY v ANN OF [..] LIMIT k` on a column
 with an SAI index (`similarity_function` option: cosine by default,
 euclidean, dot_product) returns the k most similar rows among those the
-rest of the query selects. Scoring is exact (every candidate row is
-scored), not an approximate graph search.
+rest of the query selects.
+
+The index (`internal/vecindex`) is a proximity graph as Cassandra's SAI
+builds with jvector (a DiskANN/Vamana-style graph): each vector has at
+most `maximum_node_connections` (16) neighbors, chosen on insert by a
+beam search of `construction_beam_width` (100) and kept diverse (a
+candidate is kept only if it is closer to the node than to kept neighbors,
+relaxed up to alpha 1.4), with backlinks pruned past 1.2x the maximum. A
+search is a best-first beam search for `optimize_for`'s top-k of the limit
+(LATENCY by default: 16 for LIMIT 10; RECALL: 42), scored exactly. Deleted
+vectors stay in the graph for routing and are never returned. Each node
+indexes its own rows as writes are applied, in the index's table (the
+graph is cached in memory); candidates are checked against the rows, which
+drops stale entries, and more are fetched while fewer than LIMIT qualify.
+In a cluster the query goes to every node (each answering for the
+partitions it is the first replica of) and the coordinator merges by
+score. With the partition key restricted, rows are scored one by one.
+Not done: product quantization (jvector compresses graphs of 1K+ vectors
+on disk), compacting away deleted nodes.
 
 ## Not supported yet
 

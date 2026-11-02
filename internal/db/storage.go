@@ -62,13 +62,15 @@ func (d *DB) applyLocal(writes []write) error {
 		b.Put(w.table, w.key, w.value)
 	}
 	d.tableMu.RLock()
-	defer d.tableMu.RUnlock()
-	if err := d.engine.Apply(b, d.wo); err != nil {
+	err := d.engine.Apply(b, d.wo)
+	d.tableMu.RUnlock()
+	if err != nil {
 		if strings.Contains(err.Error(), lsm.ErrUnknownTable.Error()) {
 			return invalidf("a table was dropped while it was written")
 		}
 		return err
 	}
+	d.updateVectorIndexes(writes)
 	return nil
 }
 

@@ -720,6 +720,10 @@ func (q *query) run() (message.Message, error) {
 		if !q.done() {
 			q.exhausted = true
 		}
+	} else if ix := s.annIndex(); ix != nil {
+		if err := q.annSearch(ix); err != nil {
+			return nil, err
+		}
 	} else if s.index != nil {
 		if err := q.scanIndex(s.index); err != nil {
 			return nil, err
@@ -1342,6 +1346,10 @@ func (q *query) flushGroup() error {
 
 func (q *query) result() (message.Message, error) {
 	md := &message.RowsMetadata{Columns: q.s.metadata()}
+	if q.s.ann != nil && q.e.local {
+		md.Columns = append(slices.Clip(md.Columns), &message.ColumnMetadata{Keyspace: q.s.t.Keyspace, Table: q.s.t.Name,
+			Name: annScoreColumn, Type: types.FloatType.DataType(), Index: int32(len(md.Columns))})
+	}
 	md.ColumnCount = int32(len(md.Columns))
 	if len(q.s.groupBy) > 0 {
 		if q.agg.seen && q.count < q.limit {

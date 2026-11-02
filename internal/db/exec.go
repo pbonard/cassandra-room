@@ -285,7 +285,7 @@ func (d *DB) Execute(p *Prepared, o *RequestOptions) message.Message {
 			return d.proxy.forward(to, &forwarded{Keyspace: p.Keyspace, Query: p.Query, Values: vals, Null: null, Unset: unset,
 				CL: uint16(o.Consistency), Timestamp: o.Timestamp, NowInSec: o.NowInSec, User: o.User})
 		}
-		if sel, ok := st.stmt.(*selectStmt); ok && sel.index != nil {
+		if sel, ok := st.stmt.(*selectStmt); ok && (sel.index != nil || sel.annIndex() != nil) {
 			return d.proxy.scatter(p, e, o)
 		}
 	}

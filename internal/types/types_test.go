@@ -343,3 +343,24 @@ func hexs(b []byte) string {
 	}
 	return string(out)
 }
+
+func TestVectorType(t *testing.T) {
+	for _, src := range []string{"vector<float, 4>", "vector<text, 2>", "frozen<vector<float, 3>>"} {
+		x, err := Parse(src)
+		require.NoError(t, err)
+		y, err := Parse(x.String())
+		require.NoError(t, err, x.String())
+		require.True(t, x.Equal(y))
+	}
+	x, _ := Parse("vector<text, 2>")
+	v := BuildVector(x, [][]byte{[]byte("ab"), []byte("")})
+	elems, err := SplitVector(x, v)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("ab"), []byte("")}, elems)
+	require.NoError(t, x.Validate(v))
+	require.Error(t, x.Validate(v[:2]))
+	f, _ := Parse("vector<float, 3>")
+	require.Equal(t, "org.apache.cassandra.db.marshal.VectorType(org.apache.cassandra.db.marshal.FloatType , 3)", f.MarshalClass())
+	_, err = Parse("vector<float, 0>")
+	require.Error(t, err)
+}

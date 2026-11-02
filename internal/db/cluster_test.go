@@ -588,3 +588,25 @@ func TestClusterCounters(t *testing.T) {
 		require.ElementsMatch(t, want, got, "node %d", n)
 	}
 }
+
+// TestClusterVectorSearch runs ANN queries from every node: each node
+// searches its own index for the partitions it is the first replica of,
+// and the coordinator merges by score.
+func TestClusterVectorSearch(t *testing.T) {
+	c := newTestCluster(t, 3)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
+	c.ok(0, quorum, "CREATE TABLE ks.v (id int PRIMARY KEY, emb vector<float, 4>)")
+	c.ok(1, quorum, "CREATE INDEX ON ks.v (emb) USING 'sai' WITH OPTIONS = {'similarity_function': 'euclidean'}")
+	time.Sleep(100 * time.Millisecond)
+	vecOf := func(i int) []float32 { return []float32{float32(i), float32(i % 7), float32(i % 3), 1} }
+	for i := 0; i < 150; i++ {
+		c.ok(i%3, quorum, "INSERT INTO ks.v (id, emb) VALUES (?, ?)", i, string(vec(vecOf(i)...)))
+	}
+	for n := range c.nodes {
+		got := c.values(n, one, "SELECT id FROM ks.v ORDER BY emb ANN OF ? LIMIT 3", string(vec(vecOf(40)...)))
+		require.ElementsMatch(t, []string{"40", "39", "41"}, got, "node %d", n) // (values sorts)
+		rows := c.ok(n, one, "SELECT id FROM ks.v ORDER BY emb ANN OF ? LIMIT 3", string(vec(vecOf(40)...))).(*message.RowsResult)
+		require.Equal(t, []byte{0, 0, 0, 40}, []byte(rows.Data[0][0]), "nearest first")
+		require.Len(t, rows.Metadata.Columns, 1, "no score column")
+	}
+}

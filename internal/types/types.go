@@ -128,6 +128,12 @@ func (t *Type) String() string {
 }
 
 func (t *Type) write(b *strings.Builder) {
+	if t.Kind == Vector {
+		b.WriteString("vector<")
+		t.Elems[0].write(b)
+		fmt.Fprintf(b, ", %d>", t.Dim)
+		return
+	}
 	if t.Frozen {
 		b.WriteString("frozen<")
 	}
@@ -138,12 +144,7 @@ func (t *Type) write(b *strings.Builder) {
 		}
 		return
 	}
-	if t.Kind == Vector {
-		b.WriteString("vector<")
-		t.Elems[0].write(b)
-		fmt.Fprintf(b, ", %d>", t.Dim)
-		return
-	}
+
 	b.WriteString(names[t.Kind])
 	if len(t.Elems) > 0 {
 		b.WriteByte('<')

@@ -3,8 +3,8 @@ package db
 import (
 	"context"
 	"errors"
-	"reflect"
 	"fmt"
+	"reflect"
 	"slices"
 	"time"
 
@@ -137,6 +137,11 @@ func (d *DB) installLocked(next *Schema) error {
 			gone = append(gone, id)
 		}
 	}
+	d.vecs.mu.Lock()
+	for _, id := range gone {
+		delete(d.vecs.m, id)
+	}
+	d.vecs.mu.Unlock()
 	if err := d.dropStorage(gone...); err != nil {
 		return err
 	}

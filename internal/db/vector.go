@@ -8,13 +8,15 @@ import (
 
 	"github.com/cassandra-room/cassandra-room/internal/cql"
 	"github.com/cassandra-room/cassandra-room/internal/types"
+	"github.com/datastax/go-cassandra-native-protocol/message"
 )
 
 // Vector search (CEP-30): similarity functions, and ORDER BY v ANN OF q
 // LIMIT k on a column with an SAI index, which returns the k rows whose
 // vectors are most similar to q under the index's similarity function.
-// Candidates are the rows the rest of the query selects; each is scored
-// exactly (no approximate graph), so results are exact nearest neighbours.
+// Without a partition key restriction the candidates come from the
+// column's vector index (vecstore.go); with one, every row of the selected
+// partitions is scored exactly.
 
 // similarity is a VectorSimilarityFunction: higher is more similar, in
 // [0, 1].
@@ -54,6 +56,15 @@ type annOrder struct {
 	col *Column
 	t   term
 	fn  similarity
+	ix  *Index
+}
+
+// annIndex returns the vector index serving the query's ANN ordering.
+func (s *selectStmt) annIndex() *Index {
+	if s.ann == nil || !isFloatVector(s.ann.col.Type) || (s.where.pkComplete() && len(s.t.PartitionKey) > 0) {
+		return nil // restricted partitions are scored row by row
+	}
+	return s.ann.ix
 }
 
 // prepareANN validates ORDER BY col ANN OF vector.
@@ -92,7 +103,7 @@ func (s *selectStmt) prepareANN(st *cql.Select, vs *vars) error {
 	if fn == nil {
 		fn = similarities["cosine"]
 	}
-	s.ann = &annOrder{col: c, t: t, fn: fn}
+	s.ann = &annOrder{col: c, t: t, fn: fn, ix: ix}
 	return nil
 }
 
@@ -148,9 +159,43 @@ func (q *query) annFinish() {
 	q.annTrim()
 	q.rows = q.rows[:0]
 	for _, r := range q.annRows {
-		q.rows = append(q.rows, r.row)
+		row := r.row
+		if q.e.local {
+			// Scattered: the coordinator merges the nodes' rows by score.
+			row = append(row, binary.BigEndian.AppendUint32(nil, math.Float32bits(r.score)))
+		}
+		q.rows = append(q.rows, row)
 	}
 	q.count = int64(len(q.rows))
+}
+
+// annScoreColumn is the score column of a scattered ANN query's rows.
+const annScoreColumn = "[ann_score]"
+
+// mergeANN merges the nodes' scored rows: the best limit, without the
+// score column.
+func mergeANN(out *message.RowsResult, limit int64) {
+	n := len(out.Metadata.Columns) - 1
+	score := func(r [][]byte) float32 { return math.Float32frombits(binary.BigEndian.Uint32(r[n])) }
+	slices.SortStableFunc(out.Data, func(a, b [][]byte) int {
+		switch sa, sb := score(a), score(b); {
+		case sa > sb:
+			return -1
+		case sa < sb:
+			return 1
+		}
+		return 0
+	})
+	if int64(len(out.Data)) > limit {
+		out.Data = out.Data[:limit]
+	}
+	for i := range out.Data {
+		out.Data[i] = out.Data[i][:n]
+	}
+	md := *out.Metadata
+	md.Columns = md.Columns[:n]
+	md.ColumnCount = int32(n)
+	out.Metadata = &md
 }
 
 // similarityFunc evaluates similarity_cosine/euclidean/dot_product.
