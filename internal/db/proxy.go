@@ -83,7 +83,7 @@ type proxy struct {
 	// downSince is when each node was last seen going down.
 	downSince sync.Map // addr -> time.Time
 	started   time.Time
-	seq      atomic.Uint64
+	seq       atomic.Uint64
 }
 
 // cmsStateFileName holds the metadata service's acceptor state.
