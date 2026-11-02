@@ -15,6 +15,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -63,11 +64,11 @@ type ClusterOptions struct {
 // by timestamp, so the merge is reconciliation) and repair the replicas
 // that were behind.
 type proxy struct {
-	d   *DB
-	m   *cluster.Messaging
-	g   *cluster.Gossiper
-	cms *cluster.CMS
-	lat readLatency
+	d    *DB
+	m    *cluster.Messaging
+	g    *cluster.Gossiper
+	cms  *cluster.CMS
+	lats sync.Map // lsm.TableID -> *readLatency, for speculative retry
 	// initialCMS are the metadata service's members before the metadata
 	// records any.
 	initialCMS []string
@@ -973,6 +974,14 @@ type distSource struct {
 	cl primitive.ConsistencyLevel
 }
 
+// policy is the table's speculative_retry option.
+func (s *distSource) policy() string {
+	if t := s.p.d.schema.Load().byStorage[s.id]; t != nil {
+		return t.Params.SpeculativeRetry
+	}
+	return "99p"
+}
+
 func encodeKey(id lsm.TableID, parts ...[]byte) []byte {
 	b := binary.AppendUvarint(nil, uint64(id))
 	for _, p := range parts {
@@ -1046,12 +1055,14 @@ func (s *distSource) readTargets(token int64) ([]*cluster.Node, ackNeed, error) 
 	return reps, need, nil
 }
 
-// readLatency tracks replica read latencies for speculative retry.
+// readLatency tracks a table's replica read latencies, for its
+// speculative retry policy.
 type readLatency struct {
 	mu      sync.Mutex
 	samples [256]time.Duration
 	n       int
-	p99     atomic.Int64
+	// pct caches percentiles, recomputed every 32 samples.
+	pct map[float64]time.Duration
 }
 
 func (l *readLatency) add(d time.Duration) {
@@ -1059,21 +1070,90 @@ func (l *readLatency) add(d time.Duration) {
 	l.samples[l.n%len(l.samples)] = d
 	l.n++
 	if l.n%32 == 0 {
-		c := slices.Clone(l.samples[:min(l.n, len(l.samples))])
-		slices.Sort(c)
-		l.p99.Store(int64(c[len(c)*99/100]))
+		l.pct = nil
 	}
 	l.mu.Unlock()
 }
 
-// threshold is when to speculate: the 99th percentile of replica reads
-// (speculative_retry = 99p), 50ms until enough reads were seen.
-func (l *readLatency) threshold(timeout time.Duration) time.Duration {
-	t := time.Duration(l.p99.Load())
-	if t <= 0 {
-		t = 50 * time.Millisecond
+// percentile returns the p-th percentile of recent reads, 0 before any.
+func (l *readLatency) percentile(p float64) time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if v, ok := l.pct[p]; ok {
+		return v
 	}
-	return min(max(t, time.Millisecond), timeout/2)
+	n := min(l.n, len(l.samples))
+	if n == 0 {
+		return 0
+	}
+	c := slices.Clone(l.samples[:n])
+	slices.Sort(c)
+	v := c[min(int(float64(n)*p/100), n-1)]
+	if l.pct == nil {
+		l.pct = map[float64]time.Duration{}
+	}
+	l.pct[p] = v
+	return v
+}
+
+// latency returns a table's read latency tracker.
+func (p *proxy) latency(id lsm.TableID) *readLatency {
+	v, _ := p.lats.LoadOrStore(id, &readLatency{})
+	return v.(*readLatency)
+}
+
+// speculateAfter is when a read of a table asks another replica, by its
+// speculative_retry option (SpeculativeRetryPolicy): "99p" (a percentile
+// of recent replica reads, 50ms until there are some), "20ms", "ALWAYS",
+// "NONE", and MIN(..., ...) or MAX(..., ...) of two. never is true for
+// NONE.
+func speculateAfter(policy string, l *readLatency, timeout time.Duration) (d time.Duration, never bool) {
+	p := strings.ToUpper(strings.TrimSpace(policy))
+	cap := func(d time.Duration) time.Duration { return min(max(d, 0), timeout/2) }
+	switch {
+	case p == "NONE":
+		return 0, true
+	case p == "ALWAYS":
+		return 0, false
+	case (strings.HasPrefix(p, "MIN(") || strings.HasPrefix(p, "MAX(")) && strings.HasSuffix(p, ")"):
+		a, b, ok := strings.Cut(p[4:len(p)-1], ",")
+		if !ok {
+			break
+		}
+		da, na := speculateAfter(a, l, timeout)
+		db, nb := speculateAfter(b, l, timeout)
+		if p[:3] == "MIN" {
+			switch {
+			case na:
+				return db, nb
+			case nb:
+				return da, na
+			}
+			return min(da, db), false
+		}
+		if na || nb {
+			return 0, true
+		}
+		return max(da, db), false
+	case strings.HasSuffix(p, "MS"):
+		if v, err := strconv.ParseFloat(strings.TrimSuffix(p, "MS"), 64); err == nil {
+			return cap(time.Duration(v * float64(time.Millisecond))), false
+		}
+	case strings.HasSuffix(p, "P") || strings.HasSuffix(p, "PERCENTILE"):
+		v, err := strconv.ParseFloat(strings.TrimSuffix(strings.TrimSuffix(p, "PERCENTILE"), "P"), 64)
+		if err == nil && v > 0 && v <= 100 {
+			d := l.percentile(v)
+			if d <= 0 {
+				d = 50 * time.Millisecond
+			}
+			return cap(max(d, time.Millisecond)), false
+		}
+	}
+	d = l.percentile(99) // unparsable: the default
+	if d <= 0 {
+		d = 50 * time.Millisecond
+	}
+	return cap(d), false
 }
 
 func rowDigest(found bool, v []byte) []byte {
@@ -1115,6 +1195,7 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 	}
 	ch := make(chan resp, len(reps))
 	payload := encodeKey(s.id, key)
+	lat := s.p.latency(s.id)
 	ask := func(r *cluster.Node, data bool) {
 		start := time.Now()
 		verb := cluster.VerbReadDigest
@@ -1129,7 +1210,7 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 			ch <- resp{node: r, data: data, err: err}
 			return
 		}
-		s.p.lat.add(time.Since(start))
+		lat.add(time.Since(start))
 		if data {
 			ch <- resp{node: r, data: true, found: b[0] == 1, v: b[1:], digest: rowDigest(b[0] == 1, b[1:])}
 		} else {
@@ -1145,7 +1226,11 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 	var got []resp
 	var answered acks
 	haveData := false
-	speculate := time.NewTimer(s.p.lat.threshold(s.p.opts.ReadTimeout))
+	after, never := speculateAfter(s.policy(), lat, s.p.opts.ReadTimeout)
+	speculate := time.NewTimer(after)
+	if never {
+		speculate.Stop()
+	}
 	defer speculate.Stop()
 	timeout := func() error {
 		return &timeoutError{cl: s.cl, received: answered.total, blockFor: need.count()}
@@ -1386,7 +1471,7 @@ func (it *distIter) load(from []byte) bool {
 			it.err = err
 			return false
 		}
-		kvs, cutoff, err := it.fetch(reps, need.count(), from, segEnd)
+		kvs, cutoff, err := it.fetch(reps, need, from, segEnd)
 		if err != nil {
 			it.err = err
 			return false
@@ -1411,45 +1496,67 @@ func (it *distIter) load(from []byte) bool {
 
 // fetch reads [from, to) from need replicas and merges their rows; cutoff
 // is the last complete key when a replica's page was cut.
-func (it *distIter) fetch(reps []*cluster.Node, need int, from, to []byte) ([]kv, []byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), it.s.p.opts.ReadTimeout)
+func (it *distIter) fetch(reps []*cluster.Node, need ackNeed, from, to []byte) ([]kv, []byte, error) {
+	p := it.s.p
+	ctx, cancel := context.WithTimeout(context.Background(), p.opts.ReadTimeout)
 	defer cancel()
 	type resp struct {
+		node *cluster.Node
 		kvs  []kv
 		more bool
 		err  error
 	}
 	ch := make(chan resp, len(reps))
 	ask := func(r *cluster.Node) {
-		b, err := it.s.p.m.Request(ctx, r.Addr, cluster.VerbReadRange, encodeKey(it.s.id, from, to))
+		b, err := p.m.Request(ctx, r.Addr, cluster.VerbReadRange, encodeKey(it.s.id, from, to))
 		if err != nil {
-			ch <- resp{err: err}
+			ch <- resp{node: r, err: err}
 			return
 		}
 		kvs, more, err := decodeKVs(b)
-		ch <- resp{kvs: kvs, more: more, err: err}
+		ch <- resp{node: r, kvs: kvs, more: more, err: err}
 	}
-	for _, r := range reps[:need] {
+	initial := need.count()
+	for _, r := range reps[:initial] {
 		go ask(r)
 	}
-	next := need
+	asked := map[string]bool{}
+	for _, r := range reps[:initial] {
+		asked[r.Addr] = true
+	}
 	var got []resp
-	for len(got) < need {
+	var answered acks
+	timeout := func() error {
+		return &timeoutError{cl: it.s.cl, received: answered.total, blockFor: need.count()}
+	}
+	outstanding := initial
+	for !need.met(answered) {
 		select {
 		case r := <-ch:
+			outstanding--
 			if r.err != nil {
-				if next < len(reps) {
-					go ask(reps[next])
-					next++
-					continue
+				// Another replica in its place, of the same data center
+				// for EACH_QUORUM.
+				for _, alt := range reps {
+					if !asked[alt.Addr] && (need.perDC == nil || alt.DataCenter == r.node.DataCenter) {
+						asked[alt.Addr] = true
+						outstanding++
+						go ask(alt)
+						break
+					}
 				}
-				return nil, nil, &timeoutError{cl: it.s.cl, received: len(got), blockFor: need}
+				if outstanding == 0 {
+					return nil, nil, timeout()
+				}
+				continue
 			}
 			got = append(got, r)
+			answered.add(r.node)
 		case <-ctx.Done():
-			return nil, nil, &timeoutError{cl: it.s.cl, received: len(got), blockFor: need}
+			return nil, nil, timeout()
 		}
 	}
+	// Rows past the first truncated page are not complete everywhere.
 	var cutoff []byte
 	for _, r := range got {
 		if r.more && len(r.kvs) > 0 {
@@ -1481,6 +1588,25 @@ func (it *distIter) fetch(reps []*cluster.Node, need int, from, to []byte) ([]kv
 		out = append(out, kv{[]byte(k), v})
 	}
 	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i].k, out[j].k) < 0 })
+	// Blocking read repair: replicas that returned less get the merged rows
+	// (DataResolver).
+	if len(got) > 1 {
+		for _, r := range got {
+			have := make(map[string][]byte, len(r.kvs))
+			for _, e := range r.kvs {
+				have[string(e.k)] = e.v
+			}
+			var ws []write
+			for _, e := range out {
+				if v, ok := have[string(e.k)]; !ok || !bytes.Equal(v, e.v) {
+					ws = append(ws, write{table: it.s.id, key: e.k, value: e.v, token: tokenOf(e.k)})
+				}
+			}
+			if len(ws) > 0 {
+				p.repair([]string{r.node.Addr}, ws)
+			}
+		}
+	}
 	return out, cutoff, nil
 }
 

@@ -100,8 +100,13 @@ node, the coordinator in a cluster.
   the others blockFor needs for a digest; matching digests answer at once,
   a mismatch reads full rows from everyone who answered and merges them
   (row fragments merge by timestamp, so the merge is the reconciliation).
-  A replica slower than the 99th percentile of recent replica reads, or
-  failing, gets another replica asked in its place (speculative retry). Replicas that
+  A replica slower than the table's `speculative_retry` (a percentile of
+  that table's recent replica reads, `99p` by default; a fixed `Nms`;
+  `ALWAYS`; `NONE`; or `MIN`/`MAX` of two), or failing, gets another
+  replica asked in its place. Range reads read full rows from the
+  replicas (no digests, as in Cassandra), retry a failed replica with one
+  of the same data center for EACH_QUORUM, and repair the replicas that
+  returned less. Replicas that
   returned less get the merged row (blocking read repair). Range scans read
   one ring range at a time, in pages, cutting each page at the first
   replica page that was truncated.
@@ -182,9 +187,13 @@ node, the coordinator in a cluster.
 
 ## Not done
 
-replaying the metadata log (each epoch's value is a full snapshot); internode encryption and compression, EACH_QUORUM per
-data center (it is approximated as QUORUM), digest reads, speculative
-retry by latency.
+- Metadata: each epoch's value is a full snapshot pushed to every node, and
+  the log keeps the latest changes for display only (it cannot be
+  replayed).
+- Lightweight transactions stay on Paxos v1 (Accord is planned to replace
+  them).
+- Repair is full repair only (no incremental repair); streaming sends
+  files through messages (no sendfile).
 
 ## Tests
 
