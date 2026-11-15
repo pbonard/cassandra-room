@@ -20,6 +20,8 @@ type Journal interface {
 	Load() ([]*Command, error)
 	// Compact rewrites the journal with the given commands only.
 	Compact(cs []*Command) error
+	// Delete forgets a command.
+	Delete(id TxnID) error
 }
 
 // MemJournal is an in-memory journal (for tests: it survives a node being
@@ -42,6 +44,13 @@ func (j *MemJournal) Append(c *Command) error {
 	}
 	j.cmds[c.ID] = b
 	j.n++
+	return nil
+}
+
+func (j *MemJournal) Delete(id TxnID) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	delete(j.cmds, id)
 	return nil
 }
 
@@ -110,6 +119,12 @@ func (j *FileJournal) Append(c *Command) error {
 	return nil
 }
 
+// Delete appends a record forgetting the command (dropped at the next
+// compaction).
+func (j *FileJournal) Delete(id TxnID) error {
+	return j.Append(&Command{ID: id, Status: forgotten})
+}
+
 func (j *FileJournal) Load() ([]*Command, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -136,7 +151,9 @@ func (j *FileJournal) Load() ([]*Command, error) {
 	}
 	out := make([]*Command, 0, len(order))
 	for _, id := range order {
-		out = append(out, latest[id])
+		if latest[id].Status != forgotten {
+			out = append(out, latest[id])
+		}
 	}
 	return out, nil
 }

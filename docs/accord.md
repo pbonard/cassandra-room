@@ -23,6 +23,17 @@ names, not its class structure.
   quorum of every shard voted for the TxnID, the transaction executes there
   with the merged dependencies of the fast votes. Fast quorums follow
   `Shard.simpleFastQuorumSize`: all 3 of 3 replicas, 4 of 5.
+- **Privileged coordinator** (`PrivilegedCoordinatorWithoutDeps`): when the
+  coordinator replicates one of the transaction's keys, it votes first,
+  locally, and its vote counts, so a shard's fast quorum is
+  `privilegedWithoutDepsFastQuorumSize`: 2 of 3 replicas. It decides the
+  fast path locally, and only if no recovery has promised a ballot there.
+  A recovery that reaches the undecided coordinator therefore knows the
+  fast path was not taken. A recovery that doesn't reach it assumes it
+  voted.
+- **Medium path**: if a slow quorum of every shard (but not a fast quorum)
+  voted for the TxnID, one Accept round of that proposal commits it, with
+  the votes' dependencies. The replicas don't compute new ones.
 - **Slow path** (`Propose`): the coordinator proposes the latest timestamp
   to every replica in an Accept round. The Accept round also recomputes
   dependencies against that timestamp.
@@ -67,25 +78,75 @@ names, not its class structure.
 
   It first fetches the outcome from other replicas (`FetchData`,
   `Propagate`), and recovers the transaction when nobody has finished it.
+- **Ephemeral reads** (`CoordinateEphemeralRead`): a single-key read-only
+  transaction is not committed or journaled.
+  1. A quorum of every shard reports the writes on the key that are not yet
+     applied at every replica.
+  2. One replica waits until those have applied there, then reads.
+
+  Every write acknowledged before the read started is applied at a quorum,
+  and the dependency quorum intersects it. Reads of several keys use the
+  whole protocol, so that they form one snapshot.
 - **Epochs** (`Topologies`): each phase needs a quorum of every shard of
-  every epoch from the TxnID's to the execution timestamp's. An Accept
-  therefore also reaches the replicas of a newer epoch and their
-  dependencies (CASSANDRA-18365). Nodes keep the last 64 topologies.
+  every epoch from the TxnID's (or the oldest epoch not yet synchronised)
+  to the execution timestamp's.
+  - **Newer epochs:** an Accept therefore also reaches the replicas of a
+    newer epoch and their dependencies (CASSANDRA-18365). A replica that
+    knows a newer epoch doesn't vote for the fast path of an older one.
+  - **Synchronisation:** every node polls the others for the oldest epoch
+    they still have transactions of in progress. Older epochs leave the
+    quorums only once no node has any.
+  - **Stale epochs:** a replica refuses a new transaction from an epoch
+    before that (`StaleTopology`). The coordinator then recovers it (so it
+    never executes) and retries in the newer epoch.
+- **Joining nodes**:
+  - **While bootstrapping:** a pending replica receives every Apply, and
+    writes go to the replicas of every epoch up to the current one, so its
+    streamed data plus those writes are complete.
+  - **Old dependencies:** a dependency from before the node joined that it
+    doesn't know doesn't hold up applying, because its effect came with the
+    bootstrap data, and writes are timestamped cells (the latest wins in any
+    order). Reads at that node wait until such dependencies are fetched; it
+    answers "not ready" and the coordinator reads from another replica.
 - **Journal** (`Journal`, `AccordJournal`): every state change is made
-  durable before the replica answers, and replayed at startup. A
-  transaction applied at every replica is truncated after `RetainApplied`
-  to its id, status and timestamp. An erased command is only adopted once
-  it is durably decided everywhere (CASSANDRA-18365).
+  durable before the replica answers, and replayed at startup.
+  - **Truncation:** a transaction applied at every replica is truncated
+    after `RetainApplied` to its id, status and timestamp. An erased
+    command is only adopted once it is durably decided everywhere
+    (CASSANDRA-18365).
+  - **Forgetting:** truncated and invalidated records are forgotten after
+    `TombstoneRetention`, and their journal records deleted. Each key keeps
+    the largest timestamp it witnessed, so a late message about a forgotten
+    transaction gets no fast-path vote. Its recovery invalidates it.
 
 ## In the database
 
 `internal/db/accord.go` connects the protocol to the database:
 
-- **Which tables:** tables `WITH transactional_mode = 'full'` run
-  conditional statements (single statements and conditional batches) as
-  Accord transactions instead of Paxos. SERIAL reads of such tables first
-  run a read-only transaction, so they are ordered after every transaction
-  decided before them.
+- **Which tables:** tables `WITH transactional_mode = 'full'` route every
+  statement through Accord:
+  - conditional statements and conditional batches, instead of Paxos;
+  - plain writes and batches, as one transaction each (custom timestamps,
+    and batches mixing transactional and other tables, are refused);
+  - single-partition reads at any consistency, as read transactions;
+  - reads of several partitions, which first run a read-only transaction
+    on each.
+- **Transactions** (`txn.go`, `TransactionStatement`):
+  `BEGIN TRANSACTION … COMMIT TRANSACTION` supports:
+  - `LET` assignments of one row (the full primary key, or the partition
+    key and `LIMIT 1`);
+  - a `SELECT`, or a `SELECT` of `LET` references, returned to the client;
+  - `IF … THEN`, `ELSE IF … THEN`, `ELSE … END IF` blocks, with comparisons
+    and `IS [NOT] NULL` on references;
+  - references as update values;
+  - `c += v` and `c -= v` on numeric columns (an implicit read of the
+    updated row);
+  - Cassandra's validation messages.
+
+  In a cluster, the statement is one Accord transaction over every
+  partition it reads or may write. Replicas read the `LET` rows and the
+  `SELECT`; the coordinator evaluates the blocks and updates. On a single
+  node it runs under a lock.
 - **Keys:** a key is a partition: its token, plus the table's storage id
   and the partition key. An epoch's topology maps it to the replicas of its
   keyspace in that epoch's ring.
@@ -123,15 +184,14 @@ names, not its class structure.
 
 ## Not done
 
-- **Transactions:** CQL transactions (`BEGIN TRANSACTION … COMMIT
-  TRANSACTION`, `LET`) and non-conditional reads and writes through Accord
-  (transactional_mode 'full' in Cassandra also routes those). Range
-  transactions and sync points are not done either.
-- **Topology changes:** bootstrap of Accord state (and data) onto new
-  replicas. Nodes joining or leaving while Accord transactions run rely
-  on multi-epoch quorums only.
-- **Optimisations:** the medium path, privileged coordinators, ephemeral
-  reads, per-shard command stores, and journal segments (each command is
-  one synced row).
-- **Truncated state:** commands truncated to a tombstone are kept forever
-  (no `RedundantBefore` bound).
+- **Ranges and sync points:** range transactions, and range reads of
+  transactional tables (they use the ordinary read path).
+- **Epoch synchronisation:** it is per node, not per range, and a node
+  still on an old epoch holds it back for everyone.
+- **Write coverage after joins:** a write that a joining node missed while
+  down (after the Apply retries give up) is only repaired when a read
+  fetches it, or by repair.
+- **Other optimisations:** per-shard command stores, journal segments
+  (each command is one synced row), and `PrivilegedCoordinatorWithDeps`.
+- **Transaction features:** paging of transaction and Accord read results,
+  and arithmetic beyond `+=` / `-=` in transactions.

@@ -83,6 +83,10 @@ const (
 type TxnID struct {
 	Timestamp
 	Kind Kind `json:"k,omitempty"`
+	// Privileged: the coordinator (a replica) counts its own vote, and
+	// decides the fast path locally only if no recovery promised a ballot
+	// there first (TxnId.hasPrivilegedCoordinator).
+	Privileged bool `json:"p,omitempty"`
 }
 
 func (id TxnID) Compare(o TxnID) int { return id.Timestamp.Compare(o.Timestamp) }

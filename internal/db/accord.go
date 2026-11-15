@@ -137,7 +137,8 @@ func (p *proxy) accordTopology(s *Schema) {
 		return
 	}
 	ring := cluster.NewRing(nodeList(s))
-	p.accord.SetTopology(&accord.Topology{Epoch: s.Epoch, Replicas: func(k accord.Key) []accord.NodeID {
+	future := cluster.NewFutureRing(nodeList(s))
+	replication := func(k accord.Key) map[string]string {
 		id, _, err := splitAccordKey(k)
 		if err != nil {
 			return nil
@@ -146,16 +147,43 @@ func (p *proxy) accordTopology(s *Schema) {
 		if t == nil {
 			return nil
 		}
-		ks := s.Keyspaces[t.Keyspace]
-		if ks == nil {
-			return nil
+		if ks := s.Keyspaces[t.Keyspace]; ks != nil {
+			return ks.Replication
 		}
-		var out []accord.NodeID
-		for _, n := range ring.Replicas(ks.Replication, k.Token) {
-			out = append(out, n.Addr)
+		return nil
+	}
+	var nodes []accord.NodeID
+	for _, n := range s.Nodes {
+		if n.Status != cluster.StatusLeft {
+			nodes = append(nodes, n.Addr)
 		}
-		return out
-	}})
+	}
+	p.accord.SetTopology(&accord.Topology{Epoch: s.Epoch, Nodes: nodes,
+		Replicas: func(k accord.Key) []accord.NodeID {
+			repl := replication(k)
+			if repl == nil {
+				return nil
+			}
+			var out []accord.NodeID
+			for _, n := range ring.Replicas(repl, k.Token) {
+				out = append(out, n.Addr)
+			}
+			return out
+		},
+		// Joining nodes receive every write while they bootstrap
+		// (pending replicas), so that the data they stream is not missing
+		// the transactions applied meanwhile.
+		Pending: func(k accord.Key) []accord.NodeID {
+			repl := replication(k)
+			if repl == nil {
+				return nil
+			}
+			var out []accord.NodeID
+			for _, n := range future.Replicas(repl, k.Token) {
+				out = append(out, n.Addr)
+			}
+			return out
+		}})
 }
 
 type accordTransport struct{ p *proxy }
@@ -217,6 +245,9 @@ func (j *accordJournal) Load() ([]*accord.Command, error) {
 			return nil, err
 		}
 		for _, cell := range r.Cells {
+			if r.Deletion.MarkedForDeleteAt != row.NoTimestamp && cell.Timestamp <= r.Deletion.MarkedForDeleteAt {
+				continue // forgotten
+			}
 			var c accord.Command
 			if err := json.Unmarshal(cell.Value, &c); err != nil {
 				return nil, fmt.Errorf("db: corrupt accord journal: %w", err)
@@ -226,6 +257,24 @@ func (j *accordJournal) Load() ([]*accord.Command, error) {
 		}
 	}
 	return out, it.Error()
+}
+
+// Delete forgets a command (a row deletion newer than its record).
+func (j *accordJournal) Delete(id accord.TxnID) error {
+	ts := j.d.opts.Now().UnixMicro()
+	for {
+		last := j.last.Load()
+		ts = max(ts, last+1)
+		if j.last.CompareAndSwap(last, ts) {
+			break
+		}
+	}
+	r := &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: ts, LocalDeletionTime: j.d.opts.Now().Unix()}}
+	b := lsm.NewBatch()
+	b.Put(accordStorage, journalKey(id), row.Append(nil, r))
+	j.d.tableMu.RLock()
+	defer j.d.tableMu.RUnlock()
+	return j.d.engine.Apply(b, lsm.Sync)
 }
 
 // Compact is a no-op: each command has one record, replaced in place.

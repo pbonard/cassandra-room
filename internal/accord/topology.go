@@ -11,14 +11,20 @@ import (
 type Topology struct {
 	Epoch    int64
 	Replicas func(Key) []NodeID
+	// Pending, if set, returns replicas a key is moving to (joining
+	// nodes): they receive every transaction's writes, without voting.
+	Pending func(Key) []NodeID
+	// Nodes are every node of the epoch (for epoch synchronisation).
+	Nodes []NodeID
 }
 
 // Shard is a set of replicas and the keys of a transaction they own
 // (accord.topology.Shard).
 type Shard struct {
-	Epoch int64
-	Nodes []NodeID
-	Keys  []Key
+	Epoch   int64
+	Nodes   []NodeID
+	Keys    []Key
+	Pending []NodeID
 }
 
 func (s *Shard) slowQuorum() int { return len(s.Nodes) - (len(s.Nodes)-1)/2 }
@@ -29,6 +35,13 @@ func (s *Shard) slowQuorum() int { return len(s.Nodes) - (len(s.Nodes)-1)/2 }
 func (s *Shard) fastQuorum() int {
 	rf := len(s.Nodes)
 	return max((1+rf+rf-s.slowQuorum()+1)/2, rf/2+1)
+}
+
+// privilegedFastQuorum is Shard.privilegedWithoutDepsFastQuorumSize: the
+// coordinator's own vote counts, so 2 of 3 replicas suffice.
+func (s *Shard) privilegedFastQuorum() int {
+	rf := len(s.Nodes)
+	return max((rf+rf-s.slowQuorum()+1)/2, rf/2+1)
 }
 
 // shards groups keys by replica set at a topology.
@@ -47,6 +60,13 @@ func (t *Topology) shards(keys []Key) []*Shard {
 			out = append(out, s)
 		}
 		s.Keys = append(s.Keys, k)
+		if t.Pending != nil {
+			for _, p := range t.Pending(k) {
+				if !slices.Contains(s.Pending, p) && !slices.Contains(s.Nodes, p) {
+					s.Pending = append(s.Pending, p)
+				}
+			}
+		}
 	}
 	return out
 }
@@ -65,6 +85,17 @@ func (ts *Topologies) nodes() []NodeID {
 	var out []NodeID
 	for _, s := range ts.Shards {
 		out = append(out, s.Nodes...)
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// applyNodes returns every replica and pending replica once: the
+// targets of a transaction's writes.
+func (ts *Topologies) applyNodes() []NodeID {
+	out := ts.nodes()
+	for _, s := range ts.Shards {
+		out = append(out, s.Pending...)
 	}
 	slices.Sort(out)
 	return slices.Compact(out)

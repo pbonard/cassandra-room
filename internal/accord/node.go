@@ -55,6 +55,16 @@ type Config struct {
 	RetainApplied time.Duration
 	// RequestTimeout bounds each request. Default: 2s.
 	RequestTimeout time.Duration
+	// TombstoneRetention is how long the outcome of a truncated or
+	// invalidated transaction is kept before it is forgotten. Default: ten
+	// times RetainApplied.
+	TombstoneRetention time.Duration
+	// NoEphemeralReads runs read-only transactions through the whole
+	// protocol instead of as ephemeral reads.
+	NoEphemeralReads bool
+	// NoPrivilegedCoordinator disables the privileged coordinator fast
+	// path (a coordinator replica counting its own vote).
+	NoPrivilegedCoordinator bool
 }
 
 // Errors returned by Coordinate.
@@ -78,6 +88,16 @@ type Node struct {
 	topoMu sync.RWMutex
 	topos  map[int64]*Topology
 	latest int64
+	// synced is the oldest epoch any node still has transactions of in
+	// progress: phases include every epoch from it on, so transactions
+	// started before a topology change are witnessed by the replicas of
+	// the new one until none is left (epoch synchronisation).
+	synced     atomic.Int64
+	lastSynced time.Time
+	// joined is the first epoch this node was part of (it started, or
+	// joined, then): transactions of earlier epochs are reflected in the
+	// data it bootstrapped with.
+	joined atomic.Int64
 
 	stop    chan struct{}
 	stopped atomic.Bool
@@ -99,6 +119,9 @@ func NewNode(cfg Config) (*Node, error) {
 	}
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 2 * time.Second
+	}
+	if cfg.TombstoneRetention <= 0 {
+		cfg.TombstoneRetention = 10 * cfg.RetainApplied
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -124,6 +147,9 @@ func (n *Node) SetTopology(t *Topology) {
 	n.topoMu.Lock()
 	n.topos[t.Epoch] = t
 	n.latest = max(n.latest, t.Epoch)
+	if n.joined.Load() == 0 && (len(t.Nodes) == 0 || slices.Contains(t.Nodes, n.cfg.ID)) {
+		n.joined.Store(t.Epoch)
+	}
 	for e := range n.topos {
 		if e < n.latest-64 {
 			delete(n.topos, e)
@@ -161,12 +187,21 @@ func (n *Node) topologies(keys []Key, from, to int64) *Topologies {
 	return ts
 }
 
+// phaseTopologies returns the topologies a transaction's phases use: from
+// its epoch (or the oldest epoch not yet synchronised) to epoch to.
+func (n *Node) phaseTopologies(keys []Key, from, to int64) *Topologies {
+	if s := n.synced.Load(); s < from {
+		from = s
+	}
+	return n.topologies(keys, from, to)
+}
+
 // owned returns the keys this node replicates at some epoch from from on.
 func (n *Node) owned(keys []Key, from int64) []Key {
 	ts := n.topologies(keys, from, n.epoch())
 	var out []Key
 	for _, s := range ts.Shards {
-		if slices.Contains(s.Nodes, n.cfg.ID) {
+		if slices.Contains(s.Nodes, n.cfg.ID) || slices.Contains(s.Pending, n.cfg.ID) {
 			for _, k := range s.Keys {
 				if !slices.ContainsFunc(out, func(o Key) bool { return o == k }) {
 					out = append(out, k)
@@ -178,9 +213,14 @@ func (n *Node) owned(keys []Key, from int64) []Key {
 	return out
 }
 
-// newTxnID returns a new transaction id.
-func (n *Node) newTxnID(kind Kind) TxnID {
-	return TxnID{Timestamp: Timestamp{Epoch: n.epoch(), HLC: n.clock.Next(0), Node: n.cfg.ID}, Kind: kind}
+// newTxnID returns a new transaction id; it is privileged when this node
+// replicates one of keys.
+func (n *Node) newTxnID(kind Kind, keys ...Key) TxnID {
+	id := TxnID{Timestamp: Timestamp{Epoch: n.epoch(), HLC: n.clock.Next(0), Node: n.cfg.ID}, Kind: kind}
+	if !n.cfg.NoPrivilegedCoordinator && len(keys) > 0 && len(n.owned(keys, id.Epoch)) > 0 {
+		id.Privileged = true
+	}
+	return id
 }
 
 // Start starts the progress log.
@@ -208,6 +248,9 @@ const (
 	mRecover       msgType = "BeginRecovery"
 	mCheckStatus   msgType = "CheckStatus"
 	mInformDurable msgType = "InformDurable"
+	mEphemeralDeps msgType = "GetEphemeralReadDeps"
+	mEphemeralRead msgType = "ReadEphemeralTxnData"
+	mEpochStatus   msgType = "EpochStatus"
 )
 
 type envelope struct {
@@ -226,6 +269,9 @@ const (
 	// notReady: the replica could not finish in time (a read or an apply
 	// waiting on dependencies).
 	notReady
+	// stale: the transaction's epoch is older than the replica's
+	// synchronised epoch; the coordinator must use a newer one.
+	stale
 )
 
 type preAcceptReq struct {
@@ -249,6 +295,9 @@ type acceptReq struct {
 	Txn        *Txn
 	Keys       []Key
 	Invalidate bool
+	// NoDeps: the medium path, whose dependencies are those proposed; the
+	// replicas need not compute any.
+	NoDeps bool `json:",omitempty"`
 }
 
 type acceptReply struct {
@@ -323,6 +372,24 @@ type checkStatusReq struct {
 	ID TxnID
 }
 
+type ephemeralReq struct {
+	Keys []Key
+	Deps Deps
+	Txn  *Txn
+}
+
+type ephemeralReply struct {
+	Outcome outcome
+	Deps    Deps
+	Reads   map[string][]byte
+}
+
+type epochStatus struct {
+	// Active is the oldest epoch of a transaction in progress here (the
+	// latest epoch if there is none); Latest the newest epoch known.
+	Active, Latest int64
+}
+
 type checkStatusReply struct {
 	Status    Status
 	Promised  Ballot
@@ -382,6 +449,18 @@ func (n *Node) Handle(ctx context.Context, from NodeID, payload []byte) ([]byte,
 		if err = json.Unmarshal(env.B, &r); err == nil {
 			err = n.s.informDurable(r.ID)
 		}
+	case mEphemeralDeps:
+		var r ephemeralReq
+		if err = json.Unmarshal(env.B, &r); err == nil {
+			reply = n.s.ephemeralDeps(r.Keys)
+		}
+	case mEphemeralRead:
+		var r ephemeralReq
+		if err = json.Unmarshal(env.B, &r); err == nil {
+			reply, err = n.s.ephemeralRead(ctx, &r)
+		}
+	case mEpochStatus:
+		reply = n.s.epochStatus()
 	default:
 		err = fmt.Errorf("accord: unknown message %q", env.T)
 	}
@@ -442,4 +521,27 @@ func broadcast[R any](ctx context.Context, n *Node, nodes []NodeID, t msgType, r
 // jitter returns d plus up to half of it, at random.
 func jitter(d time.Duration) time.Duration {
 	return d + time.Duration(rand.Int64N(int64(d)/2+1))
+}
+
+// Pending returns the commands not yet applied or invalidated here (for
+// diagnostics).
+func (n *Node) Pending() []string {
+	n.s.mu.Lock()
+	defer n.s.mu.Unlock()
+	var out []string
+	for _, c := range n.s.cmds {
+		switch c.Status {
+		case Applied, Invalidated, Truncated:
+			continue
+		}
+		var blocked string
+		if c.blockedOn != nil {
+			blocked = c.blockedOn.String()
+			if d := n.s.cmds[*c.blockedOn]; d != nil {
+				blocked += "/" + d.Status.String()
+			}
+		}
+		out = append(out, c.ID.String()+" "+c.Status.String()+" blocked="+blocked)
+	}
+	return out
 }

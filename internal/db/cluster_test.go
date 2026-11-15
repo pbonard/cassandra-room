@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/pbonard/cassandra-room/internal/cluster"
 	"net"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -878,3 +879,102 @@ func TestClusterTransactions(t *testing.T) {
 	_, isErr := c.exec(0, quorum, "BEGIN BATCH INSERT INTO ks.acct (id, balance) VALUES (9, 1); INSERT INTO ks.plain (k, v) VALUES (1, 1); APPLY BATCH").(message.Error)
 	require.True(t, isErr)
 }
+
+// TestClusterAccordJoin runs transactions while a node joins: as a
+// pending replica it receives the writes made during its bootstrap, the
+// transactions started before the change are witnessed by both
+// topologies, and afterwards every replica holds the same balances.
+func TestClusterAccordJoin(t *testing.T) {
+	c := newTestCluster(t, 2)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
+	c.ok(0, quorum, "CREATE TABLE ks.acct (id int PRIMARY KEY, balance int) WITH transactional_mode = 'full'")
+	const accounts = 8
+	for i := 0; i < accounts; i++ {
+		c.ok(i%2, quorum, "INSERT INTO ks.acct (id, balance) VALUES (?, 100)", i)
+	}
+	transfer := `BEGIN TRANSACTION
+		LET src = (SELECT balance FROM ks.acct WHERE id = ?);
+		IF src.balance >= ? THEN
+			UPDATE ks.acct SET balance -= ? WHERE id = ?;
+			UPDATE ks.acct SET balance += ? WHERE id = ?;
+		END IF
+	COMMIT TRANSACTION`
+	n := c.add() // before the workers read c.nodes
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var ok atomic.Int64
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				from, to := (w+i)%accounts, (w+3*i+1)%accounts
+				if from == to {
+					continue
+				}
+				if _, isVoid := c.exec(w%2, quorum, transfer, from, 5, 5, from, 5, to).(*message.VoidResult); isVoid {
+					ok.Add(1)
+				}
+			}
+		}()
+	}
+	time.Sleep(100 * time.Millisecond)
+	c.start(n)
+	require.Eventually(t, func() bool {
+		for _, d := range c.nodes {
+			if len(d.proxy.ring.Load().Nodes()) != 3 {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, 20*time.Millisecond, "every ring has the new node")
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	require.Positive(t, ok.Load())
+	total := 0
+	for i := 0; i < accounts; i++ {
+		v := c.values(i%3, one, "SELECT balance FROM ks.acct WHERE id = ?", i)
+		b, err := strconv.Atoi(v[0])
+		require.NoError(t, err)
+		total += b
+	}
+	require.Equal(t, accounts*100, total)
+	// Every replica (the new one included) converges to the same balance.
+	ring := c.nodes[0].proxy.ring.Load()
+	repl := map[string]string{"class": "SimpleStrategy", "replication_factor": "2"}
+	require.Eventually(t, func() bool {
+		for i := 0; i < accounts; i++ {
+			var seen []string
+			for _, r := range ring.Replicas(repl, Token(int32Bytes(i))) {
+				node := slices.Index(c.addrs, r.Addr)
+				res := c.nodes[node].Execute(mustPrepare(t, c.nodes[node], "SELECT balance FROM ks.acct WHERE id = ?"),
+					&RequestOptions{Consistency: one, local: true, Values: []*primitive.Value{primitive.NewValue(int32Bytes(i))}})
+				rows, isRows := res.(*message.RowsResult)
+				if !isRows || len(rows.Data) != 1 {
+					return false
+				}
+				seen = append(seen, string(rows.Data[0][0]))
+			}
+			if len(seen) != 2 || seen[0] != seen[1] {
+				var who []string
+				for _, r := range ring.Replicas(repl, Token(int32Bytes(i))) {
+					who = append(who, fmt.Sprint(slices.Index(c.addrs, r.Addr)))
+				}
+				t.Logf("account %d: %q on %v", i, seen, who)
+				for j, d := range c.nodes {
+					t.Logf("node %d pending: %v", j, d.proxy.accord.Pending())
+				}
+				return false
+			}
+		}
+		return true
+	}, 15*time.Second, 50*time.Millisecond, "replicas agree")
+}
+
+func int32Bytes(i int) []byte { return binary.BigEndian.AppendUint32(nil, uint32(i)) }

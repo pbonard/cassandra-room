@@ -29,9 +29,17 @@ const (
 	Truncated
 )
 
+// forgotten marks a journal record of a forgotten command.
+const forgotten Status = 255
+
 var statusNames = [...]string{"NotDefined", "PreAccepted", "AcceptedInvalidate", "Accepted", "Committed", "Stable", "PreApplied", "Applied", "Invalidated", "Truncated"}
 
-func (s Status) String() string { return statusNames[s] }
+func (s Status) String() string {
+	if int(s) < len(statusNames) {
+		return statusNames[s]
+	}
+	return "Forgotten"
+}
 
 // decided reports whether the execution timestamp is decided.
 func (s Status) decided() bool { return s >= Committed && s != Invalidated }
@@ -70,11 +78,18 @@ type command struct {
 	// ready: every dependency that executes earlier has applied.
 	ready     bool
 	executing bool
+	// skipped are dependencies from before this node joined that it does
+	// not know: their effects came with its bootstrap data, so applying
+	// does not wait for them, but reads do (they are fetched first).
+	skipped []TxnID
 	// blockedOn is a dependency the command waits for, since when.
 	blockedOn    *TxnID
 	blockedSince time.Time
 	lastChange   time.Time
 	appliedAt    time.Time
+	// recoveries counts the recoveries this node started without the
+	// command changing since: each waits twice as long as the previous.
+	recoveries int
 }
 
 // cfk is a key's conflict index (accord.local.CommandsForKey): every
@@ -111,6 +126,7 @@ func (s *store) get(id TxnID) *command {
 // save journals a command and wakes its waiters.
 func (s *store) saveLocked(c *command) error {
 	c.lastChange = s.n.cfg.Now()
+	c.recoveries = 0
 	if err := s.n.cfg.Journal.Append(&c.Command); err != nil {
 		return err
 	}
@@ -223,6 +239,11 @@ func (s *store) preAccept(r *preAcceptReq) (*preAcceptReply, error) {
 	if r.Ballot.Less(c.Promised) {
 		return &preAcceptReply{Outcome: rejectedBallot}, nil
 	}
+	if c.Status == NotDefined && r.Ballot.IsZero() && r.ID.Epoch < s.n.synced.Load() {
+		// A coordinator still on an epoch every node has moved past: its
+		// replicas may no longer be the ones that matter (StaleTopology).
+		return &preAcceptReply{Outcome: stale}, nil
+	}
 	if c.Status >= Committed {
 		return &preAcceptReply{Outcome: redundant, ExecuteAt: c.ExecuteAt}, nil
 	}
@@ -280,6 +301,9 @@ func (s *store) accept(r *acceptReq) (*acceptReply, error) {
 	s.registerLocked(c, r.Keys)
 	c.Status, c.ExecuteAt, c.Deps = Accepted, r.ExecuteAt, r.Deps
 	s.witnessLocked(c, r.ExecuteAt)
+	if r.NoDeps {
+		return &acceptReply{Outcome: ok}, s.saveLocked(c)
+	}
 	deps := s.depsLocked(c, r.ExecuteAt)
 	return &acceptReply{Outcome: ok, Deps: deps}, s.saveLocked(c)
 }
@@ -330,6 +354,9 @@ func (s *store) commit(ctx context.Context, r *commitReq) (*commitReply, error) 
 		s.mu.Lock()
 	}
 	defer s.mu.Unlock()
+	if s.missingLocked(c.skipped, c.Keys) {
+		return &commitReply{Outcome: notReady}, nil
+	}
 	reads := map[string][]byte{}
 	for _, k := range c.owned {
 		b, err := s.n.cfg.Data.Read(k, c.ExecuteAt, c.Txn)
@@ -440,6 +467,12 @@ func (s *store) maybeExecuteLocked(c *command) {
 					case d.Status.decided() && c.ExecuteAt.Less(d.ExecuteAt):
 						continue // it executes after this one
 					}
+				}
+				if (d == nil || d.Status < PreAccepted) && id.Epoch < s.n.joined.Load() {
+					if !slices.Contains(c.skipped, id) {
+						c.skipped = append(c.skipped, id)
+					}
+					continue
 				}
 				if c.blockedOn == nil || *c.blockedOn != id {
 					idc := id
@@ -576,6 +609,7 @@ func (s *store) informDurable(id TxnID) error {
 // they cannot be needed again (CASSANDRA-18365: an erased command is only
 // adopted once it is durably decided everywhere).
 func (s *store) truncateLocked() {
+	s.forgetLocked()
 	now := s.n.cfg.Now()
 	for _, c := range s.cmds {
 		if c.Status != Applied || !c.Durable || now.Sub(c.appliedAt) < s.n.cfg.RetainApplied {
@@ -632,4 +666,176 @@ func (s *store) rescanLocked() {
 	for _, c := range s.cmds {
 		s.maybeExecuteLocked(c)
 	}
+}
+
+// fastCommit is the privileged coordinator's local decision of the fast
+// path: it commits only if no recovery has promised a ballot here, which a
+// recovery that reaches this node relies on to invalidate safely.
+func (s *store) fastCommit(id TxnID, txn *Txn, deps Deps) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := s.get(id)
+	if !c.Promised.IsZero() {
+		return c.Status.decided() && c.ExecuteAt == id.Timestamp
+	}
+	if c.Status.decided() {
+		return c.ExecuteAt == id.Timestamp
+	}
+	return s.commitLocked(c, id.Timestamp, deps, txn, txn.Keys, Ballot{}, false) == nil
+}
+
+// ephemeralDeps returns the writes on keys a read must wait for
+// (GetEphemeralReadDeps): every conflicting write not yet applied at every
+// replica.
+func (s *store) ephemeralDeps(keys []Key) *ephemeralReply {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d := Deps{}
+	for _, k := range s.n.owned(keys, 0) {
+		f := s.keys[keyString(k)]
+		if f == nil {
+			continue
+		}
+		for _, id := range f.ids {
+			c := s.cmds[id]
+			if c == nil || id.Kind != Write || c.Status == Invalidated || c.Status == Truncated || c.Status == Applied && c.Durable {
+				continue
+			}
+			d.add(k, id)
+		}
+	}
+	return &ephemeralReply{Outcome: ok, Deps: d}
+}
+
+// ephemeralRead reads keys once every dependency on them has applied here
+// (ReadEphemeralTxnData); dependencies unknown here are fetched.
+func (s *store) ephemeralRead(ctx context.Context, r *ephemeralReq) (*ephemeralReply, error) {
+	owned := s.n.owned(r.Keys, 0)
+	start := s.n.cfg.Now()
+	fetched := map[TxnID]bool{}
+	s.mu.Lock()
+	for {
+		var wait *command
+		for _, k := range owned {
+			for _, id := range r.Deps[keyString(k)] {
+				c := s.get(id)
+				if c.Status == Applied || c.Status == Invalidated || c.Status == Truncated {
+					continue
+				}
+				if len(c.Keys) == 0 {
+					s.registerLocked(c, []Key{k})
+				}
+				if c.Status < PreAccepted && id.Epoch < s.n.joined.Load() {
+					// From before this node joined: another replica reads.
+					s.missingLocked([]TxnID{id}, []Key{k})
+					s.mu.Unlock()
+					return &ephemeralReply{Outcome: notReady}, nil
+				}
+				wait = c
+				break
+			}
+			if wait != nil {
+				break
+			}
+		}
+		if wait == nil {
+			break
+		}
+		if !fetched[wait.ID] && s.n.cfg.Now().Sub(start) > s.n.cfg.RecoverAfter {
+			fetched[wait.ID] = true
+			id, keys := wait.ID, slices.Clone(wait.Keys)
+			go func() {
+				if _, busy := s.n.recovering.LoadOrStore(id, true); busy {
+					return
+				}
+				defer s.n.recovering.Delete(id)
+				fctx, cancel := context.WithTimeout(context.Background(), s.n.recoveryTimeout())
+				defer cancel()
+				if !s.n.fetch(fctx, id, keys) {
+					_ = s.n.recover(fctx, id, nil, keys)
+				}
+			}()
+		}
+		ch := wait.changed
+		s.mu.Unlock()
+		select {
+		case <-ch:
+		case <-time.After(50 * time.Millisecond):
+		case <-ctx.Done():
+			return &ephemeralReply{Outcome: notReady}, nil
+		}
+		s.mu.Lock()
+	}
+	defer s.mu.Unlock()
+	reads := map[string][]byte{}
+	for _, k := range owned {
+		b, err := s.n.cfg.Data.Read(k, Timestamp{}, r.Txn)
+		if err != nil {
+			return nil, err
+		}
+		reads[keyString(k)] = b
+	}
+	return &ephemeralReply{Outcome: ok, Reads: reads}, nil
+}
+
+// epochStatus reports the oldest epoch of a transaction in progress here.
+func (s *store) epochStatus() *epochStatus {
+	latest := s.n.epoch()
+	st := &epochStatus{Active: latest, Latest: latest}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, c := range s.cmds {
+		switch c.Status {
+		case Applied, Invalidated, Truncated:
+			continue
+		case NotDefined:
+			if c.Promised.IsZero() {
+				continue
+			}
+		}
+		st.Active = min(st.Active, c.ID.Epoch)
+	}
+	return st
+}
+
+// forgetLocked drops the tombstones of transactions truncated or
+// invalidated long ago. A key's largest witnessed timestamp is kept, so a
+// late message about a forgotten transaction cannot make it pass the fast
+// path again: it is recovered and invalidated.
+func (s *store) forgetLocked() {
+	now := s.n.cfg.Now()
+	for id, c := range s.cmds {
+		if c.Status != Truncated && c.Status != Invalidated || now.Sub(c.lastChange) < s.n.cfg.TombstoneRetention {
+			continue
+		}
+		for _, k := range c.owned {
+			if f := s.keys[keyString(k)]; f != nil {
+				if i, found := slices.BinarySearchFunc(f.ids, id, TxnID.Compare); found {
+					f.ids = slices.Delete(f.ids, i, i+1)
+				}
+			}
+		}
+		if s.n.cfg.Journal.Delete(id) == nil {
+			delete(s.cmds, id)
+			delete(s.waiters, id)
+		}
+	}
+}
+
+// missingLocked reports whether some of ids are not applied here yet, and
+// fetches them in the background.
+func (s *store) missingLocked(ids []TxnID, keys []Key) bool {
+	missing := false
+	for _, id := range ids {
+		d := s.cmds[id]
+		if d != nil && (d.Status == Applied || d.Status == Invalidated || d.Status == Truncated) {
+			continue
+		}
+		missing = true
+		if d != nil && len(d.Keys) > 0 {
+			keys = d.Keys
+		}
+		go s.n.fetchOnce(id, slices.Clone(keys))
+	}
+	return missing
 }

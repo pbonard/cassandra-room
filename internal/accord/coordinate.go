@@ -9,37 +9,83 @@ import (
 )
 
 // errPreempted: another coordinator (a recovery) took over the
-// transaction; its outcome must be awaited.
-var errPreempted = errors.New("accord: preempted")
+// transaction; its outcome must be awaited. errStale: a replica refused the
+// transaction's epoch.
+var (
+	errPreempted = errors.New("accord: preempted")
+	errStale     = errors.New("accord: stale epoch")
+)
 
 // Coordinate runs a transaction and returns its result
-// (CoordinateTransaction).
+// (CoordinateTransaction). Read-only transactions are ephemeral reads
+// unless disabled.
 func (n *Node) Coordinate(ctx context.Context, txn *Txn) ([]byte, error) {
 	if len(txn.Keys) == 0 {
 		return nil, errors.New("accord: a transaction needs keys")
 	}
-	id := n.newTxnID(txn.Kind)
-	res, err := n.coordinate(ctx, id, txn)
-	if errors.Is(err, errPreempted) {
-		return n.awaitOutcome(ctx, id, txn.Keys)
+	if txn.Kind == Read && len(txn.Keys) == 1 && !n.cfg.NoEphemeralReads {
+		return n.ephemeralRead(ctx, txn)
 	}
-	return res, err
+	for {
+		id := n.newTxnID(txn.Kind, txn.Keys...)
+		res, err := n.coordinate(ctx, id, txn)
+		switch {
+		case errors.Is(err, errStale):
+			// Make sure the stale attempt never executes, then retry in
+			// the newer epoch.
+			_ = n.recover(ctx, id, txn, txn.Keys)
+			res, err = n.awaitOutcome(ctx, id, txn.Keys)
+			if errors.Is(err, ErrInvalidated) {
+				select {
+				case <-ctx.Done():
+					return nil, ErrTimeout
+				case <-time.After(10 * time.Millisecond):
+				}
+				continue
+			}
+		case errors.Is(err, errPreempted):
+			return n.awaitOutcome(ctx, id, txn.Keys)
+		}
+		return res, err
+	}
 }
 
 // coordinate runs PreAccept, then the fast path or Propose.
 func (n *Node) coordinate(ctx context.Context, id TxnID, txn *Txn) ([]byte, error) {
-	ts := n.topologies(txn.Keys, id.Epoch, id.Epoch)
+	ts := n.phaseTopologies(txn.Keys, id.Epoch, id.Epoch)
 	if len(ts.Shards) == 0 {
 		return nil, errors.New("accord: no topology")
 	}
+	fq := n.fastQuorumOf(id)
 	req := &preAcceptReq{ID: id, Txn: txn}
-	ch := broadcast[preAcceptReply](ctx, n, ts.nodes(), mPreAccept, func(NodeID) any { return req })
 	slow := newTracker(ts, (*Shard).slowQuorum)
-	fast := newTracker(ts, (*Shard).fastQuorum)
-	noFast := newTracker(ts, func(s *Shard) int { return len(s.Nodes) - s.fastQuorum() + 1 })
+	fast := newTracker(ts, fq)
+	medium := newTracker(ts, (*Shard).slowQuorum)
+	noFast := newTracker(ts, func(s *Shard) int { return len(s.Nodes) - fq(s) + 1 })
 	oks := map[NodeID]*preAcceptReply{}
+	targets := ts.nodes()
+	if id.Privileged {
+		// The privileged coordinator votes first, locally.
+		r, err := n.s.preAccept(req)
+		if err != nil {
+			return nil, err
+		}
+		if r.Outcome != ok {
+			return nil, errPreempted
+		}
+		oks[n.cfg.ID] = r
+		slow.success(n.cfg.ID)
+		if r.FastVote {
+			fast.success(n.cfg.ID)
+			medium.success(n.cfg.ID)
+		} else {
+			noFast.success(n.cfg.ID)
+		}
+		targets = slices.DeleteFunc(slices.Clone(targets), func(x NodeID) bool { return x == n.cfg.ID })
+	}
+	ch := broadcast[preAcceptReply](ctx, n, targets, mPreAccept, func(NodeID) any { return req })
 	var grace <-chan time.Time
-	for pending := len(ts.nodes()); pending > 0; {
+	for pending := len(targets); pending > 0 && !fast.done(); {
 		var r response[preAcceptReply]
 		select {
 		case r = <-ch:
@@ -55,6 +101,8 @@ func (n *Node) coordinate(ctx context.Context, id TxnID, txn *Txn) ([]byte, erro
 			slow.failure(r.from)
 			fast.failure(r.from)
 			noFast.success(r.from)
+		case r.reply.Outcome == stale:
+			return nil, errStale
 		case r.reply.Outcome != ok:
 			return nil, errPreempted
 		default:
@@ -62,6 +110,7 @@ func (n *Node) coordinate(ctx context.Context, id TxnID, txn *Txn) ([]byte, erro
 			slow.success(r.from)
 			if r.reply.FastVote {
 				fast.success(r.from)
+				medium.success(r.from)
 			} else {
 				noFast.success(r.from)
 			}
@@ -84,16 +133,30 @@ func (n *Node) coordinate(ctx context.Context, id TxnID, txn *Txn) ([]byte, erro
 	if !slow.done() {
 		return nil, ErrTimeout
 	}
-	if fast.done() {
-		// The fast path: execute at the TxnID with the dependencies of the
-		// fast votes.
+	fastDeps := func() Deps {
 		deps := Deps{}
 		for _, r := range oks {
 			if r.FastVote {
 				deps = deps.with(r.Deps)
 			}
 		}
+		return deps
+	}
+	if fast.done() {
+		// The fast path: execute at the TxnID with the dependencies of the
+		// fast votes. A privileged coordinator decides it locally, unless a
+		// recovery got there first.
+		deps := fastDeps()
+		if id.Privileged && !n.s.fastCommit(id, txn, deps) {
+			return nil, errPreempted
+		}
 		return n.execute(ctx, Ballot{}, id, txn, id.Timestamp, deps)
+	}
+	if medium.done() {
+		// The medium path: a slow quorum of every shard voted for the
+		// TxnID; one Accept round of that proposal, without new
+		// dependencies, commits it.
+		return n.propose(ctx, Ballot{}, id, txn, id.Timestamp, fastDeps(), true)
 	}
 	executeAt := id.Timestamp
 	deps := Deps{}
@@ -101,14 +164,25 @@ func (n *Node) coordinate(ctx context.Context, id TxnID, txn *Txn) ([]byte, erro
 		executeAt = maxTimestamp(executeAt, r.ExecuteAt)
 		deps = deps.with(r.Deps)
 	}
-	return n.propose(ctx, Ballot{}, id, txn, executeAt, deps)
+	return n.propose(ctx, Ballot{}, id, txn, executeAt, deps, false)
+}
+
+// fastQuorumOf returns the fast quorum size of each shard for a
+// transaction: privileged where its coordinator is a replica.
+func (n *Node) fastQuorumOf(id TxnID) func(*Shard) int {
+	return func(s *Shard) int {
+		if id.Privileged && slices.Contains(s.Nodes, id.Node) {
+			return s.privilegedFastQuorum()
+		}
+		return s.fastQuorum()
+	}
 }
 
 // propose runs the Accept round (Propose), then executes.
-func (n *Node) propose(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, executeAt Timestamp, deps Deps) ([]byte, error) {
+func (n *Node) propose(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, executeAt Timestamp, deps Deps, medium bool) ([]byte, error) {
 	n.clock.Observe(executeAt.HLC)
-	ts := n.topologies(txn.Keys, id.Epoch, executeAt.Epoch)
-	req := &acceptReq{ID: id, Ballot: ballot, ExecuteAt: executeAt, Deps: deps, Txn: txn, Keys: txn.Keys}
+	ts := n.phaseTopologies(txn.Keys, id.Epoch, executeAt.Epoch)
+	req := &acceptReq{ID: id, Ballot: ballot, ExecuteAt: executeAt, Deps: deps, Txn: txn, Keys: txn.Keys, NoDeps: medium}
 	ch := broadcast[acceptReply](ctx, n, ts.nodes(), mAccept, func(NodeID) any { return req })
 	tr := newTracker(ts, (*Shard).slowQuorum)
 	merged := Deps{}
@@ -135,6 +209,9 @@ func (n *Node) propose(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 	if !tr.done() {
 		return nil, ErrTimeout
 	}
+	if medium {
+		merged = deps
+	}
 	return n.execute(ctx, ballot, id, txn, executeAt, merged)
 }
 
@@ -145,7 +222,7 @@ func (n *Node) execute(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 	if txn == nil {
 		return nil, errors.New("accord: executing a transaction without its definition")
 	}
-	ts := n.topologies(txn.Keys, id.Epoch, executeAt.Epoch)
+	ts := n.phaseTopologies(txn.Keys, id.Epoch, executeAt.Epoch)
 	commit := func(stable bool) *commitReq {
 		return &commitReq{ID: id, Ballot: ballot, ExecuteAt: executeAt, Deps: deps, Txn: txn, Keys: txn.Keys, Stable: stable}
 	}
@@ -215,7 +292,14 @@ func (n *Node) execute(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 			return nil, err
 		}
 	}
-	return result, n.persist(ctx, ts, id, txn, executeAt, deps, writes, result)
+	return result, n.persist(ctx, n.applyTopologies(txn.Keys, id, executeAt), id, txn, executeAt, deps, writes, result)
+}
+
+// applyTopologies are the replicas a transaction's writes go to: those of
+// every epoch up to the current one, and pending replicas, so that nodes
+// joining since it was decided receive them too.
+func (n *Node) applyTopologies(keys []Key, id TxnID, executeAt Timestamp) *Topologies {
+	return n.phaseTopologies(keys, id.Epoch, max(executeAt.Epoch, n.epoch()))
 }
 
 // persist applies the outcome at every replica, returning once a quorum
@@ -223,7 +307,7 @@ func (n *Node) execute(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 // once every replica has applied it they are told it is durable.
 func (n *Node) persist(ctx context.Context, ts *Topologies, id TxnID, txn *Txn, executeAt Timestamp, deps Deps, writes Writes, result []byte) error {
 	req := &applyReq{ID: id, ExecuteAt: executeAt, Deps: deps, Txn: txn, Writes: writes, Result: result}
-	nodes := ts.nodes()
+	nodes := ts.applyNodes()
 	ch := broadcast[applyReply](context.Background(), n, nodes, mApply, func(NodeID) any { return req })
 	tr := newTracker(ts, (*Shard).slowQuorum)
 	got := 0
@@ -346,7 +430,7 @@ func (n *Node) recover(ctx context.Context, id TxnID, txn *Txn, keys []Key) erro
 		keys = txn.Keys
 	}
 	ballot := Ballot{Epoch: n.epoch(), HLC: n.clock.Next(0), Node: n.cfg.ID}
-	ts := n.topologies(keys, id.Epoch, n.epoch())
+	ts := n.phaseTopologies(keys, id.Epoch, n.epoch())
 	if len(ts.Shards) == 0 {
 		return errors.New("accord: no topology")
 	}
@@ -394,7 +478,7 @@ func (n *Node) recover(ctx context.Context, id TxnID, txn *Txn, keys []Key) erro
 	case best.Status == Invalidated:
 		return n.commitInvalidate(ts, id, keys)
 	case best.Status == Applied || best.Status == PreApplied:
-		return n.persist(ctx, ts, id, txn, best.ExecuteAt, best.Deps, best.Writes, best.Result)
+		return n.persist(ctx, n.applyTopologies(keys, id, best.ExecuteAt), id, txn, best.ExecuteAt, best.Deps, best.Writes, best.Result)
 	case best.Status == Stable || best.Status == Committed:
 		_, err := n.execute(ctx, ballot, id, txn, best.ExecuteAt, best.Deps)
 		return err
@@ -405,7 +489,7 @@ func (n *Node) recover(ctx context.Context, id TxnID, txn *Txn, keys []Key) erro
 		for _, r := range oks {
 			deps = deps.with(r.LocalDeps)
 		}
-		_, err := n.propose(ctx, ballot, id, txn, best.ExecuteAt, deps)
+		_, err := n.propose(ctx, ballot, id, txn, best.ExecuteAt, deps, false)
 		return err
 	case best.Status == AcceptedInvalidate || txn == nil:
 		return n.invalidate(ctx, ballot, ts, id, keys)
@@ -421,6 +505,12 @@ func (n *Node) recover(ctx context.Context, id TxnID, txn *Txn, keys []Key) erro
 			}
 		}
 	}
+	if r := oks[id.Node]; id.Privileged && r != nil {
+		// The privileged coordinator answered without having decided: it
+		// promised our ballot, so it can no longer take the fast path.
+		rejects = true
+	}
+	fq := n.fastQuorumOf(id)
 	for _, s := range ts.Shards {
 		votesAgainst := 0
 		for _, node := range s.Nodes {
@@ -428,7 +518,9 @@ func (n *Node) recover(ctx context.Context, id TxnID, txn *Txn, keys []Key) erro
 				votesAgainst++
 			}
 		}
-		if votesAgainst > len(s.Nodes)-s.fastQuorum() {
+		// A privileged coordinator outside the recovery quorum is assumed
+		// to have voted for the fast path.
+		if votesAgainst > len(s.Nodes)-fq(s) {
 			rejects = true // no fast quorum can have formed in this shard
 		}
 	}
@@ -449,7 +541,7 @@ func (n *Node) recover(ctx context.Context, id TxnID, txn *Txn, keys []Key) erro
 	for _, r := range oks {
 		deps = deps.with(r.LocalDeps)
 	}
-	_, err := n.propose(ctx, ballot, id, txn, id.Timestamp, deps)
+	_, err := n.propose(ctx, ballot, id, txn, id.Timestamp, deps, false)
 	return err
 }
 
@@ -589,20 +681,29 @@ func (n *Node) progressLog() {
 				}
 				todo = append(todo, stalled{*c.blockedOn, txn, keys})
 				c.blockedSince = now
-			case now.Sub(c.lastChange) > after && (c.Status != NotDefined || !c.Promised.IsZero()) && len(c.Keys) > 0:
+			case now.Sub(c.lastChange) > after<<min(c.recoveries, 4) && (c.Status != NotDefined || !c.Promised.IsZero()) && len(c.Keys) > 0:
 				todo = append(todo, stalled{c.ID, c.Txn, c.Keys})
 				c.lastChange = now
+				c.recoveries++
 			}
 		}
 		n.s.truncateLocked()
 		n.s.mu.Unlock()
+		if now.Sub(n.lastSynced) > 10*n.cfg.ProgressInterval {
+			n.lastSynced = now
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), n.cfg.RequestTimeout)
+				defer cancel()
+				n.syncEpochs(ctx)
+			}()
+		}
 		for _, s := range todo {
 			if _, busy := n.recovering.LoadOrStore(s.id, true); busy {
 				continue
 			}
 			go func() {
 				defer n.recovering.Delete(s.id)
-				ctx, cancel := context.WithTimeout(context.Background(), 4*n.cfg.RecoverAfter)
+				ctx, cancel := context.WithTimeout(context.Background(), n.recoveryTimeout())
 				defer cancel()
 				if n.fetch(ctx, s.id, s.keys) {
 					return
@@ -631,7 +732,7 @@ func (n *Node) fetch(ctx context.Context, id TxnID, keys []Key) bool {
 			return err == nil
 		case (rep.Status == Applied || rep.Status == PreApplied) && rep.Txn != nil:
 			go func() {
-				actx, cancel := context.WithTimeout(context.Background(), 4*n.cfg.RecoverAfter)
+				actx, cancel := context.WithTimeout(context.Background(), n.recoveryTimeout())
 				defer cancel()
 				_, _ = n.s.apply(actx, &applyReq{ID: id, ExecuteAt: rep.ExecuteAt, Deps: rep.Deps, Txn: rep.Txn, Writes: rep.Writes, Result: rep.Result})
 			}()
@@ -648,3 +749,117 @@ func (n *Node) fetch(ctx context.Context, id TxnID, keys []Key) bool {
 }
 
 func (n *Node) String() string { return fmt.Sprintf("accord node %s", n.cfg.ID) }
+
+// ---- ephemeral reads ----
+
+// ephemeralRead runs a read-only transaction without committing it
+// (CoordinateEphemeralRead): a quorum of every shard reports the writes
+// not yet applied everywhere; one replica per shard reads once those have
+// applied there. Every write acknowledged before the read started is
+// applied at a quorum, which the dependency quorum intersects, so the read
+// sees it; nothing is journaled.
+func (n *Node) ephemeralRead(ctx context.Context, txn *Txn) ([]byte, error) {
+	epoch := n.epoch()
+	ts := n.phaseTopologies(txn.Keys, epoch, epoch)
+	if len(ts.Shards) == 0 {
+		return nil, errors.New("accord: no topology")
+	}
+	req := &ephemeralReq{Keys: txn.Keys}
+	ch := broadcast[ephemeralReply](ctx, n, ts.nodes(), mEphemeralDeps, func(NodeID) any { return req })
+	tr := newTracker(ts, (*Shard).slowQuorum)
+	deps := Deps{}
+	for i := 0; i < len(ts.nodes()) && !tr.done(); i++ {
+		var r response[ephemeralReply]
+		select {
+		case r = <-ch:
+		case <-ctx.Done():
+			return nil, ErrTimeout
+		}
+		if r.err != nil || r.reply.Outcome != ok {
+			tr.failure(r.from)
+		} else {
+			tr.success(r.from)
+			deps = deps.with(r.reply.Deps)
+		}
+		if tr.impossible() {
+			return nil, ErrTimeout
+		}
+	}
+	if !tr.done() {
+		return nil, ErrTimeout
+	}
+	reads := map[string][]byte{}
+	for _, s := range ts.latest() {
+		order := slices.Clone(s.Nodes)
+		if i := slices.Index(order, n.cfg.ID); i > 0 {
+			order[0], order[i] = order[i], order[0]
+		}
+		done := false
+		for _, to := range order {
+			var rep ephemeralReply
+			if err := n.send(ctx, to, mEphemeralRead, &ephemeralReq{Keys: s.Keys, Deps: deps, Txn: txn}, &rep); err != nil || rep.Outcome != ok {
+				if ctx.Err() != nil {
+					return nil, ErrTimeout
+				}
+				continue
+			}
+			for k, v := range rep.Reads {
+				reads[k] = v
+			}
+			done = true
+			break
+		}
+		if !done {
+			return nil, ErrTimeout
+		}
+	}
+	_, result, err := n.cfg.Agent.Execute(txn, Timestamp{Epoch: epoch, HLC: n.clock.Next(0), Node: n.cfg.ID}, reads)
+	return result, err
+}
+
+// ---- epoch synchronisation ----
+
+// syncEpochs advances the synchronised epoch to the oldest epoch any node
+// still has a transaction of in progress (every node must answer).
+func (n *Node) syncEpochs(ctx context.Context) {
+	n.topoMu.RLock()
+	t := n.topos[n.latest]
+	n.topoMu.RUnlock()
+	if t == nil {
+		return
+	}
+	active := n.s.epochStatus().Active
+	for _, node := range t.Nodes {
+		if node == n.cfg.ID {
+			continue
+		}
+		var st epochStatus
+		if err := n.send(ctx, node, mEpochStatus, struct{}{}, &st); err != nil {
+			return
+		}
+		active = min(active, st.Active, st.Latest)
+	}
+	if active > n.synced.Load() {
+		n.synced.Store(active)
+	}
+}
+
+// fetchOnce fetches a transaction's outcome, or recovers it, unless that
+// is already under way.
+func (n *Node) fetchOnce(id TxnID, keys []Key) {
+	if _, busy := n.recovering.LoadOrStore(id, true); busy {
+		return
+	}
+	defer n.recovering.Delete(id)
+	ctx, cancel := context.WithTimeout(context.Background(), n.recoveryTimeout())
+	defer cancel()
+	if !n.fetch(ctx, id, keys) {
+		_ = n.recover(ctx, id, nil, keys)
+	}
+}
+
+// recoveryTimeout bounds a recovery: it may take several rounds of
+// requests, and a stable transaction's execution.
+func (n *Node) recoveryTimeout() time.Duration {
+	return max(4*n.cfg.RecoverAfter, 8*n.cfg.RequestTimeout)
+}
