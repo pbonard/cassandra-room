@@ -31,6 +31,8 @@ type parser struct {
 	i       int
 	src     string
 	markers []string
+	// txnVars are the LET names of the transaction being parsed.
+	txnVars map[string]bool
 }
 
 func (p *parser) peek() token { return p.toks[p.i] }
@@ -168,6 +170,9 @@ func (p *parser) statement() (Statement, error) {
 	case "delete":
 		return p.deleteStatement()
 	case "begin":
+		if p.isWordAt(1, "transaction") {
+			return p.transaction()
+		}
 		return p.batchStatement()
 	case "use":
 		p.next()
@@ -679,6 +684,9 @@ func (p *parser) term() (Term, error) {
 		if t.kind == tIdent && t.text == "null" {
 			p.next()
 			return &Null{}, nil
+		}
+		if t.kind == tIdent && p.txnVars[t.text] {
+			return p.reference()
 		}
 		if p.isPunctAt(1, "(") || p.isPunctAt(1, ".") {
 			return p.functionCall()
@@ -1773,4 +1781,198 @@ func (p *parser) list() (*ListStmt, error) {
 	}
 	s.NoRecursive = p.word("norecursive")
 	return s, nil
+}
+
+// ---- transactions ----
+
+// transaction parses BEGIN TRANSACTION ... COMMIT TRANSACTION
+// (Parser.g's batchTxnStatement).
+func (p *parser) transaction() (*Transaction, error) {
+	p.i += 2
+	tx := &Transaction{}
+	p.txnVars = map[string]bool{}
+	defer func() { p.txnVars = nil }()
+	for p.isWord("let") {
+		p.next()
+		name, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectPunct("="); err != nil {
+			return nil, err
+		}
+		if err := p.expectPunct("("); err != nil {
+			return nil, err
+		}
+		sel, err := p.selectStatement()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectPunct(")"); err != nil {
+			return nil, err
+		}
+		if err := p.expectPunct(";"); err != nil {
+			return nil, err
+		}
+		if p.txnVars[name] {
+			return nil, p.errorf("The name '%s' has already been used by a LET assignment.", name)
+		}
+		p.txnVars[name] = true
+		tx.Lets = append(tx.Lets, Let{Name: name, Select: sel})
+	}
+	if p.isWord("select") {
+		if t := p.peekAt(1); t.kind == tIdent && p.txnVars[t.text] {
+			p.next()
+			for {
+				r, err := p.reference()
+				if err != nil {
+					return nil, err
+				}
+				if r.Column == "" {
+					return nil, p.errorf("SELECT references must specify a column.")
+				}
+				tx.Returning = append(tx.Returning, r)
+				if !p.punct(",") {
+					break
+				}
+			}
+		} else {
+			sel, err := p.selectStatement()
+			if err != nil {
+				return nil, err
+			}
+			tx.Select = sel
+		}
+		if err := p.expectPunct(";"); err != nil {
+			return nil, err
+		}
+	}
+	if p.isWord("if") {
+		p.next()
+		for {
+			conds, err := p.txnConditions()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expectWord("then"); err != nil {
+				return nil, err
+			}
+			ups, err := p.txnUpdates()
+			if err != nil {
+				return nil, err
+			}
+			if len(ups) == 0 {
+				return nil, p.errorf("IF/ELSE branch body must contain at least one modification statement")
+			}
+			tx.Branches = append(tx.Branches, TxnBranch{Conditions: conds, Updates: ups})
+			if !p.word("else") {
+				break
+			}
+			if p.word("if") {
+				continue
+			}
+			ups, err = p.txnUpdates()
+			if err != nil {
+				return nil, err
+			}
+			if len(ups) == 0 {
+				return nil, p.errorf("IF/ELSE branch body must contain at least one modification statement")
+			}
+			tx.Branches = append(tx.Branches, TxnBranch{Else: true, Updates: ups})
+			break
+		}
+		if err := p.expectWord("end", "if"); err != nil {
+			return nil, err
+		}
+	}
+	ups, err := p.txnUpdates()
+	if err != nil {
+		return nil, err
+	}
+	tx.Updates = ups
+	return tx, p.expectWord("commit", "transaction")
+}
+
+// txnUpdates parses modification statements, each ended by ';'.
+func (p *parser) txnUpdates() ([]Statement, error) {
+	var out []Statement
+	for {
+		var st Statement
+		var err error
+		switch {
+		case p.isWord("insert"):
+			st, err = p.insertStatement()
+		case p.isWord("update"):
+			st, err = p.updateStatement()
+		case p.isWord("delete"):
+			st, err = p.deleteStatement()
+		default:
+			return out, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectPunct(";"); err != nil {
+			return nil, err
+		}
+		out = append(out, st)
+	}
+}
+
+// reference parses a LET name, optionally followed by .column
+// (rowDataReference).
+func (p *parser) reference() (*Reference, error) {
+	name, err := p.ident()
+	if err != nil {
+		return nil, err
+	}
+	r := &Reference{Tuple: name}
+	if p.punct(".") {
+		if r.Column, err = p.ident(); err != nil {
+			return nil, err
+		}
+	}
+	return r, nil
+}
+
+// txnConditions parses conditions joined by AND (txnConditions).
+func (p *parser) txnConditions() ([]TxnCondition, error) {
+	var out []TxnCondition
+	for {
+		left, err := p.term()
+		if err != nil {
+			return nil, err
+		}
+		c := TxnCondition{Left: left}
+		if p.word("is") {
+			c.Op = "IS NULL"
+			if p.word("not") {
+				c.Op = "IS NOT NULL"
+			}
+			if err := p.expectWord("null"); err != nil {
+				return nil, err
+			}
+			if _, ok := left.(*Reference); !ok {
+				return nil, p.errorf("IS NULL needs a LET reference")
+			}
+		} else {
+			t := p.next()
+			if t.kind != tPunct || !isComparison(t.text) || t.text == "IN" {
+				return nil, p.errorf("no viable alternative at input '%s'", t.text)
+			}
+			c.Op = t.text
+			if c.Right, err = p.term(); err != nil {
+				return nil, err
+			}
+			_, lref := c.Left.(*Reference)
+			_, rref := c.Right.(*Reference)
+			if !lref && !rref {
+				return nil, p.errorf("a transaction condition needs a LET reference")
+			}
+		}
+		out = append(out, c)
+		if !p.word("and") {
+			return out, nil
+		}
+	}
 }

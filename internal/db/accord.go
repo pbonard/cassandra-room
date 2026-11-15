@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -58,6 +59,10 @@ type stmtSource struct {
 // accordUpdate is a conditional statement (or batch) as an Accord
 // transaction's update.
 type accordUpdate struct {
+	// Mode is what the statements are: "" conditional statements (CAS),
+	// "txn" a BEGIN TRANSACTION statement, "write" plain modifications,
+	// "read" a plain SELECT.
+	Mode   string `json:",omitempty"`
 	Stmts  []accordStmt
 	Now    int64 // unix nanoseconds
 	NowSec int64
@@ -228,6 +233,33 @@ func (j *accordJournal) Compact([]*accord.Command) error { return nil }
 
 // ---- executing transactions ----
 
+// accordStatement rebuilds a "txn" or "read" transaction's statement and
+// its context.
+func (d *DB) accordStatement(txn *accord.Txn) (statement, *execCtx, *accordUpdate, error) {
+	var u accordUpdate
+	if err := json.Unmarshal(txn.Update, &u); err != nil {
+		return nil, nil, nil, err
+	}
+	if len(u.Stmts) != 1 {
+		return nil, nil, &u, nil
+	}
+	st := u.Stmts[0]
+	p, err := d.Prepare(st.Keyspace, st.Query)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	ps, err := d.current(p)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	values := make([]*primitive.Value, len(st.Values))
+	for i, v := range st.Values {
+		values[i] = &primitive.Value{Type: primitive.ValueType(v.T), Contents: v.V}
+	}
+	e := &execCtx{d: d, values: values, now: time.Unix(0, u.Now), nowSec: u.NowSec, cl: primitive.ConsistencyLevelOne, local: true, listSeq: new(uint32)}
+	return ps.stmt, e, &u, nil
+}
+
 // accordMods rebuilds a transaction's statements.
 func (d *DB) accordMods(txn *accord.Txn) ([]boundModification, *accordUpdate, error) {
 	var u accordUpdate
@@ -271,6 +303,31 @@ type accordData struct{ d *DB }
 // Read reads, from this replica's data, the current row of each
 // conditional statement on the partition.
 func (a accordData) Read(k accord.Key, _ accord.Timestamp, txn *accord.Txn) ([]byte, error) {
+	var mode struct{ Mode string }
+	if err := json.Unmarshal(txn.Update, &mode); err != nil {
+		return nil, err
+	}
+	switch mode.Mode {
+	case "write":
+		return nil, nil
+	case "txn", "read":
+		st, e, _, err := a.d.accordStatement(txn)
+		if err != nil {
+			return nil, err
+		}
+		if tx, ok := st.(*txnStmt); ok {
+			reads, err := tx.readLocal(e, &k)
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(reads)
+		}
+		res, err := st.(*selectStmt).execute(e)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(res.(*message.RowsResult).Data)
+	}
 	mods, _, err := a.d.accordMods(txn)
 	if err != nil {
 		return nil, err
@@ -306,6 +363,55 @@ type accordAgent struct{ d *DB }
 // Execute checks the conditions against the rows read and computes the
 // writes, timestamped with the execution timestamp.
 func (a accordAgent) Execute(txn *accord.Txn, executeAt accord.Timestamp, reads map[string][]byte) (accord.Writes, []byte, error) {
+	var mode struct{ Mode string }
+	if err := json.Unmarshal(txn.Update, &mode); err != nil {
+		return nil, nil, err
+	}
+	switch mode.Mode {
+	case "read":
+		return accord.Writes{}, reads[accordKeyString(txn.Keys[0])], nil
+	case "write":
+		mods, _, err := a.d.accordMods(txn)
+		if err != nil {
+			return nil, nil, err
+		}
+		mu := &mutation{}
+		for _, bm := range mods {
+			bm.e.ts = executeAt.HLC
+			if err := bm.m.addMutations(bm.e, mu); err != nil {
+				return nil, nil, err
+			}
+		}
+		return groupWrites(txn.Keys, mu.writes), []byte("null"), nil
+	case "txn":
+		st, e, _, err := a.d.accordStatement(txn)
+		if err != nil {
+			return nil, nil, err
+		}
+		tx := st.(*txnStmt)
+		merged := make(txnReads, len(tx.reads()))
+		for _, k := range txn.Keys {
+			var r txnReads
+			if b := reads[accordKeyString(k)]; b != nil {
+				if err := json.Unmarshal(b, &r); err != nil {
+					return nil, nil, err
+				}
+			}
+			for i := range r {
+				if i < len(merged) && r[i] != nil {
+					merged[i] = r[i]
+				}
+			}
+		}
+		e.ts = executeAt.HLC
+		mu := &mutation{}
+		rows, err := tx.evaluate(e, merged, mu)
+		if err != nil {
+			return nil, nil, err
+		}
+		out, err := json.Marshal(rows)
+		return groupWrites(txn.Keys, mu.writes), out, err
+	}
 	mods, _, err := a.d.accordMods(txn)
 	if err != nil {
 		return nil, nil, err
@@ -345,14 +451,122 @@ func (a accordAgent) Execute(txn *accord.Txn, executeAt accord.Timestamp, reads 
 // transaction that executes before it, so a quorum read that follows sees
 // them (a SERIAL read).
 func (p *proxy) accordBarrier(t *Table, pk []byte) error {
+	return p.accordBarrierKey(accordKey(t.Storage, pk))
+}
+
+func (p *proxy) accordBarrierKey(k accord.Key) error {
 	b, _ := json.Marshal(accordUpdate{})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*p.opts.ReadTimeout)
 	defer cancel()
-	_, err := p.accord.Coordinate(ctx, &accord.Txn{Kind: accord.Read, Keys: []accord.Key{accordKey(t.Storage, pk)}, Update: b})
+	_, err := p.accord.Coordinate(ctx, &accord.Txn{Kind: accord.Read, Keys: []accord.Key{k}, Update: b})
 	if err != nil {
 		return &timeoutError{cl: primitive.ConsistencyLevelSerial}
 	}
 	return nil
+}
+
+// groupWrites assigns writes to the transaction keys of their partitions.
+func groupWrites(keys []accord.Key, writes []write) accord.Writes {
+	per := map[string][]write{}
+	for _, w := range writes {
+		for _, k := range keys {
+			id, _, err := splitAccordKey(k)
+			if err == nil && id == w.table && k.Token == w.token {
+				per[accordKeyString(k)] = append(per[accordKeyString(k)], w)
+			}
+		}
+	}
+	out := accord.Writes{}
+	for k, ws := range per {
+		out[k] = encodeWrites(ws)
+	}
+	return out
+}
+
+// accordSource encodes the statement of e (and its values).
+func accordSource(e *execCtx) (accordStmt, error) {
+	if e.src == nil {
+		return accordStmt{}, errors.New("db: a transaction statement without its text")
+	}
+	st := accordStmt{Query: e.src.Query, Keyspace: e.src.Keyspace}
+	for _, v := range e.values {
+		if v == nil {
+			st.Values = append(st.Values, accordValue{T: int32(primitive.ValueTypeNull)})
+			continue
+		}
+		st.Values = append(st.Values, accordValue{T: int32(v.Type), V: v.Contents})
+	}
+	return st, nil
+}
+
+// accordRun runs the statement of e (a transaction, or a plain read) as an
+// Accord transaction over keys.
+func (p *proxy) accordRun(e *execCtx, mode string, keys []accord.Key, writes bool) ([]byte, error) {
+	st, err := accordSource(e)
+	if err != nil {
+		return nil, err
+	}
+	kind := accord.Write
+	if !writes {
+		kind = accord.Read
+	}
+	return p.accordCoordinate(&accordUpdate{Mode: mode, Stmts: []accordStmt{st}, Now: e.now.UnixNano(), NowSec: e.nowSec}, keys, kind)
+}
+
+func (p *proxy) accordCoordinate(u *accordUpdate, keys []accord.Key, kind accord.Kind) ([]byte, error) {
+	if len(keys) == 0 {
+		return nil, invalidf("A transaction needs at least one partition")
+	}
+	b, err := json.Marshal(u)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*p.opts.WriteTimeout)
+	defer cancel()
+	out, err := p.accord.Coordinate(ctx, &accord.Txn{Kind: kind, Keys: keys, Update: b})
+	switch {
+	case errors.Is(err, accord.ErrTimeout), errors.Is(err, accord.ErrInvalidated):
+		if kind == accord.Read {
+			return nil, &timeoutError{cl: primitive.ConsistencyLevelSerial}
+		}
+		return nil, &timeoutError{write: true, cas: true, cl: primitive.ConsistencyLevelSerial}
+	}
+	return out, err
+}
+
+// accordWrite applies plain modifications to transactional tables as one
+// Accord transaction (transactional_mode 'full' routes every write through
+// Accord, so writes are ordered with the transactions).
+func (p *proxy) accordWrite(mods []boundModification, batchCtx *execCtx) error {
+	u := &accordUpdate{Mode: "write", Now: batchCtx.now.UnixNano(), NowSec: batchCtx.nowSec}
+	var keys []accord.Key
+	var last *stmtSource
+	for _, bm := range mods {
+		if bm.m.timestamp != nil {
+			return invalidf("Custom timestamps are not supported on tables with transactional_mode 'full'")
+		}
+		ks, err := stmtPartitions(bm.e, bm.m.t, bm.m.where)
+		if err != nil {
+			return err
+		}
+		for _, k := range ks {
+			if !slices.Contains(keys, k) {
+				keys = append(keys, k)
+			}
+		}
+		if bm.e.src == last {
+			continue
+		}
+		last = bm.e.src
+		st, err := accordSource(bm.e)
+		if err != nil {
+			return err
+		}
+		u.Stmts = append(u.Stmts, st)
+	}
+	slices.SortFunc(keys, accord.Key.Compare)
+	_, err := p.accordCoordinate(u, keys, accord.Write)
+	return err
 }
 
 // accordKeyString is the key's name in reads and writes (accord's own).

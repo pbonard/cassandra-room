@@ -107,6 +107,13 @@ func (d *DB) prepare(keyspace, query string) (*prepState, error) {
 		ps.result = ds.metadata()
 	case *cql.RoleStmt, *cql.GrantStmt, *cql.ListStmt:
 		ps.stmt = &authStmt{raw: st, session: keyspace}
+	case *cql.Transaction:
+		tx, err := d.prepareTransaction(s, keyspace, st, vs)
+		if err != nil {
+			return nil, err
+		}
+		ps.stmt = tx
+		ps.result = tx.md
 	case *cql.Batch:
 		b, err := d.prepareBatch(s, keyspace, st, vs)
 		if err != nil {
@@ -169,6 +176,8 @@ type execCtx struct {
 	// src is the statement's text, for conditional statements run by
 	// Accord, which any node may have to execute again.
 	src *stmtSource
+	// txnRefs are the LET rows of a transaction being evaluated.
+	txnRefs map[string]map[string][]byte
 	// trace records the request's events, if traced.
 	trace *Trace
 }

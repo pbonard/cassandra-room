@@ -43,6 +43,8 @@ type vars struct {
 	specs []spec
 	ks    string
 	table string
+	// refs are the LET rows of the transaction being prepared.
+	refs map[string]*txnRef
 }
 
 func newVars(markers []string) *vars {
@@ -191,6 +193,18 @@ func (vs *vars) prepareTerm(raw cql.Term, name string, typ *types.Type) (term, e
 		return &constTerm{v: v}, nil
 	case *cql.Null:
 		return &constTerm{st: vNull}, nil
+	case *cql.Reference:
+		return vs.prepareReference(r, name, typ)
+	case *cql.BinaryTerm:
+		l, err := vs.prepareTerm(r.Left, name, typ)
+		if err != nil {
+			return nil, err
+		}
+		rt, err := vs.prepareTerm(r.Right, name, typ)
+		if err != nil {
+			return nil, err
+		}
+		return &arithTerm{op: r.Op, l: l, r: rt, typ: typ}, nil
 	case *cql.Marker:
 		n := vs.names[r.Index]
 		if n == "" {

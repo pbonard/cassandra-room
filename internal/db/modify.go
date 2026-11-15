@@ -336,6 +336,12 @@ type boundModification struct {
 
 // applyModifications applies statements' mutations in one atomic batch.
 func (d *DB) applyModifications(mods []boundModification, batchCtx *execCtx) error {
+	if d.proxy != nil && slices.ContainsFunc(mods, func(bm boundModification) bool { return bm.m.t.accordManaged() }) {
+		if slices.ContainsFunc(mods, func(bm boundModification) bool { return !bm.m.t.accordManaged() }) {
+			return invalidf("A batch cannot mix tables with and without transactional_mode 'full'")
+		}
+		return d.proxy.accordWrite(mods, batchCtx)
+	}
 	if d.proxy != nil && mods[0].m.isCounter() {
 		// Counter deltas, applied by each partition's leader.
 		b := &mutation{trace: batchCtx.trace}

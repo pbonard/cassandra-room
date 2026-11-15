@@ -809,3 +809,72 @@ func TestClusterAccord(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 	require.Equal(t, c.values(0, serial, "SELECT v FROM ks.c WHERE k = 1"), got)
 }
+
+// TestClusterTransactions runs BEGIN TRANSACTION transfers between
+// accounts (partitions on different replicas) concurrently from every
+// node, with plain reads and writes of the transactional table going
+// through Accord: the total never changes and no balance goes negative.
+func TestClusterTransactions(t *testing.T) {
+	c := newTestCluster(t, 3)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
+	c.ok(0, quorum, "CREATE TABLE ks.acct (id int PRIMARY KEY, balance int) WITH transactional_mode = 'full'")
+	const accounts = 6
+	for i := 0; i < accounts; i++ {
+		c.ok(i%3, one, "INSERT INTO ks.acct (id, balance) VALUES (?, 100)", i)
+	}
+	transfer := `BEGIN TRANSACTION
+		LET src = (SELECT balance FROM ks.acct WHERE id = ?);
+		IF src.balance >= ? THEN
+			UPDATE ks.acct SET balance -= ? WHERE id = ?;
+			UPDATE ks.acct SET balance += ? WHERE id = ?;
+		END IF
+	COMMIT TRANSACTION`
+	var wg sync.WaitGroup
+	var done atomic.Int64
+	for w := 0; w < 6; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 10; i++ {
+				from, to, amt := (w+i)%accounts, (w+2*i+1)%accounts, 10+(i%4)*15
+				if from == to {
+					continue
+				}
+				res := c.exec(w%3, quorum, transfer, from, amt, amt, from, amt, to)
+				switch r := res.(type) {
+				case *message.VoidResult:
+					done.Add(1)
+				case *message.WriteTimeout:
+				default:
+					t.Errorf("unexpected %T %v", res, r)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	require.Positive(t, done.Load())
+	total := 0
+	for i := 0; i < accounts; i++ {
+		v := c.values(i%3, one, "SELECT balance FROM ks.acct WHERE id = ?", i)
+		require.Len(t, v, 1)
+		b, err := strconv.Atoi(v[0])
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, b, 0)
+		total += b
+	}
+	require.Equal(t, accounts*100, total, "transfers keep the total")
+
+	// The transaction's SELECT sees a consistent snapshot of two accounts.
+	res := c.exec(1, quorum, `BEGIN TRANSACTION
+		LET a = (SELECT balance FROM ks.acct WHERE id = 0);
+		LET b = (SELECT balance FROM ks.acct WHERE id = 1);
+		SELECT a.balance, b.balance;
+	COMMIT TRANSACTION`)
+	rows := res.(*message.RowsResult)
+	require.Len(t, rows.Data, 1)
+	require.Equal(t, "a.balance", rows.Metadata.Columns[0].Name)
+	// Mixing a transactional and a plain table in a batch is refused.
+	c.ok(0, quorum, "CREATE TABLE ks.plain (k int PRIMARY KEY, v int)")
+	_, isErr := c.exec(0, quorum, "BEGIN BATCH INSERT INTO ks.acct (id, balance) VALUES (9, 1); INSERT INTO ks.plain (k, v) VALUES (1, 1); APPLY BATCH").(message.Error)
+	require.True(t, isErr)
+}

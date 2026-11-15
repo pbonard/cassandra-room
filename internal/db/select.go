@@ -544,7 +544,34 @@ func (s *selectStmt) execute(e *execCtx) (message.Message, error) {
 		src = newVirtualSource(d, s.t)
 	} else {
 		serial := e.cl == primitive.ConsistencyLevelSerial || e.cl == primitive.ConsistencyLevelLocalSerial
-		if serial && d.proxy != nil && !e.local {
+		if d.proxy != nil && !e.local && s.t.accordManaged() && s.where.pkComplete() {
+			// transactional_mode 'full': a single-partition read is an Accord
+			// read transaction (executed by a replica once every earlier
+			// transaction on the partition applied); a read of several
+			// partitions first orders itself after them with a read-only
+			// transaction on each.
+			keys, err := stmtPartitions(e, s.t, s.where)
+			if err != nil {
+				return nil, err
+			}
+			if len(keys) == 1 && e.src != nil {
+				out, err := d.proxy.accordRun(e, "read", keys, false)
+				if err != nil {
+					return nil, err
+				}
+				var rows message.RowSet
+				if err := json.Unmarshal(out, &rows); err != nil {
+					return nil, err
+				}
+				md := s.metadata()
+				return &message.RowsResult{Metadata: &message.RowsMetadata{ColumnCount: int32(len(md)), Columns: md}, Data: rows}, nil
+			}
+			for _, k := range keys {
+				if err := d.proxy.accordBarrierKey(k); err != nil {
+					return nil, err
+				}
+			}
+		} else if serial && d.proxy != nil && !e.local {
 			// A SERIAL read first finishes any Paxos round in progress on the
 			// partition, so it sees every decided update (readWithPaxos).
 			var pks [][]byte

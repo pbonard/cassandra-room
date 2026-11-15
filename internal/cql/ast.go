@@ -362,3 +362,54 @@ type ListStmt struct {
 func (*RoleStmt) stmt()  {}
 func (*GrantStmt) stmt() {}
 func (*ListStmt) stmt()  {}
+
+// Transaction is BEGIN TRANSACTION ... COMMIT TRANSACTION (CEP-15).
+type Transaction struct {
+	Lets []Let
+	// Select is a full SELECT returned to the client; Returning are
+	// SELECT x.col, ... references (at most one of them is set).
+	Select    *Select
+	Returning []*Reference
+	// Branches are IF ... THEN, ELSE IF ... THEN and ELSE blocks.
+	Branches []TxnBranch
+	// Updates apply unconditionally.
+	Updates []Statement
+}
+
+// Let is LET name = (SELECT ...).
+type Let struct {
+	Name   string
+	Select *Select
+}
+
+// TxnBranch is a block of updates, applied if its conditions hold (and no
+// earlier branch's did).
+type TxnBranch struct {
+	Conditions []TxnCondition
+	Else       bool
+	Updates    []Statement
+}
+
+// TxnCondition compares a reference with a term (Op = < <= > >= !=), or
+// tests one for null ("IS NULL", "IS NOT NULL").
+type TxnCondition struct {
+	Left, Right Term
+	Op          string
+}
+
+// Reference is a LET row (Column empty) or one of its columns.
+type Reference struct {
+	Tuple, Column string
+}
+
+func (*Reference) term()   {}
+func (*Transaction) stmt() {}
+
+// BinaryTerm is an arithmetic term (left op right), as a transaction's
+// c += v on a numeric column becomes c = current + v.
+type BinaryTerm struct {
+	Op          byte
+	Left, Right Term
+}
+
+func (*BinaryTerm) term() {}
