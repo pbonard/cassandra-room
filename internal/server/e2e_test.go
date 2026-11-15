@@ -4,15 +4,15 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"github.com/cassandra-room/cassandra-room/internal/cluster"
+	"github.com/pbonard/cassandra-room/internal/cluster"
 	"net"
 	"strconv"
 	"testing"
 	"time"
 
-	"github.com/cassandra-room/cassandra-room/internal/db"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/gocql/gocql"
+	"github.com/pbonard/cassandra-room/internal/db"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/inf.v0"
 )

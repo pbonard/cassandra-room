@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cassandra-room/cassandra-room/internal/types"
+	"github.com/pbonard/cassandra-room/internal/types"
 )
 
 // Parse parses one statement, with optional trailing semicolons.

@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/cassandra-room/cassandra-room/internal/types"
+	"github.com/pbonard/cassandra-room/internal/types"
 	"github.com/stretchr/testify/require"
 )
 

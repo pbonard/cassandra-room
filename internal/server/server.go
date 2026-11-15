@@ -12,10 +12,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cassandra-room/cassandra-room/internal/db"
 	"github.com/datastax/go-cassandra-native-protocol/frame"
 	"github.com/datastax/go-cassandra-native-protocol/message"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
+	"github.com/pbonard/cassandra-room/internal/db"
 )
 
 // Server is a concurrent CQL native protocol server that accepts multiple TCP connections,

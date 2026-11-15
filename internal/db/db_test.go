@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cassandra-room/cassandra-room/internal/types"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/datastax/go-cassandra-native-protocol/message"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
+	"github.com/pbonard/cassandra-room/internal/types"
 	"github.com/stretchr/testify/require"
 )
 

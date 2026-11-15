@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/cassandra-room/cassandra-room/internal/cluster"
+	"github.com/pbonard/cassandra-room/internal/cluster"
 	"net"
 	"sort"
 	"strconv"

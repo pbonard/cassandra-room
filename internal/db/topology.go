@@ -10,9 +10,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/cassandra-room/cassandra-room/internal/cluster"
-	"github.com/cassandra-room/cassandra-room/internal/storage/lsm"
 	"github.com/datastax/go-cassandra-native-protocol/message"
+	"github.com/pbonard/cassandra-room/internal/cluster"
+	"github.com/pbonard/cassandra-room/internal/storage/lsm"
 )
 
 // Topology changes: bootstrap (BootStrapper, RangeStreamer), decommission

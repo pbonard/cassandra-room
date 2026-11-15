@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cassandra-room/cassandra-room/internal/cql"
-	"github.com/cassandra-room/cassandra-room/internal/storage/row"
-	"github.com/cassandra-room/cassandra-room/internal/types"
+	"github.com/pbonard/cassandra-room/internal/cql"
+	"github.com/pbonard/cassandra-room/internal/storage/row"
+	"github.com/pbonard/cassandra-room/internal/types"
 )
 
 // The system keyspaces drivers read on connection (SystemKeyspace,

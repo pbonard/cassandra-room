@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cassandra-room/cassandra-room/internal/cql"
-	"github.com/cassandra-room/cassandra-room/internal/types"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
+	"github.com/pbonard/cassandra-room/internal/cql"
+	"github.com/pbonard/cassandra-room/internal/types"
 )
 
 // Terms: a statement's values, prepared against their receivers' types

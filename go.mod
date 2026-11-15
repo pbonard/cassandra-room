@@ -1,4 +1,4 @@
-module github.com/cassandra-room/cassandra-room
+module github.com/pbonard/cassandra-room
 
 go 1.27.0
 

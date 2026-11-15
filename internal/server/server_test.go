@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cassandra-room/cassandra-room/internal/db"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/datastax/go-cassandra-native-protocol/compression"
 	"github.com/datastax/go-cassandra-native-protocol/compression/lz4"
@@ -22,6 +21,7 @@ import (
 	"github.com/datastax/go-cassandra-native-protocol/message"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
 	"github.com/datastax/go-cassandra-native-protocol/segment"
+	"github.com/pbonard/cassandra-room/internal/db"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

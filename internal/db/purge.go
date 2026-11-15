@@ -5,8 +5,8 @@ import (
 	"encoding/binary"
 	"slices"
 
-	"github.com/cassandra-room/cassandra-room/internal/storage/lsm"
-	"github.com/cassandra-room/cassandra-room/internal/storage/row"
+	"github.com/pbonard/cassandra-room/internal/storage/lsm"
+	"github.com/pbonard/cassandra-room/internal/storage/row"
 )
 
 // Purging partition deletions and range tombstones. Both are stored as

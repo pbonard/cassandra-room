@@ -4,10 +4,10 @@ import (
 	"hash/maphash"
 	"sync"
 
-	"github.com/cassandra-room/cassandra-room/internal/cql"
-	"github.com/cassandra-room/cassandra-room/internal/types"
 	"github.com/datastax/go-cassandra-native-protocol/message"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
+	"github.com/pbonard/cassandra-room/internal/cql"
+	"github.com/pbonard/cassandra-room/internal/types"
 )
 
 // Lightweight transactions. On one node the condition is read and the
