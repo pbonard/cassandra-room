@@ -46,6 +46,7 @@ const (
 	VerbCounterMutation
 	VerbStreamFile
 	VerbMetadataSync
+	VerbAccord
 	numVerbs
 )
 
@@ -176,10 +177,11 @@ const (
 	stageMetadata
 	stageStreaming
 	stageAntiEntropy
+	stageAccord
 	numStages
 )
 
-var stageWorkers = [numStages]int{stageRead: 64, stageMutation: 64, stageGossip: 16, stageMetadata: 8, stageStreaming: 4, stageAntiEntropy: 32}
+var stageWorkers = [numStages]int{stageRead: 64, stageMutation: 64, stageGossip: 16, stageMetadata: 8, stageStreaming: 4, stageAntiEntropy: 32, stageAccord: 128}
 
 func stageOf(v Verb) int {
 	switch v {
@@ -191,6 +193,9 @@ func stageOf(v Verb) int {
 		return stageGossip
 	case VerbPaxosPrepare, VerbPaxosAccept, VerbMetadataFetch, VerbMetadataPush:
 		return stageMetadata
+	case VerbAccord:
+		// Accord requests may wait for dependencies to apply.
+		return stageAccord
 	case VerbMetadataSync:
 		// It fetches from another node's metadata stage: not from its own.
 		return stageAntiEntropy
@@ -316,7 +321,7 @@ type StageStat struct {
 	Dropped       uint64
 }
 
-var stageNames = [numStages]string{"ReadStage", "MutationStage", "GossipStage", "MetadataStage", "StreamingStage", "AntiEntropyStage"}
+var stageNames = [numStages]string{"ReadStage", "MutationStage", "GossipStage", "MetadataStage", "StreamingStage", "AntiEntropyStage", "AccordStage"}
 
 // Stages returns the stages' activity.
 func (m *Messaging) Stages() []StageStat {

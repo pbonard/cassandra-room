@@ -2,6 +2,7 @@ package db
 
 import (
 	"hash/maphash"
+	"slices"
 	"sync"
 
 	"github.com/datastax/go-cassandra-native-protocol/message"
@@ -106,6 +107,9 @@ func (d *DB) executeCAS(mods []boundModification, batchCtx *execCtx) (message.Me
 		pk = p
 	}
 	t := mods[0].m.t
+	if d.proxy != nil && t.accordManaged() {
+		return d.proxy.accordCAS(mods, t, pk)
+	}
 	if k := d.schema.Load().Keyspaces[t.Keyspace]; d.proxy != nil && k != nil && !k.virtual {
 		var res message.Message
 		err := d.proxy.cas(t, pk, batchCtx.serial, batchCtx.cl, func(ts int64, readCL primitive.ConsistencyLevel) (bool, []write, error) {
@@ -150,37 +154,54 @@ func (d *DB) executeCAS(mods []boundModification, batchCtx *execCtx) (message.Me
 // checkConditions reads the current rows at readCL and checks every
 // statement's condition, returning the [applied] result.
 func (d *DB) checkConditions(mods []boundModification, readCL primitive.ConsistencyLevel) (bool, message.Message, error) {
-	t := mods[0].m.t
-	md := &message.RowsMetadata{Columns: (&condition{}).metadata()}
-	out := [][]byte{{1}}
-	for _, bm := range mods {
+	applied, failed, current, err := evalConditions(mods, func(bm boundModification) ([][]byte, error) {
+		e := bm.e
+		res, err := bm.m.cond.read.execute(&execCtx{d: d, values: e.values, now: e.now, nowSec: e.nowSec, cl: readCL})
+		if err != nil {
+			return nil, err
+		}
+		if rows := res.(*message.RowsResult).Data; len(rows) > 0 {
+			return rows[0], nil
+		}
+		return nil, nil
+	})
+	if err != nil {
+		return false, nil, err
+	}
+	return applied, casResult(mods, applied, failed, current), nil
+}
+
+// evalConditions checks the statements' conditions against their current
+// rows (all columns, nil if none): it returns whether all hold, and if not
+// the first statement whose condition failed and its row.
+func evalConditions(mods []boundModification, current func(boundModification) ([][]byte, error)) (bool, int, [][]byte, error) {
+	for i, bm := range mods {
 		m, e := bm.m, bm.e
 		if m.cond == nil {
 			continue
 		}
-		res, err := m.cond.read.execute(&execCtx{d: d, values: e.values, now: e.now, nowSec: e.nowSec, cl: readCL})
+		vals, err := current(bm)
 		if err != nil {
-			return false, nil, err
+			return false, 0, nil, err
 		}
-		rows := res.(*message.RowsResult).Data
-		var current map[*Column][]byte // the current row, nil if none
-		if len(rows) > 0 {
-			current = map[*Column][]byte{}
-			for i, col := range t.AllColumns() {
-				current[col] = rows[0][i]
+		var row map[*Column][]byte
+		if vals != nil {
+			row = map[*Column][]byte{}
+			for i, col := range m.t.AllColumns() {
+				row[col] = vals[i]
 			}
 		}
 		applied := true
 		switch {
 		case m.cond.ifNotExists:
-			applied = current == nil
+			applied = row == nil
 		case m.cond.ifExists:
-			applied = current != nil
+			applied = row != nil
 		default:
 			for _, f := range m.cond.conds {
-				ok, err := f.matchesCAS(e, current)
+				ok, err := f.matchesCAS(e, row)
 				if err != nil {
-					return false, nil, err
+					return false, 0, nil, err
 				}
 				if !ok {
 					applied = false
@@ -188,30 +209,39 @@ func (d *DB) checkConditions(mods []boundModification, readCL primitive.Consiste
 				}
 			}
 		}
-		if applied {
-			continue
+		if !applied {
+			return false, i, vals, nil
 		}
-		out[0][0] = 0
-		if current != nil {
-			cols := t.AllColumns()
-			if !m.cond.ifNotExists && !m.cond.ifExists {
-				cols = nil
-				for _, f := range m.cond.conds {
-					cols = append(cols, f.col)
-				}
-			}
-			for _, col := range cols {
-				md.Columns = append(md.Columns, &message.ColumnMetadata{Name: col.Name, Type: col.Type.DataType()})
-				out = append(out, current[col])
+	}
+	return true, 0, nil, nil
+}
+
+// casResult is the result of conditional statements: [applied], and when
+// a condition failed, the columns it involves in the current row.
+func casResult(mods []boundModification, applied bool, failed int, current [][]byte) message.Message {
+	t := mods[0].m.t
+	md := &message.RowsMetadata{Columns: (&condition{}).metadata()}
+	out := [][]byte{{boolByte(applied)}}
+	if !applied && current != nil {
+		m := mods[failed].m
+		all := t.AllColumns()
+		cols := all
+		if !m.cond.ifNotExists && !m.cond.ifExists {
+			cols = nil
+			for _, f := range m.cond.conds {
+				cols = append(cols, f.col)
 			}
 		}
-		break
+		for _, col := range cols {
+			md.Columns = append(md.Columns, &message.ColumnMetadata{Name: col.Name, Type: col.Type.DataType()})
+			out = append(out, current[slices.Index(all, col)])
+		}
 	}
 	for i, c := range md.Columns {
 		c.Keyspace, c.Table, c.Index = t.Keyspace, t.Name, int32(i)
 	}
 	md.ColumnCount = int32(len(md.Columns))
-	return out[0][0] == 1, &message.RowsResult{Metadata: md, Data: message.RowSet{out}}, nil
+	return &message.RowsResult{Metadata: md, Data: message.RowSet{out}}
 }
 
 func boolByte(b bool) byte {

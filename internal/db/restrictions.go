@@ -105,6 +105,12 @@ type where struct {
 	filters []filter
 }
 
+// hasPartitionRestriction reports whether some partition key column is
+// restricted.
+func (w *where) hasPartitionRestriction() bool {
+	return slices.ContainsFunc(w.pk, func(v *valuesTerm) bool { return v != nil })
+}
+
 func (w *where) pkComplete() bool {
 	for _, v := range w.pk {
 		if v == nil {

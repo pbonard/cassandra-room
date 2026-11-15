@@ -153,3 +153,38 @@ func TestParseAuth(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, &GrantStmt{Permissions: []string{"SELECT"}, Resource: "data/ks/t", Grantee: "alice"}, p.Statement)
 }
+
+func TestParseTransaction(t *testing.T) {
+	p, err := Parse(`BEGIN TRANSACTION
+		LET a = (SELECT v FROM ks.t WHERE k = 1);
+		LET b = (SELECT * FROM ks.t WHERE k = ?);
+		SELECT a.v, b.v;
+		IF a IS NOT NULL AND a.v > 3 AND 10 >= b.v THEN
+			UPDATE ks.t SET v = a.v WHERE k = 2;
+		ELSE IF b.v = ? THEN
+			INSERT INTO ks.t (k, v) VALUES (3, b.v);
+		ELSE
+			DELETE FROM ks.t WHERE k = 4;
+		END IF
+		UPDATE ks.t SET v = 0 WHERE k = 5;
+	COMMIT TRANSACTION`)
+	require.NoError(t, err)
+	tx := p.Statement.(*Transaction)
+	require.Len(t, tx.Lets, 2)
+	require.Len(t, tx.Returning, 2)
+	require.Len(t, tx.Branches, 3)
+	require.Len(t, tx.Branches[0].Conditions, 3)
+	require.Equal(t, "IS NOT NULL", tx.Branches[0].Conditions[0].Op)
+	require.Equal(t, &Reference{Tuple: "b", Column: "v"}, tx.Branches[0].Conditions[2].Right)
+	require.True(t, tx.Branches[2].Else)
+	require.Len(t, tx.Updates, 1)
+	require.Equal(t, &Reference{Tuple: "a", Column: "v"}, tx.Branches[0].Updates[0].(*Update).Operations[0].Value)
+	require.Len(t, p.Markers, 2)
+
+	_, err = Parse("BEGIN TRANSACTION SELECT * FROM ks.t WHERE k = 1; COMMIT TRANSACTION")
+	require.NoError(t, err)
+	_, err = Parse("BEGIN TRANSACTION LET a = (SELECT * FROM ks.t WHERE k = 1); LET a = (SELECT * FROM ks.t WHERE k = 2); COMMIT TRANSACTION")
+	require.Error(t, err)
+	_, err = Parse("BEGIN TRANSACTION IF 1 = 1 THEN UPDATE ks.t SET v = 1 WHERE k = 1; END IF COMMIT TRANSACTION")
+	require.Error(t, err)
+}

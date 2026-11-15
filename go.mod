@@ -7,7 +7,7 @@ require (
 	github.com/cockroachdb/pebble v0.0.0-20261021160554-a995e890c06e
 	github.com/datastax/go-cassandra-native-protocol v0.0.0-20260130100129-9d5b43677a33
 	github.com/gocql/gocql v1.7.0
-	github.com/pierrec/lz4/v4 v4.0.3
+	github.com/pierrec/lz4/v4 v4.1.33
 	github.com/stretchr/testify v1.9.0
 	golang.org/x/crypto v0.58.0
 	gopkg.in/inf.v0 v0.9.1

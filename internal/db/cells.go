@@ -41,6 +41,23 @@ func (d *DB) listPath(ts int64, prepend bool) []byte {
 	return append(out, d.nodeSuffix[:]...)
 }
 
+// listPath is DB.listPath, or, for a transaction executed by Accord, a
+// path that depends only on the transaction (any node computing its writes
+// computes the same ones).
+func (e *execCtx) listPath(ts int64, prepend bool) []byte {
+	if e.listSeq == nil {
+		return e.d.listPath(ts, prepend)
+	}
+	t := ts
+	if prepend {
+		t = -ts
+	}
+	*e.listSeq++
+	out := binary.BigEndian.AppendUint64(make([]byte, 0, 16), uint64(t)^(1<<63))
+	out = binary.BigEndian.AppendUint32(out, *e.listSeq)
+	return append(out, 0, 0, 0, 0)
+}
+
 // columnCells returns the cells of column id in sorted cells.
 func columnCells(cells []row.Cell, id uint32) []row.Cell {
 	i := sort.Search(len(cells), func(i int) bool { return cells[i].Column >= id })
@@ -106,7 +123,7 @@ func assemble(t *types.Type, cells []row.Cell) []byte {
 }
 
 // elementCells returns the cells of a whole multi-cell value.
-func (d *DB) elementCells(c *Column, v []byte, ts int64, prepend bool, cell func(path, value []byte) row.Cell) ([]row.Cell, error) {
+func (d *DB) elementCells(c *Column, v []byte, ts int64, prepend bool, listPath func(ts int64, prepend bool) []byte, cell func(path, value []byte) row.Cell) ([]row.Cell, error) {
 	t := c.Type
 	var out []row.Cell
 	switch t.Kind {
@@ -117,7 +134,7 @@ func (d *DB) elementCells(c *Column, v []byte, ts int64, prepend bool, cell func
 		}
 		for _, e := range elems {
 			if t.Kind == types.List {
-				out = append(out, cell(d.listPath(ts, prepend), e))
+				out = append(out, cell(listPath(ts, prepend), e))
 				continue
 			}
 			p, err := elementPath(t.Elems[0], e)

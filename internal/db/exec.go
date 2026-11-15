@@ -107,6 +107,13 @@ func (d *DB) prepare(keyspace, query string) (*prepState, error) {
 		ps.result = ds.metadata()
 	case *cql.RoleStmt, *cql.GrantStmt, *cql.ListStmt:
 		ps.stmt = &authStmt{raw: st, session: keyspace}
+	case *cql.Transaction:
+		tx, err := d.prepareTransaction(s, keyspace, st, vs)
+		if err != nil {
+			return nil, err
+		}
+		ps.stmt = tx
+		ps.result = tx.md
 	case *cql.Batch:
 		b, err := d.prepareBatch(s, keyspace, st, vs)
 		if err != nil {
@@ -164,6 +171,19 @@ type execCtx struct {
 	counterDeltas bool
 	// local restricts reads to this node (replica-side reads).
 	local bool
+	// listSeq, if set, numbers list elements deterministically (Accord).
+	listSeq *uint32
+	// src is the statement's text, for conditional statements run by
+	// Accord, which any node may have to execute again.
+	src *stmtSource
+	// aggPartial makes an aggregate return its partial state (a sub-range
+	// of an Accord range read).
+	aggPartial bool
+	// tokenBounds, if set, restricts a range scan to [lo, hi] (a sub-range
+	// of an Accord range read).
+	tokenBounds *[2]int64
+	// txnRefs are the LET rows of a transaction being evaluated.
+	txnRefs map[string]map[string][]byte
 	// trace records the request's events, if traced.
 	trace *Trace
 }
@@ -285,6 +305,7 @@ func (d *DB) Execute(p *Prepared, o *RequestOptions) message.Message {
 			return ErrorMessage(err)
 		}
 	}
+	e.src = &stmtSource{Query: p.Query, Keyspace: p.Keyspace}
 	res, err := st.stmt.execute(e)
 	if err != nil {
 		return ErrorMessage(err)
@@ -352,6 +373,7 @@ func (d *DB) ExecuteBatch(typ primitive.BatchType, children []BatchChild, o *Req
 		}
 		child := *ctx
 		child.values = c.Values
+		child.src = &stmtSource{Query: c.Prepared.Query, Keyspace: c.Prepared.Keyspace}
 		mods = append(mods, boundModification{m: m, e: &child})
 	}
 	if conditional {

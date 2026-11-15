@@ -82,6 +82,69 @@ func (a *aggState) add(q *query, r *rowData) error {
 	return nil
 }
 
+// aggPartial is an aggregate's state, to merge with the states of other
+// parts of the data.
+type aggPartial struct {
+	Seen  bool
+	First [][]byte
+	Count []int64
+	Vals  [][]byte
+	Sums  []string // big.Rat, "" for none
+}
+
+func (a *aggState) partial() aggPartial {
+	p := aggPartial{Seen: a.seen, First: a.first, Count: a.count, Vals: a.vals, Sums: make([]string, len(a.sums))}
+	for i, s := range a.sums {
+		if s != nil {
+			p.Sums[i] = s.RatString()
+		}
+	}
+	return p
+}
+
+// merge adds a partial state of data that follows what a holds.
+func (a *aggState) merge(p aggPartial) error {
+	if !p.Seen {
+		return nil
+	}
+	if !a.seen {
+		a.seen, a.first = true, p.First
+	}
+	for i, s := range a.sels {
+		switch s.kind {
+		case selCount:
+			a.count[i] += p.Count[i]
+		case selMin, selMax:
+			v := p.Vals[i]
+			if v == nil {
+				continue
+			}
+			if a.vals[i] == nil {
+				a.vals[i] = v
+				continue
+			}
+			c := types.Compare(s.typ, v, a.vals[i])
+			if (s.kind == selMin && c < 0) || (s.kind == selMax && c > 0) {
+				a.vals[i] = v
+			}
+		case selSum, selAvg:
+			a.count[i] += p.Count[i]
+			if p.Sums[i] == "" {
+				continue
+			}
+			r, ok := new(big.Rat).SetString(p.Sums[i])
+			if !ok {
+				return fmt.Errorf("db: corrupt partial aggregate")
+			}
+			if a.sums[i] == nil {
+				a.sums[i] = new(big.Rat)
+			}
+			a.sums[i].Add(a.sums[i], r)
+		}
+	}
+	return nil
+}
+
 func (a *aggState) result(*query) ([][]byte, error) {
 	out := make([][]byte, len(a.sels))
 	for i, s := range a.sels {

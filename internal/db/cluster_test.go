@@ -2,10 +2,12 @@ package db
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"github.com/pbonard/cassandra-room/internal/cluster"
 	"net"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -727,4 +729,356 @@ func TestClusterTracing(t *testing.T) {
 	require.Contains(t, joined, "MUTATION acknowledged by")
 	require.Contains(t, joined, "Reading a row at QUORUM")
 	require.Len(t, c.values(1, one, "SELECT session_id FROM system_traces.sessions"), 2)
+}
+
+// TestClusterAccord runs conditional updates on a transactional_mode
+// 'full' table as Accord transactions: concurrent compare-and-set from
+// every coordinator, with and without a replica down.
+func TestClusterAccord(t *testing.T) {
+	c := newTestCluster(t, 3)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}")
+	c.ok(0, quorum, "CREATE TABLE ks.c (k int PRIMARY KEY, v int, l list<int>) WITH transactional_mode = 'full'")
+	require.Contains(t, c.values(1, one, "SELECT transactional_mode FROM system_schema.tables WHERE keyspace_name = 'ks' AND table_name = 'c'"), "full")
+	res := c.exec(1, quorum, "INSERT INTO ks.c (k, v) VALUES (1, 0) IF NOT EXISTS")
+	require.Equal(t, byte(1), res.(*message.RowsResult).Data[0][0][0])
+	res = c.exec(2, quorum, "INSERT INTO ks.c (k, v) VALUES (1, 5) IF NOT EXISTS")
+	rows := res.(*message.RowsResult)
+	require.Equal(t, byte(0), rows.Data[0][0][0], "not applied: the row exists")
+	require.Len(t, rows.Data[0], 4, "[applied] and the current row")
+
+	serial := primitive.ConsistencyLevelSerial
+	increments := func(nodes []int) int64 {
+		var applied atomic.Int64
+		var wg sync.WaitGroup
+		for w := 0; w < 6; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				node := nodes[w%len(nodes)]
+				for i := 0; i < 8; i++ {
+					res := c.exec(node, serial, "SELECT v FROM ks.c WHERE k = 1")
+					rows, ok := res.(*message.RowsResult)
+					if !ok {
+						continue
+					}
+					cur := int(int32(be32(rows.Data[0][0])))
+					res = c.exec(node, quorum, "UPDATE ks.c SET v = ?, l = l + [?] WHERE k = 1 IF v = ?", cur+1, cur+1, cur)
+					switch r := res.(type) {
+					case *message.RowsResult:
+						if r.Data[0][0][0] == 1 {
+							applied.Add(1)
+						}
+					case *message.WriteTimeout:
+						require.Equal(t, primitive.WriteTypeCas, r.WriteType)
+					default:
+						t.Errorf("unexpected %T %v", res, res)
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		return applied.Load()
+	}
+	n := increments([]int{0, 1, 2})
+	require.Positive(t, n)
+	final := c.values(2, serial, "SELECT v FROM ks.c WHERE k = 1")
+	v, err := strconv.Atoi(final[0])
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, int64(v), n, "every acknowledged increment applied")
+	// The list holds each successful increment once, in order.
+	l := c.values(0, serial, "SELECT l FROM ks.c WHERE k = 1")
+	want := binary.BigEndian.AppendUint32(nil, uint32(v))
+	for i := 1; i <= v; i++ {
+		want = binary.BigEndian.AppendUint32(want, 4)
+		want = binary.BigEndian.AppendUint32(want, uint32(i))
+	}
+	require.Equal(t, []string{string(want)}, l)
+
+	// A replica down: a quorum still commits.
+	c.stop(2)
+	require.Eventually(t, func() bool { return !c.nodes[0].proxy.g.IsAlive(c.addrs[2]) }, 5*time.Second, 10*time.Millisecond)
+	require.Positive(t, increments([]int{0, 1}))
+
+	// It restarts from its journal and catches up: the transactions it
+	// missed reach it, and it coordinates again.
+	c.start(2)
+	require.Positive(t, increments([]int{2}))
+	got := c.values(2, serial, "SELECT v FROM ks.c WHERE k = 1")
+	require.Eventually(t, func() bool {
+		n := c.nodes[2].proxy.accord
+		return n != nil
+	}, time.Second, 10*time.Millisecond)
+	require.Equal(t, c.values(0, serial, "SELECT v FROM ks.c WHERE k = 1"), got)
+}
+
+// TestClusterTransactions runs BEGIN TRANSACTION transfers between
+// accounts (partitions on different replicas) concurrently from every
+// node, with plain reads and writes of the transactional table going
+// through Accord: the total never changes and no balance goes negative.
+func TestClusterTransactions(t *testing.T) {
+	c := newTestCluster(t, 3)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
+	c.ok(0, quorum, "CREATE TABLE ks.acct (id int PRIMARY KEY, balance int) WITH transactional_mode = 'full'")
+	const accounts = 6
+	for i := 0; i < accounts; i++ {
+		c.ok(i%3, one, "INSERT INTO ks.acct (id, balance) VALUES (?, 100)", i)
+	}
+	transfer := `BEGIN TRANSACTION
+		LET src = (SELECT balance FROM ks.acct WHERE id = ?);
+		IF src.balance >= ? THEN
+			UPDATE ks.acct SET balance -= ? WHERE id = ?;
+			UPDATE ks.acct SET balance += ? WHERE id = ?;
+		END IF
+	COMMIT TRANSACTION`
+	var wg sync.WaitGroup
+	var done atomic.Int64
+	for w := 0; w < 6; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 10; i++ {
+				from, to, amt := (w+i)%accounts, (w+2*i+1)%accounts, 10+(i%4)*15
+				if from == to {
+					continue
+				}
+				res := c.exec(w%3, quorum, transfer, from, amt, amt, from, amt, to)
+				switch r := res.(type) {
+				case *message.VoidResult:
+					done.Add(1)
+				case *message.WriteTimeout:
+				default:
+					t.Errorf("unexpected %T %v", res, r)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	require.Positive(t, done.Load())
+	total := 0
+	for i := 0; i < accounts; i++ {
+		v := c.values(i%3, one, "SELECT balance FROM ks.acct WHERE id = ?", i)
+		require.Len(t, v, 1)
+		b, err := strconv.Atoi(v[0])
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, b, 0)
+		total += b
+	}
+	require.Equal(t, accounts*100, total, "transfers keep the total")
+
+	// The transaction's SELECT sees a consistent snapshot of two accounts.
+	res := c.exec(1, quorum, `BEGIN TRANSACTION
+		LET a = (SELECT balance FROM ks.acct WHERE id = 0);
+		LET b = (SELECT balance FROM ks.acct WHERE id = 1);
+		SELECT a.balance, b.balance;
+	COMMIT TRANSACTION`)
+	rows := res.(*message.RowsResult)
+	require.Len(t, rows.Data, 1)
+	require.Equal(t, "a.balance", rows.Metadata.Columns[0].Name)
+	// Mixing a transactional and a plain table in a batch is refused.
+	c.ok(0, quorum, "CREATE TABLE ks.plain (k int PRIMARY KEY, v int)")
+	_, isErr := c.exec(0, quorum, "BEGIN BATCH INSERT INTO ks.acct (id, balance) VALUES (9, 1); INSERT INTO ks.plain (k, v) VALUES (1, 1); APPLY BATCH").(message.Error)
+	require.True(t, isErr)
+}
+
+// TestClusterAccordJoin runs transactions while a node joins: as a
+// pending replica it receives the writes made during its bootstrap, the
+// transactions started before the change are witnessed by both
+// topologies, and afterwards every replica holds the same balances.
+func TestClusterAccordJoin(t *testing.T) {
+	c := newTestCluster(t, 2)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
+	c.ok(0, quorum, "CREATE TABLE ks.acct (id int PRIMARY KEY, balance int) WITH transactional_mode = 'full'")
+	const accounts = 8
+	for i := 0; i < accounts; i++ {
+		c.ok(i%2, quorum, "INSERT INTO ks.acct (id, balance) VALUES (?, 100)", i)
+	}
+	transfer := `BEGIN TRANSACTION
+		LET src = (SELECT balance FROM ks.acct WHERE id = ?);
+		IF src.balance >= ? THEN
+			UPDATE ks.acct SET balance -= ? WHERE id = ?;
+			UPDATE ks.acct SET balance += ? WHERE id = ?;
+		END IF
+	COMMIT TRANSACTION`
+	n := c.add() // before the workers read c.nodes
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var ok atomic.Int64
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				from, to := (w+i)%accounts, (w+3*i+1)%accounts
+				if from == to {
+					continue
+				}
+				if _, isVoid := c.exec(w%2, quorum, transfer, from, 5, 5, from, 5, to).(*message.VoidResult); isVoid {
+					ok.Add(1)
+				}
+			}
+		}()
+	}
+	time.Sleep(100 * time.Millisecond)
+	c.start(n)
+	require.Eventually(t, func() bool {
+		for _, d := range c.nodes {
+			if len(d.proxy.ring.Load().Nodes()) != 3 {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, 20*time.Millisecond, "every ring has the new node")
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	require.Positive(t, ok.Load())
+	total := 0
+	for i := 0; i < accounts; i++ {
+		v := c.values(i%3, one, "SELECT balance FROM ks.acct WHERE id = ?", i)
+		b, err := strconv.Atoi(v[0])
+		require.NoError(t, err)
+		total += b
+	}
+	require.Equal(t, accounts*100, total)
+	// Every replica (the new one included) converges to the same balance.
+	ring := c.nodes[0].proxy.ring.Load()
+	repl := map[string]string{"class": "SimpleStrategy", "replication_factor": "2"}
+	require.Eventually(t, func() bool {
+		for i := 0; i < accounts; i++ {
+			var seen []string
+			for _, r := range ring.Replicas(repl, Token(int32Bytes(i))) {
+				node := slices.Index(c.addrs, r.Addr)
+				res := c.nodes[node].Execute(mustPrepare(t, c.nodes[node], "SELECT balance FROM ks.acct WHERE id = ?"),
+					&RequestOptions{Consistency: one, local: true, Values: []*primitive.Value{primitive.NewValue(int32Bytes(i))}})
+				rows, isRows := res.(*message.RowsResult)
+				if !isRows || len(rows.Data) != 1 {
+					return false
+				}
+				seen = append(seen, string(rows.Data[0][0]))
+			}
+			if len(seen) != 2 || seen[0] != seen[1] {
+				var who []string
+				for _, r := range ring.Replicas(repl, Token(int32Bytes(i))) {
+					who = append(who, fmt.Sprint(slices.Index(c.addrs, r.Addr)))
+				}
+				t.Logf("account %d: %q on %v", i, seen, who)
+				for j, d := range c.nodes {
+					t.Logf("node %d pending: %v", j, d.proxy.accord.Pending())
+				}
+				return false
+			}
+		}
+		return true
+	}, 15*time.Second, 50*time.Millisecond, "replicas agree")
+}
+
+func int32Bytes(i int) []byte { return binary.BigEndian.AppendUint32(nil, uint32(i)) }
+
+// TestClusterAccordReads pages single-partition and range reads of a
+// transactional table through Accord, while transactions move values
+// between partitions: every complete range read sees the total.
+func TestClusterAccordReads(t *testing.T) {
+	c := newTestCluster(t, 3)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
+	c.ok(0, quorum, "CREATE TABLE ks.acct (id int PRIMARY KEY, balance int) WITH transactional_mode = 'full'")
+	c.ok(0, quorum, "CREATE TABLE ks.rows (k int, c int, v int, PRIMARY KEY (k, c)) WITH transactional_mode = 'full'")
+	const accounts = 40
+	for i := 0; i < accounts; i++ {
+		c.ok(i%3, one, "INSERT INTO ks.acct (id, balance) VALUES (?, 10)", i)
+	}
+	for i := 0; i < 25; i++ {
+		c.ok(i%3, one, "INSERT INTO ks.rows (k, c, v) VALUES (1, ?, ?)", i, i)
+	}
+	pages := func(node int, q string, size int32) (rows [][][]byte, n int) {
+		var paging []byte
+		for {
+			p := mustPrepare(t, c.nodes[node], q)
+			res := c.nodes[node].Execute(p, &RequestOptions{Consistency: quorum, PageSize: size, PagingState: paging})
+			r, ok := res.(*message.RowsResult)
+			require.True(t, ok, "%v", res)
+			require.LessOrEqual(t, len(r.Data), int(size))
+			rows = append(rows, r.Data...)
+			n++
+			if len(r.Metadata.PagingState) == 0 {
+				return rows, n
+			}
+			paging = r.Metadata.PagingState
+		}
+	}
+	// A single partition in pages of 10.
+	rows, n := pages(1, "SELECT c FROM ks.rows WHERE k = 1", 10)
+	require.Len(t, rows, 25)
+	require.Equal(t, 3, n)
+	// Range reads in pages while transfers run.
+	transfer := `BEGIN TRANSACTION
+		LET src = (SELECT balance FROM ks.acct WHERE id = ?);
+		IF src.balance >= 1 THEN
+			UPDATE ks.acct SET balance -= 1 WHERE id = ?;
+			UPDATE ks.acct SET balance += 1 WHERE id = ?;
+		END IF
+	COMMIT TRANSACTION`
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := 0; w < 3; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				from, to := (w*7+i)%accounts, (w*7+i*3+1)%accounts
+				if from != to {
+					c.exec(w, quorum, transfer, from, from, to)
+				}
+			}
+		}()
+	}
+	for r := 0; r < 5; r++ {
+		rows, _ := pages(r%3, "SELECT id, balance FROM ks.acct", 7)
+		require.Len(t, rows, accounts, "every account once")
+	}
+	close(stop)
+	wg.Wait()
+	rows, _ = pages(2, "SELECT id, balance FROM ks.acct", 1000)
+	total := 0
+	for _, r := range rows {
+		total += int(int32(be32(r[1])))
+	}
+	require.Equal(t, accounts*10, total)
+	// LIMIT across sub-ranges.
+	rows, _ = pages(0, "SELECT id FROM ks.acct LIMIT 13", 5)
+	require.Len(t, rows, 13)
+
+	// Aggregates over the range: partial states merged across sub-ranges.
+	rows, _ = pages(1, "SELECT sum(balance), count(*), avg(balance), min(id), max(id) FROM ks.acct", 5)
+	require.Len(t, rows, 1)
+	require.Equal(t, accounts*10, int(int32(be32(rows[0][0]))))
+	require.Equal(t, uint64(accounts), binary.BigEndian.Uint64(rows[0][1]))
+	require.Equal(t, 10, int(int32(be32(rows[0][2]))))
+	require.Equal(t, 0, int(int32(be32(rows[0][3]))))
+	require.Equal(t, accounts-1, int(int32(be32(rows[0][4]))))
+	// GROUP BY partition over the range: one row per partition.
+	for k := 2; k <= 6; k++ {
+		for ck := 0; ck < k; ck++ {
+			c.ok(k%3, one, "INSERT INTO ks.rows (k, c, v) VALUES (?, ?, ?)", k, ck, 1)
+		}
+	}
+	rows, _ = pages(2, "SELECT k, count(*) FROM ks.rows GROUP BY k", 100)
+	got := map[int]uint64{}
+	for _, r := range rows {
+		got[int(int32(be32(r[0])))] = binary.BigEndian.Uint64(r[1])
+	}
+	require.Equal(t, map[int]uint64{1: 25, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6}, got)
+	rows, _ = pages(2, "SELECT k, count(*) FROM ks.rows GROUP BY k LIMIT 4", 100)
+	require.Len(t, rows, 4)
+	rows, _ = pages(0, "SELECT count(*) FROM ks.rows", 3)
+	require.Equal(t, uint64(25+2+3+4+5+6), binary.BigEndian.Uint64(rows[0][0]))
 }
