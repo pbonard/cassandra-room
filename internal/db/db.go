@@ -16,11 +16,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cassandra-room/cassandra-room/internal/cluster"
-	"github.com/cassandra-room/cassandra-room/internal/storage/lsm"
-	"github.com/cassandra-room/cassandra-room/internal/storage/row"
-	"github.com/cassandra-room/cassandra-room/internal/types"
 	"github.com/cockroachdb/pebble/vfs"
+	"github.com/pbonard/cassandra-room/internal/cluster"
+	"github.com/pbonard/cassandra-room/internal/storage/lsm"
+	"github.com/pbonard/cassandra-room/internal/storage/row"
+	"github.com/pbonard/cassandra-room/internal/types"
 )
 
 // Options configure a DB.
@@ -94,6 +94,9 @@ type DB struct {
 	// cluster's coordinator.
 	store storage
 	proxy *proxy
+	// metaLog holds the recent entries of the metadata log, in a
+	// cluster (guarded by ddlMu).
+	metaLog []cluster.Entry
 }
 
 // localState is persisted with the schema.

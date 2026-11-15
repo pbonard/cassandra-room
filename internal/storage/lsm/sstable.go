@@ -3,7 +3,7 @@ package lsm
 import (
 	"bytes"
 	"context"
-	"github.com/cassandra-room/cassandra-room/internal/storage/row"
+	"github.com/pbonard/cassandra-room/internal/storage/row"
 	"io"
 	"math"
 	"slices"

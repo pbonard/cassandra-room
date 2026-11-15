@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cassandra-room/cassandra-room/internal/types"
 	"github.com/datastax/go-cassandra-native-protocol/message"
+	"github.com/pbonard/cassandra-room/internal/types"
 
 	"github.com/stretchr/testify/require"
 )

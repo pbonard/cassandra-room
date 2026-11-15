@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cassandra-room/cassandra-room/internal/types"
+	"github.com/pbonard/cassandra-room/internal/types"
 )
 
 // aggState accumulates aggregate selectors (AggregateFcts); non-aggregate

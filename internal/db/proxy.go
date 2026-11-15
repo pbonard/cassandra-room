@@ -20,13 +20,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cassandra-room/cassandra-room/internal/cluster"
-	"github.com/cassandra-room/cassandra-room/internal/storage/lsm"
-	"github.com/cassandra-room/cassandra-room/internal/storage/row"
-	"github.com/cassandra-room/cassandra-room/internal/types"
 	"github.com/datastax/go-cassandra-native-protocol/frame"
 	"github.com/datastax/go-cassandra-native-protocol/message"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
+	"github.com/pbonard/cassandra-room/internal/cluster"
+	"github.com/pbonard/cassandra-room/internal/storage/lsm"
+	"github.com/pbonard/cassandra-room/internal/storage/row"
+	"github.com/pbonard/cassandra-room/internal/types"
 )
 
 // ClusterOptions make a DB a node of a cluster.
@@ -188,7 +188,11 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	if len(p.initialCMS) == 0 {
 		p.initialCMS = []string{p.self}
 	}
-	p.cms = cluster.NewCMS(m, p.cmsMembers, d.currentMetadata, d.installBytes, metadataInfo)
+	if err := d.replayMetadataLog(); err != nil {
+		m.Close()
+		return err
+	}
+	p.cms = cluster.NewCMS(m, metaStore{p})
 	saved, err := d.readFile(cmsStateFileName)
 	if err != nil {
 		m.Close()
@@ -424,17 +428,20 @@ func (p *proxy) membershipChanged() {
 	}
 }
 
-// disseminate pushes the current metadata to the live nodes after a
+// disseminate pushes the entry of an epoch to the live nodes after a
 // commit (TCM's log replication).
-func (p *proxy) disseminate() {
+func (p *proxy) disseminate(epoch int64) {
+	e, ok := p.d.entryAt(epoch)
+	if !ok {
+		return // already replaced by a snapshot: nodes catch up by gossip
+	}
 	var nodes []string
 	for _, n := range p.d.schema.Load().Nodes {
 		if n.Addr != p.self && n.Status != cluster.StatusLeft && p.g.IsAlive(n.Addr) {
 			nodes = append(nodes, n.Addr)
 		}
 	}
-	_, b := p.d.currentMetadata()
-	p.cms.Push(nodes, b)
+	p.cms.Push(nodes, e)
 }
 
 func (p *proxy) stop() {

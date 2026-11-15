@@ -4,7 +4,7 @@ import (
 	"container/list"
 	"sync"
 
-	"github.com/cassandra-room/cassandra-room/internal/db"
+	"github.com/pbonard/cassandra-room/internal/db"
 )
 
 const numLRUShards = 64

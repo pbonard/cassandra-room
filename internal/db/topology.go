@@ -9,10 +9,11 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
-	"github.com/cassandra-room/cassandra-room/internal/cluster"
-	"github.com/cassandra-room/cassandra-room/internal/storage/lsm"
 	"github.com/datastax/go-cassandra-native-protocol/message"
+	"github.com/pbonard/cassandra-room/internal/cluster"
+	"github.com/pbonard/cassandra-room/internal/storage/lsm"
 )
 
 // Topology changes: bootstrap (BootStrapper, RangeStreamer), decommission
@@ -499,9 +500,12 @@ func (d *DB) RemoveNode(target string) error {
 }
 
 // ReconfigureCMS sets the members of the cluster metadata service (TCM's
-// nodetool cms reconfigure): they must be normal, live nodes. The change
-// is committed by the current members; the next epochs are decided by the
-// new ones.
+// nodetool cms reconfigure): they must be normal, live nodes. As TCM's
+// PrepareCMSReconfiguration and AdvanceCMSReconfiguration, it moves one
+// member at a time, additions first, each its own epoch: a node is brought
+// up to date with the log before it joins, and every majority of the
+// members before a step shares a node with every majority after it. An
+// interrupted reconfiguration is continued by running it again.
 func (d *DB) ReconfigureCMS(members []string) error {
 	p := d.proxy
 	if p == nil {
@@ -525,13 +529,57 @@ func (d *DB) ReconfigureCMS(members []string) error {
 	members = slices.Clone(members)
 	slices.Sort(members)
 	members = slices.Compact(members)
-	_, err := d.change("RECONFIGURE_CMS", func(next *Schema) (message.Message, bool, error) {
-		if slices.Equal(next.CMS, members) {
-			return nil, false, nil
+	for {
+		cur := slices.Clone(p.cmsMembers())
+		slices.Sort(cur)
+		step, next, ok := cmsStep(cur, members)
+		if !ok {
+			return nil
 		}
-		next.CMS = members
-		next.logDetail = strings.Join(members, ",")
-		return nil, true, nil
-	})
-	return err
+		if step[0] == '+' {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			epoch, err := p.cms.Sync(ctx, step[1:])
+			cancel()
+			if err != nil {
+				return fmt.Errorf("db: bringing %s up to date with the metadata log: %w", step[1:], err)
+			}
+			if epoch < d.schema.Load().Epoch {
+				return fmt.Errorf("db: %s is behind the metadata log (epoch %d)", step[1:], epoch)
+			}
+		}
+		_, err := d.change("RECONFIGURE_CMS", func(n *Schema) (message.Message, bool, error) {
+			have := slices.Clone(n.CMS)
+			if len(have) == 0 {
+				have = slices.Clone(p.initialCMS)
+			}
+			slices.Sort(have)
+			if !slices.Equal(have, cur) {
+				return nil, false, errors.New("db: the metadata service was reconfigured concurrently")
+			}
+			n.CMS = next
+			n.logDetail = step
+			return nil, true, nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+}
+
+// cmsStep returns the next step from the members cur to want ("+addr" or
+// "-addr") and the members after it, or false when there is none.
+func cmsStep(cur, want []string) (string, []string, bool) {
+	for _, m := range want {
+		if !slices.Contains(cur, m) {
+			next := append(slices.Clone(cur), m)
+			slices.Sort(next)
+			return "+" + m, next, true
+		}
+	}
+	for i, m := range cur {
+		if !slices.Contains(want, m) {
+			return "-" + m, slices.Delete(slices.Clone(cur), i, i+1), true
+		}
+	}
+	return "", nil, false
 }

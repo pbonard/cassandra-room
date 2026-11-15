@@ -3,7 +3,7 @@
 // prepared against the schema by the execution layer.
 package cql
 
-import "github.com/cassandra-room/cassandra-room/internal/types"
+import "github.com/pbonard/cassandra-room/internal/types"
 
 // Statement is a parsed statement.
 type Statement interface{ stmt() }

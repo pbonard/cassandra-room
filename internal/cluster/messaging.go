@@ -45,6 +45,7 @@ const (
 	VerbReadDigest
 	VerbCounterMutation
 	VerbStreamFile
+	VerbMetadataSync
 	numVerbs
 )
 
@@ -118,8 +119,8 @@ type MessagingOptions struct {
 const (
 	// ProtocolVersion is this node's messaging version; MinProtocolVersion
 	// the oldest it can talk to.
-	ProtocolVersion    = 2
-	MinProtocolVersion = 2
+	ProtocolVersion    = 3
+	MinProtocolVersion = 3
 
 	kindRequest    = 1
 	kindResponse   = 2
@@ -160,7 +161,8 @@ func classOf(v Verb, size int) int {
 	case v == VerbStreamPush || v == VerbStreamFile || v == VerbReadRange || v == VerbRepair:
 		return classLarge
 	case v == VerbGossip || v == VerbPing || v == VerbPingReq || v == VerbBroadcast ||
-		v == VerbPaxosPrepare || v == VerbPaxosAccept || v == VerbMetadataFetch || v == VerbMetadataPush:
+		v == VerbPaxosPrepare || v == VerbPaxosAccept || v == VerbMetadataFetch || v == VerbMetadataPush ||
+		v == VerbMetadataSync:
 		return classUrgent
 	}
 	return classSmall
@@ -189,6 +191,9 @@ func stageOf(v Verb) int {
 		return stageGossip
 	case VerbPaxosPrepare, VerbPaxosAccept, VerbMetadataFetch, VerbMetadataPush:
 		return stageMetadata
+	case VerbMetadataSync:
+		// It fetches from another node's metadata stage: not from its own.
+		return stageAntiEntropy
 	case VerbStreamFile:
 		return stageStreaming
 	}

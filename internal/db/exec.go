@@ -6,9 +6,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cassandra-room/cassandra-room/internal/cql"
 	"github.com/datastax/go-cassandra-native-protocol/message"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
+	"github.com/pbonard/cassandra-room/internal/cql"
 )
 
 // statement is a prepared statement (CQLStatement).

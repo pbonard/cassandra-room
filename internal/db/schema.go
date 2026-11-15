@@ -11,10 +11,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cassandra-room/cassandra-room/internal/cluster"
-	"github.com/cassandra-room/cassandra-room/internal/cql"
-	"github.com/cassandra-room/cassandra-room/internal/storage/lsm"
-	"github.com/cassandra-room/cassandra-room/internal/types"
+	"github.com/pbonard/cassandra-room/internal/cluster"
+	"github.com/pbonard/cassandra-room/internal/cql"
+	"github.com/pbonard/cassandra-room/internal/storage/lsm"
+	"github.com/pbonard/cassandra-room/internal/types"
 )
 
 // ColumnKind is a column's role (ColumnMetadata.Kind).

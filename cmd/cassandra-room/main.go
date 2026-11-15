@@ -15,9 +15,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cassandra-room/cassandra-room/internal/cluster"
-	"github.com/cassandra-room/cassandra-room/internal/db"
-	"github.com/cassandra-room/cassandra-room/internal/server"
+	"github.com/pbonard/cassandra-room/internal/cluster"
+	"github.com/pbonard/cassandra-room/internal/db"
+	"github.com/pbonard/cassandra-room/internal/server"
 )
 
 func main() {

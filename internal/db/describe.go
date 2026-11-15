@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cassandra-room/cassandra-room/internal/cql"
-	"github.com/cassandra-room/cassandra-room/internal/types"
 	"github.com/datastax/go-cassandra-native-protocol/message"
+	"github.com/pbonard/cassandra-room/internal/cql"
+	"github.com/pbonard/cassandra-room/internal/types"
 )
 
 // describeStmt is DESCRIBE (DescribeStatement): cqlsh's DESCRIBE commands

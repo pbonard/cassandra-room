@@ -5,8 +5,8 @@ import (
 	"slices"
 	"sort"
 
-	"github.com/cassandra-room/cassandra-room/internal/storage/row"
-	"github.com/cassandra-room/cassandra-room/internal/types"
+	"github.com/pbonard/cassandra-room/internal/storage/row"
+	"github.com/pbonard/cassandra-room/internal/types"
 )
 
 // Multi-cell columns (ComplexColumnData): a non-frozen collection or user

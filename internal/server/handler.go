@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cassandra-room/cassandra-room/internal/db"
 	"github.com/datastax/go-cassandra-native-protocol/compression/lz4"
 	"github.com/datastax/go-cassandra-native-protocol/compression/snappy"
 	"github.com/datastax/go-cassandra-native-protocol/message"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
+	"github.com/pbonard/cassandra-room/internal/db"
 )
 
 func (s *Server) handleMessage(

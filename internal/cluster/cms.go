@@ -13,29 +13,25 @@ import (
 
 // CMS is the Cluster Metadata Service of Cassandra's CEP-21 (Transactional
 // Cluster Metadata): cluster metadata changes form a log of epochs, and the
-// value of each epoch is chosen by Paxos among the CMS members
-// (PaxosBackedProcessor), which linearizes them. Every node applies the
-// epochs in order. Here an epoch's value is the full metadata after the
-// change (a snapshot, as TCM's ForceSnapshot), so a node that falls behind
-// catches up from any peer in one step (FetchPeerLog, FetchCMSLog).
+// entry of each epoch is chosen by Paxos among the CMS members
+// (PaxosBackedProcessor), which linearizes them. An entry holds only the
+// change (a transformation's effect on the metadata before it), and every
+// node applies the entries in epoch order (LocalLog). A node that falls
+// behind fetches the entries it misses from a peer (FetchPeerLog,
+// FetchCMSLog), or a full snapshot when the peer no longer has them all
+// (TCM's ForceSnapshot).
 //
-// Any node may propose: it computes the next metadata from its current
-// one and tries to get it chosen for the next epoch; if another value was
-// chosen there, it adopts that one and plans its change again.
+// The acceptors of an epoch are the members recorded in the metadata of
+// the epoch before, read together with it, so every proposer for an epoch
+// asks the same members.
+//
+// Any node may propose: it computes the next entry from its current
+// metadata and tries to get it chosen for the next epoch; if another entry
+// was chosen there, it applies that one and plans its change again.
 type CMS struct {
-	m *Messaging
-	// members returns the current members: the metadata records them, so
-	// the acceptors of an epoch are the members of the epoch before.
-	members func() []string
-	self    string
-	// current returns the local epoch and metadata; install installs a
-	// newer metadata snapshot (ignoring older ones).
-	current func() (int64, []byte)
-	install func([]byte) error
-	// info returns a metadata's epoch and whether it contains the change
-	// with a given entry id (TCM's Entry.Id, for idempotence: a proposal
-	// can be chosen through another proposer without its own knowing).
-	info func(meta []byte, id string) (epoch int64, applied bool, err error)
+	m     *Messaging
+	self  string
+	store Store
 
 	mu        sync.Mutex
 	acceptors map[int64]*acceptor // Paxos state per epoch, for members
@@ -44,6 +40,45 @@ type CMS struct {
 	// or acceptance is answered (TCM keeps it in system tables): a member
 	// that restarts must not forget what it promised.
 	persist func([]byte) error
+	// catchingUp serializes catching up.
+	catchingUp sync.Mutex
+}
+
+// Entry is the change committed at an epoch, encoded by the Store.
+type Entry struct {
+	Epoch int64
+	Value []byte
+}
+
+// Store is a node's metadata, as the CMS sees it.
+type Store interface {
+	// Current returns the local epoch, its metadata, and the CMS members
+	// it records (the acceptors of the next epoch).
+	Current() (epoch int64, meta []byte, members []string)
+	// Contains reports whether meta includes the change with an entry id
+	// (TCM's Entry.Id, for idempotence: a proposal can be chosen through
+	// another proposer without its own knowing).
+	Contains(meta []byte, id string) (bool, error)
+	// Append applies the entry of the epoch after the current one; it
+	// ignores entries of past epochs and returns ErrGap for later ones.
+	Append(e Entry) error
+	// Since returns the entries after an epoch, or false if the log no
+	// longer holds them all.
+	Since(epoch int64) ([]Entry, bool)
+	// Snapshot installs full metadata, if it is newer than the current.
+	Snapshot(meta []byte) error
+}
+
+// ErrGap is returned by Store.Append for an entry past the next epoch.
+var ErrGap = errors.New("cluster: metadata entry past the next epoch")
+
+// fetchRequest asks a node for the metadata log after an epoch.
+type fetchRequest struct{ Since int64 }
+
+// fetchResponse holds the entries asked for, or a snapshot.
+type fetchResponse struct {
+	Entries  []Entry `json:",omitempty"`
+	Snapshot []byte  `json:",omitempty"`
 }
 
 // SetPersistence restores the acceptor state saved by persist and makes
@@ -109,18 +144,26 @@ type paxosResp struct {
 var ErrNoQuorum = errors.New("cluster: no quorum of the cluster metadata service")
 
 // NewCMS creates the metadata service client (and acceptor, on members).
-func NewCMS(m *Messaging, members func() []string, current func() (int64, []byte), install func([]byte) error,
-	info func(meta []byte, id string) (int64, bool, error)) *CMS {
-	c := &CMS{m: m, members: members, self: m.Addr(), current: current, install: install, info: info, acceptors: map[int64]*acceptor{}}
+func NewCMS(m *Messaging, store Store) *CMS {
+	c := &CMS{m: m, self: m.Addr(), store: store, acceptors: map[int64]*acceptor{}}
 	m.Handle(VerbPaxosPrepare, c.handlePrepare)
 	m.Handle(VerbPaxosAccept, c.handleAccept)
 	m.Handle(VerbMetadataFetch, c.handleFetch)
 	m.Handle(VerbMetadataPush, c.handlePush)
+	m.Handle(VerbMetadataSync, c.handleSync)
 	return c
 }
 
 // Members returns the CMS members.
-func (c *CMS) Members() []string { return c.members() }
+func (c *CMS) Members() []string {
+	_, _, members := c.store.Current()
+	return members
+}
+
+func (c *CMS) epoch() int64 {
+	e, _, _ := c.store.Current()
+	return e
+}
 
 func (c *CMS) acceptorLocked(epoch int64) *acceptor {
 	a := c.acceptors[epoch]
@@ -129,7 +172,7 @@ func (c *CMS) acceptorLocked(epoch int64) *acceptor {
 		c.acceptors[epoch] = a
 	}
 	// Forget the state of epochs long committed.
-	cur, _ := c.current()
+	cur := c.epoch()
 	for e := range c.acceptors {
 		if e < cur-16 {
 			delete(c.acceptors, e)
@@ -143,7 +186,7 @@ func (c *CMS) handlePrepare(ctx context.Context, _ string, payload []byte) ([]by
 	if err := json.Unmarshal(payload, &r); err != nil {
 		return nil, err
 	}
-	if cur, _ := c.current(); cur >= r.Epoch {
+	if c.epoch() >= r.Epoch {
 		return json.Marshal(paxosResp{Behind: true})
 	}
 	c.mu.Lock()
@@ -166,7 +209,7 @@ func (c *CMS) handleAccept(ctx context.Context, _ string, payload []byte) ([]byt
 	if err := json.Unmarshal(payload, &r); err != nil {
 		return nil, err
 	}
-	if cur, _ := c.current(); cur >= r.Epoch {
+	if c.epoch() >= r.Epoch {
 		return json.Marshal(paxosResp{Behind: true})
 	}
 	c.mu.Lock()
@@ -182,24 +225,106 @@ func (c *CMS) handleAccept(ctx context.Context, _ string, payload []byte) ([]byt
 	return json.Marshal(paxosResp{OK: true})
 }
 
-func (c *CMS) handleFetch(context.Context, string, []byte) ([]byte, error) {
-	_, b := c.current()
-	return b, nil
+// handleFetch serves the log after an epoch, or a snapshot. An empty
+// request asks for a snapshot.
+func (c *CMS) handleFetch(_ context.Context, _ string, payload []byte) ([]byte, error) {
+	var r fetchResponse
+	if len(payload) > 0 {
+		var q fetchRequest
+		if err := json.Unmarshal(payload, &q); err != nil {
+			return nil, err
+		}
+		if entries, ok := c.store.Since(q.Since); ok {
+			r.Entries = entries
+			return json.Marshal(r)
+		}
+	}
+	_, r.Snapshot, _ = c.store.Current()
+	return json.Marshal(r)
 }
 
-func (c *CMS) handlePush(ctx context.Context, _ string, payload []byte) ([]byte, error) {
-	return nil, c.install(payload)
+// handlePush applies an entry pushed after a commit; past a gap, the node
+// catches up from the sender (in the background: the sender waits on this
+// answer, and catching up asks it in turn).
+func (c *CMS) handlePush(_ context.Context, from string, payload []byte) ([]byte, error) {
+	var e Entry
+	if err := json.Unmarshal(payload, &e); err != nil {
+		return nil, err
+	}
+	err := c.store.Append(e)
+	if errors.Is(err, ErrGap) {
+		go func() { _ = c.CatchUp(from) }()
+		return nil, nil
+	}
+	return nil, err
 }
 
-// CatchUp fetches the metadata from a node that is ahead.
+// handleSync catches up from the node named in the request and returns
+// the epoch reached: a node about to join the metadata service is brought
+// up to date first.
+func (c *CMS) handleSync(_ context.Context, _ string, payload []byte) ([]byte, error) {
+	if err := c.CatchUp(string(payload)); err != nil {
+		return nil, err
+	}
+	return json.Marshal(c.epoch())
+}
+
+// Sync asks node to catch up from this one, and returns its epoch.
+func (c *CMS) Sync(ctx context.Context, node string) (int64, error) {
+	if node == c.self {
+		return c.epoch(), nil
+	}
+	b, err := c.m.Request(ctx, node, VerbMetadataSync, []byte(c.self))
+	if err != nil {
+		return 0, err
+	}
+	var e int64
+	err = json.Unmarshal(b, &e)
+	return e, err
+}
+
+// CatchUp fetches what this node misses of the log from a node: the
+// entries after its epoch, replayed in order, or a snapshot.
 func (c *CMS) CatchUp(from string) error {
+	c.catchingUp.Lock()
+	defer c.catchingUp.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	q, _ := json.Marshal(fetchRequest{Since: c.epoch()})
+	b, err := c.m.Request(ctx, from, VerbMetadataFetch, q)
+	if err != nil {
+		return err
+	}
+	var r fetchResponse
+	if err := json.Unmarshal(b, &r); err != nil {
+		return err
+	}
+	if r.Snapshot != nil {
+		return c.store.Snapshot(r.Snapshot)
+	}
+	for _, e := range r.Entries {
+		if err := c.store.Append(e); err != nil {
+			if !errors.Is(err, ErrGap) {
+				// A diverged or unreadable entry: start again from the
+				// sender's full metadata.
+				return c.snapshotFrom(ctx, from)
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *CMS) snapshotFrom(ctx context.Context, from string) error {
 	b, err := c.m.Request(ctx, from, VerbMetadataFetch, nil)
 	if err != nil {
 		return err
 	}
-	return c.install(b)
+	var r fetchResponse
+	if err := json.Unmarshal(b, &r); err != nil {
+		return err
+	}
+	return c.store.Snapshot(r.Snapshot)
 }
 
 // broadcast sends a request to every member, collecting the answers.
@@ -229,11 +354,11 @@ func (c *CMS) broadcast(ctx context.Context, members []string, verb Verb, req pa
 	return out
 }
 
-// Commit applies a metadata change: plan computes the next metadata from
-// the current one, recording the entry id (it may be called several times,
-// on newer metadata, if other changes win the race). It returns the epoch
-// at which the change is committed.
-func (c *CMS) Commit(ctx context.Context, plan func(current []byte, id string) ([]byte, error)) (int64, error) {
+// Commit commits a metadata change: plan computes the entry of the next
+// epoch from the current metadata, recording the entry id (it may be
+// called several times, on newer metadata, if other changes win the race).
+// It returns the epoch at which the change is committed.
+func (c *CMS) Commit(ctx context.Context, plan func(meta []byte, id string) ([]byte, error)) (int64, error) {
 	id := fmt.Sprintf("%s/%d/%d", c.self, time.Now().UnixNano(), rand.Int63())
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -242,8 +367,10 @@ func (c *CMS) Commit(ctx context.Context, plan func(current []byte, id string) (
 		if attempt > 0 {
 			time.Sleep(time.Duration(rand.Intn(20*attempt)) * time.Millisecond)
 		}
-		epoch, cur := c.current()
-		if _, applied, err := c.info(cur, id); err != nil {
+		// The epoch, its metadata and the members are read together: the
+		// members of the epoch before decide the next one.
+		epoch, cur, members := c.store.Current()
+		if applied, err := c.store.Contains(cur, id); err != nil {
 			return 0, err
 		} else if applied {
 			return epoch, nil // chosen through another proposer
@@ -253,11 +380,7 @@ func (c *CMS) Commit(ctx context.Context, plan func(current []byte, id string) (
 			return 0, err
 		}
 		slot := epoch + 1
-		members := c.members()
 		quorum := len(members)/2 + 1
-		if e, _, err := c.info(next, id); err != nil || e != slot {
-			return 0, fmt.Errorf("cluster: planned metadata has epoch %d, want %d", e, slot)
-		}
 		c.mu.Lock()
 		c.round++
 		b := ballot{Round: max(c.round, time.Now().UnixNano()), Node: c.self}
@@ -282,7 +405,7 @@ func (c *CMS) Commit(ctx context.Context, plan func(current []byte, id string) (
 			}
 		}
 		if behind {
-			c.catchUpFromMembers()
+			c.catchUpFromMembers(members)
 			continue
 		}
 		if len(ok) < quorum {
@@ -310,7 +433,7 @@ func (c *CMS) Commit(ctx context.Context, plan func(current []byte, id string) (
 			}
 		}
 		if behind && n < quorum {
-			c.catchUpFromMembers()
+			c.catchUpFromMembers(members)
 			continue
 		}
 		if n < quorum {
@@ -319,19 +442,14 @@ func (c *CMS) Commit(ctx context.Context, plan func(current []byte, id string) (
 			}
 			continue
 		}
-		// Chosen: install it here and on the other members.
-		if err := c.install(value); err != nil {
+		// Chosen: apply it here and push it to the other members.
+		chosen := Entry{Epoch: slot, Value: value}
+		if err := c.store.Append(chosen); errors.Is(err, ErrGap) {
+			c.catchUpFromMembers(members)
+		} else if err != nil {
 			return 0, err
 		}
-		for _, mb := range members {
-			if mb != c.self {
-				go func() {
-					pctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-					defer cancel()
-					_, _ = c.m.Request(pctx, mb, VerbMetadataPush, value)
-				}()
-			}
-		}
+		go c.Push(members, chosen)
 		if bytes.Equal(value, next) {
 			return slot, nil
 		}
@@ -339,16 +457,17 @@ func (c *CMS) Commit(ctx context.Context, plan func(current []byte, id string) (
 	}
 }
 
-func (c *CMS) catchUpFromMembers() {
-	for _, mb := range c.members() {
+func (c *CMS) catchUpFromMembers(members []string) {
+	for _, mb := range members {
 		if mb != c.self && c.CatchUp(mb) == nil {
 			return
 		}
 	}
 }
 
-// Push sends metadata to nodes (dissemination after a commit).
-func (c *CMS) Push(nodes []string, value []byte) {
+// Push sends an entry to nodes (log replication after a commit).
+func (c *CMS) Push(nodes []string, e Entry) {
+	b, _ := json.Marshal(e)
 	var wg sync.WaitGroup
 	for _, n := range nodes {
 		if n == c.self {
@@ -359,7 +478,7 @@ func (c *CMS) Push(nodes []string, value []byte) {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			_, _ = c.m.Request(ctx, n, VerbMetadataPush, value)
+			_, _ = c.m.Request(ctx, n, VerbMetadataPush, b)
 		}()
 	}
 	wg.Wait()

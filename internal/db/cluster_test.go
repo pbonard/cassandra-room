@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/cassandra-room/cassandra-room/internal/cluster"
+	"github.com/pbonard/cassandra-room/internal/cluster"
 	"net"
 	"sort"
 	"strconv"
@@ -504,6 +504,21 @@ func TestClusterOperations(t *testing.T) {
 	// A three-member metadata service.
 	require.NoError(t, c.nodes[1].ReconfigureCMS([]string{c.addrs[0], c.addrs[1], c.addrs[2]}))
 	require.Eventually(t, func() bool { return len(c.nodes[3].schema.Load().CMS) == 3 }, 5*time.Second, 10*time.Millisecond)
+	// One member at a time, each its own epoch.
+	var steps []string
+	for _, e := range c.nodes[3].schema.Load().Log {
+		if e.Kind == "RECONFIGURE_CMS" {
+			steps = append(steps, e.Detail)
+		}
+	}
+	require.ElementsMatch(t, []string{"+" + c.addrs[1], "+" + c.addrs[2]}, steps)
+	// Every node holds the log's recent entries, entry by entry.
+	for i := range c.nodes {
+		require.Eventually(t, func() bool {
+			e, ok := c.nodes[i].entryAt(c.nodes[0].schema.Load().Epoch)
+			return ok && e.Epoch > 0
+		}, 5*time.Second, 10*time.Millisecond)
+	}
 	require.Len(t, c.values(3, one, "SELECT host_id FROM system_views.cluster_metadata_directory WHERE cms_member = true ALLOW FILTERING"), 3)
 	c.ok(2, quorum, "CREATE TABLE ks.other (k int PRIMARY KEY)")
 

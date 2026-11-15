@@ -10,12 +10,12 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/cassandra-room/cassandra-room/internal/cql"
-	"github.com/cassandra-room/cassandra-room/internal/storage/lsm"
-	"github.com/cassandra-room/cassandra-room/internal/storage/row"
-	"github.com/cassandra-room/cassandra-room/internal/types"
 	"github.com/datastax/go-cassandra-native-protocol/message"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
+	"github.com/pbonard/cassandra-room/internal/cql"
+	"github.com/pbonard/cassandra-room/internal/storage/lsm"
+	"github.com/pbonard/cassandra-room/internal/storage/row"
+	"github.com/pbonard/cassandra-room/internal/types"
 )
 
 // selectStmt is a prepared SELECT (SelectStatement).

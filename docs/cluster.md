@@ -64,18 +64,28 @@ is a linearized log of epochs**.
   **metadata epoch**; nothing about tokens or schema.
 - **Cluster metadata** (`cms.go`, `internal/db/metadata.go`, after
   CEP-21): the schema, the roles and the node directory (address, host id,
-  native address, DC, rack, tokens, status) form one snapshot with an
+  native address, DC, rack, tokens, status) form the metadata, with an
   epoch. Every change (DDL, role changes, a node registering, joining or
   leaving) is a transformation: the proposer plans it on a copy of the
-  current snapshot and the **Cluster Metadata Service** chooses the value
-  of the next epoch by single-decree Paxos among its members (the seeds).
-  Concurrent changes are serialized: a proposer whose slot was taken
-  catches up and plans again. Each change carries an entry id, so a change
-  chosen through another proposer is not applied twice. Committed
-  snapshots are pushed to the live nodes; a node that missed one sees a
-  higher epoch in gossip and fetches the snapshot from that peer. A node
-  installs snapshots in epoch order only, creating storage for new tables
-  and dropping storage of removed ones.
+  current metadata and the **Cluster Metadata Service** chooses the entry
+  of the next epoch by single-decree Paxos among its members (the seeds at
+  first). The acceptors of epoch N+1 are the members recorded at epoch N,
+  read together with it. Concurrent changes are serialized: a proposer
+  whose slot was taken catches up and plans again. Each change carries an
+  entry id, so a change chosen through another proposer is not applied
+  twice.
+- **Metadata log** (`internal/db/metalog.go`, TCM's LocalLog): an epoch's
+  entry holds only the change: the scalars, the keyspaces, tables, roles
+  and nodes it added, changed or removed, and a hash of the resulting
+  metadata. Committed entries are pushed to the live nodes, which apply
+  them in epoch order; a node that misses some (a gap, or a higher epoch
+  seen in gossip) fetches the entries after its epoch from a peer and
+  replays them, or a snapshot when the peer's log (the last 256 entries)
+  no longer reaches back. A hash mismatch also falls back to a snapshot.
+  Each node logs an entry durably (`metadata-log.json`) before installing
+  it and replays logged entries at startup, so a crash in between loses
+  nothing. Installing creates storage for new tables and drops storage of
+  removed ones.
 - **Ring** (`ring.go`): built from the metadata's node directory, never
   from gossip, so all nodes at the same epoch agree on the replicas. Each
   node has `-num-tokens` random vnode tokens. SimpleStrategy and
@@ -167,10 +177,14 @@ node, the coordinator in a cluster.
   down even if the address is reused), streams them from the other
   replicas, then one commit makes it NORMAL and the dead node LEFT.
 - **Metadata service membership** (`POST /cms/reconfigure?members=`) is
-  part of the metadata: the members of epoch N decide epoch N+1, so a
-  reconfiguration is committed by the old members and the following epochs
-  by the new ones. The seeds are the initial members.
-- **Metadata log**: each commit records its epoch, kind (REGISTER,
+  part of the metadata: the members of epoch N decide epoch N+1. As TCM's
+  Prepare/AdvanceCMSReconfiguration, a reconfiguration moves one member
+  per epoch, additions first; a node is brought up to date with the log
+  (`VerbMetadataSync`) before it is added. A step checks the members it
+  starts from, so concurrent reconfigurations fail instead of mixing; an
+  interrupted one is continued by running it again. The seeds are the
+  initial members.
+- **Metadata history**: each commit records its epoch, kind (REGISTER,
   PREPARE_JOIN/FINISH_JOIN, PREPARE_LEAVE/FINISH_LEAVE, PREPARE_REMOVE,
   PREPARE_REPLACE/FINISH_REPLACE, RECONFIGURE_CMS, SCHEMA_CHANGE, ROLES)
   and what it did; the last 256 are in `system_views.cluster_metadata_log`,
@@ -179,9 +193,9 @@ node, the coordinator in a cluster.
 
 ## Not done
 
-- Metadata: each epoch's value is a full snapshot pushed to every node, and
-  the log keeps the latest changes for display only (it cannot be
-  replayed).
+- Metadata: applying an entry still re-encodes the whole metadata to check
+  its hash; the target of an interrupted reconfiguration is not recorded
+  in the metadata (TCM records it so any node can finish it).
 - Lightweight transactions stay on Paxos v1 (Accord is planned to replace
   them).
 - Repair is full repair only (no incremental repair); streaming sends
@@ -192,7 +206,11 @@ node, the coordinator in a cluster.
 `internal/cluster` tests messaging, SWIM joins, state spread, failure
 detection and restart with a new generation, refutation, the suspicion
 timeout, concurrent CMS commits from three proposers (exactly one epoch
-per change, the same snapshot everywhere), and replica placement. `internal/db/cluster_test.go` runs in-process
+per change, the same metadata everywhere), commits while the members
+change one at a time, catching up by replaying a peer's log or from a
+snapshot, and replica placement. `internal/db/metalog_test.go` checks that
+entries hold only the changed elements and rebuild the same metadata,
+divergence detection, and replay of logged entries at startup. `internal/db/cluster_test.go` runs in-process
 clusters: schema propagation, replication at RF 3, QUORUM with a node down
 and ALL unavailable, metadata catch-up and hint replay after restart, read repair of a divergent
 replica, counters and LWT from every coordinator,

@@ -6,9 +6,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cassandra-room/cassandra-room/internal/storage/lsm"
-	"github.com/cassandra-room/cassandra-room/internal/storage/row"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
+	"github.com/pbonard/cassandra-room/internal/storage/lsm"
+	"github.com/pbonard/cassandra-room/internal/storage/row"
 )
 
 // mutation is a set of row fragment writes, applied atomically on each

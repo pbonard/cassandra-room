@@ -6,7 +6,7 @@ import (
 	"math"
 	"math/bits"
 
-	"github.com/cassandra-room/cassandra-room/internal/types"
+	"github.com/pbonard/cassandra-room/internal/types"
 )
 
 // Storage keys. Rows of a table are stored in token order, as Cassandra's

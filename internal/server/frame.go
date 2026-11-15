@@ -7,7 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/cassandra-room/cassandra-room/internal/db"
+	"github.com/pbonard/cassandra-room/internal/db"
 	"io"
 	"net"
 	"sync"
