@@ -222,15 +222,14 @@ func (d *DB) prepareTransaction(s *Schema, session string, st *cql.Transaction, 
 				br.conds = append(br.conds, cond)
 				continue
 			}
-			// The reference's column types the other side.
-			ref, _ := c.Left.(*cql.Reference)
-			if ref == nil {
-				ref = c.Right.(*cql.Reference)
+			// The references' types type the other side.
+			cond.typ = vs.termType(c.Left)
+			if cond.typ == nil {
+				cond.typ = vs.termType(c.Right)
 			}
-			if _, err := vs.prepareReference(ref, "", nil); err != nil {
-				return nil, err
+			if cond.typ == nil {
+				return nil, invalidf("a transaction condition needs a LET reference to a selected column")
 			}
-			cond.typ = vs.refs[ref.Tuple].cols[ref.Column].Type
 			var err error
 			if cond.left, err = vs.prepareTxnTerm(c.Left, cond.typ); err != nil {
 				return nil, err
@@ -489,12 +488,79 @@ func (tx *txnStmt) execute(e *execCtx) (message.Message, error) {
 	return tx.result(rows), nil
 }
 
-// arithTerm is left op right on a numeric type; a null left side counts as
-// zero (c += v on a missing value sets v).
+// arithTerm is left op right on numeric types (null if either is null,
+// unless zeroNull: a null left side then counts as zero, as c += v on a
+// missing value sets v).
 type arithTerm struct {
-	op   byte
-	l, r term
-	typ  *types.Type
+	op       byte
+	l, r     term
+	lt, rt   *types.Type
+	typ      *types.Type
+	zeroNull bool
+}
+
+// termType infers a raw term's type from the references it uses (nil
+// when it has none: it takes the type of its context).
+func (vs *vars) termType(raw cql.Term) *types.Type {
+	switch r := raw.(type) {
+	case *cql.Reference:
+		if ref := vs.refs[r.Tuple]; ref != nil {
+			if c := ref.cols[r.Column]; c != nil {
+				return c.Type
+			}
+		}
+	case *cql.BinaryTerm:
+		lt, rt := vs.termType(r.Left), vs.termType(r.Right)
+		switch {
+		case lt == nil:
+			return rt
+		case rt == nil:
+			return lt
+		}
+		t, err := arithmeticType(lt, rt, r.Op)
+		if err == nil {
+			return t
+		}
+	case *cql.Cast:
+		if t, err := types.Parse(r.Type); err == nil {
+			return t
+		}
+	}
+	return nil
+}
+
+// prepareArith prepares an arithmetic term: operand types come from the
+// references (a side without any takes the other's, or the context's);
+// the result must have the type of its context.
+func (vs *vars) prepareArith(r *cql.BinaryTerm, name string, typ *types.Type) (term, error) {
+	lt, rt := vs.termType(r.Left), vs.termType(r.Right)
+	switch {
+	case lt == nil && rt == nil:
+		lt, rt = typ, typ
+	case lt == nil:
+		lt = rt
+	case rt == nil:
+		rt = lt
+	}
+	if lt == nil || !isNumeric(lt) || !isNumeric(rt) {
+		return nil, invalidf("the '%c' operation needs numeric operands for %s", r.Op, name)
+	}
+	res, err := arithmeticType(lt, rt, r.Op)
+	if err != nil {
+		return nil, err
+	}
+	if typ != nil && res.String() != typ.String() {
+		return nil, invalidf("Invalid arithmetic of type %s for %s of type %s", res, name, typ)
+	}
+	l, err := vs.prepareTerm(r.Left, name, lt)
+	if err != nil {
+		return nil, err
+	}
+	rr, err := vs.prepareTerm(r.Right, name, rt)
+	if err != nil {
+		return nil, err
+	}
+	return &arithTerm{op: r.Op, l: l, r: rr, lt: lt, rt: rt, typ: res, zeroNull: r.ZeroNull}, nil
 }
 
 func (a *arithTerm) bind(e *execCtx) ([]byte, valState, error) {
@@ -510,11 +576,17 @@ func (a *arithTerm) bind(e *execCtx) ([]byte, valState, error) {
 		return nil, vNull, nil
 	}
 	if ls != vSet {
-		if l, err = types.FromLiteral(a.typ, types.LitInteger, "0"); err != nil {
+		if !a.zeroNull {
+			return nil, vNull, nil
+		}
+		if l, err = types.FromLiteral(a.lt, types.LitInteger, "0"); err != nil {
 			return nil, vNull, err
 		}
 	}
-	v, err := arithmetic(a.op, a.typ, a.typ, a.typ, l, r)
+	if (a.op == '/' || a.op == '%') && isZeroNumber(a.rt, r) {
+		return nil, vNull, invalidf("Cannot divide by zero")
+	}
+	v, err := arithmetic(a.op, a.lt, a.rt, a.typ, l, r)
 	if err != nil {
 		return nil, vNull, err
 	}
@@ -563,7 +635,7 @@ func (d *DB) rewriteIncrements(s *Schema, session string, st *cql.Transaction) e
 				st.Lets = append(st.Lets, cql.Let{Name: name, Select: &cql.Select{Keyspace: u.Keyspace, Table: u.Table,
 					Selectors: []cql.Selector{{Expr: &cql.ColumnSel{Name: op.Column}}}, Where: u.Where}})
 				u.Operations[i] = cql.Operation{Column: op.Column, Op: "=",
-					Value: &cql.BinaryTerm{Op: sign, Left: &cql.Reference{Tuple: name, Column: op.Column}, Right: op.Value}}
+					Value: &cql.BinaryTerm{Op: sign, Left: &cql.Reference{Tuple: name, Column: op.Column}, Right: op.Value, ZeroNull: true}}
 			}
 		}
 		return nil
@@ -574,4 +646,10 @@ func (d *DB) rewriteIncrements(s *Schema, session string, st *cql.Transaction) e
 		}
 	}
 	return rewrite(st.Updates)
+}
+
+// isZeroNumber reports whether a numeric value is zero.
+func isZeroNumber(t *types.Type, v []byte) bool {
+	z, err := types.FromLiteral(t, types.LitInteger, "0")
+	return err == nil && types.Compare(t, v, z) == 0
 }

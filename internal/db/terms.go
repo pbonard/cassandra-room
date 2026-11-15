@@ -196,15 +196,7 @@ func (vs *vars) prepareTerm(raw cql.Term, name string, typ *types.Type) (term, e
 	case *cql.Reference:
 		return vs.prepareReference(r, name, typ)
 	case *cql.BinaryTerm:
-		l, err := vs.prepareTerm(r.Left, name, typ)
-		if err != nil {
-			return nil, err
-		}
-		rt, err := vs.prepareTerm(r.Right, name, typ)
-		if err != nil {
-			return nil, err
-		}
-		return &arithTerm{op: r.Op, l: l, r: rt, typ: typ}, nil
+		return vs.prepareArith(r, name, typ)
 	case *cql.Marker:
 		n := vs.names[r.Index]
 		if n == "" {

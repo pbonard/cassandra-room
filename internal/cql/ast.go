@@ -410,6 +410,9 @@ func (*Transaction) stmt() {}
 type BinaryTerm struct {
 	Op          byte
 	Left, Right Term
+	// ZeroNull: a null left side counts as zero (c += v on a missing
+	// value).
+	ZeroNull bool
 }
 
 func (*BinaryTerm) term() {}

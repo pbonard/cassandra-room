@@ -863,3 +863,103 @@ func (n *Node) fetchOnce(id TxnID, keys []Key) {
 func (n *Node) recoveryTimeout() time.Duration {
 	return max(4*n.cfg.RecoverAfter, 8*n.cfg.RequestTimeout)
 }
+
+// ---- range reads ----
+
+// RangeShards splits a range by the replica sets of the newest epoch.
+func (n *Node) RangeShards(r Range) []RangeShard {
+	n.topoMu.RLock()
+	t := n.topos[n.latest]
+	n.topoMu.RUnlock()
+	if t == nil || t.RangeReplicas == nil {
+		return nil
+	}
+	return t.RangeReplicas(r)
+}
+
+// ReadRange runs an ephemeral read of a range (TxnRangeRead, read
+// ephemerally): a quorum of every replica set owning part of it, in every
+// epoch not yet synchronised, reports the writes in the range not yet
+// applied everywhere; then, per sub-range, one replica reads once those
+// have applied there. The result maps each sub-range (Range.String) to
+// what the DataStore read, in token order.
+func (n *Node) ReadRange(ctx context.Context, r Range, txn *Txn) ([]RangeShard, map[string][]byte, error) {
+	latest := n.epoch()
+	ts := &Topologies{}
+	var readShards []RangeShard
+	n.topoMu.RLock()
+	for e := min(n.synced.Load(), latest); e <= latest; e++ {
+		t := n.topos[e]
+		if t == nil || t.RangeReplicas == nil {
+			continue
+		}
+		for _, rs := range t.RangeReplicas(r) {
+			nodes := slices.Clone(rs.Nodes)
+			slices.Sort(nodes)
+			ts.Shards = append(ts.Shards, &Shard{Epoch: e, Nodes: slices.Compact(nodes)})
+			if e == latest {
+				readShards = append(readShards, rs)
+			}
+		}
+	}
+	n.topoMu.RUnlock()
+	if len(readShards) == 0 {
+		return nil, nil, errors.New("accord: no topology for the range")
+	}
+	req := &ephemeralReq{Ranges: []Range{r}}
+	nodes := ts.nodes()
+	ch := broadcast[ephemeralReply](ctx, n, nodes, mEphemeralDeps, func(NodeID) any { return req })
+	tr := newTracker(ts, (*Shard).slowQuorum)
+	deps := Deps{}
+	for i := 0; i < len(nodes) && !tr.done(); i++ {
+		var rep response[ephemeralReply]
+		select {
+		case rep = <-ch:
+		case <-ctx.Done():
+			return nil, nil, ErrTimeout
+		}
+		if rep.err != nil || rep.reply.Outcome != ok {
+			tr.failure(rep.from)
+		} else {
+			tr.success(rep.from)
+			deps = deps.with(rep.reply.Deps)
+		}
+		if tr.impossible() {
+			return nil, nil, ErrTimeout
+		}
+	}
+	if !tr.done() {
+		return nil, nil, ErrTimeout
+	}
+	reads := map[string][]byte{}
+	for _, rs := range readShards {
+		order := slices.Clone(rs.Nodes)
+		slices.Sort(order)
+		if i := slices.Index(order, n.cfg.ID); i > 0 {
+			order[0], order[i] = order[i], order[0]
+		}
+		sub := Deps{}
+		for ks, ids := range deps {
+			if k, ok := parseKeyString(ks); ok && rs.Range.contains(k) {
+				sub[ks] = ids
+			}
+		}
+		done := false
+		for _, to := range order {
+			var rep ephemeralReply
+			if err := n.send(ctx, to, mEphemeralRead, &ephemeralReq{Ranges: []Range{rs.Range}, Deps: sub, Txn: txn}, &rep); err != nil || rep.Outcome != ok {
+				if ctx.Err() != nil {
+					return nil, nil, ErrTimeout
+				}
+				continue
+			}
+			reads[rs.Range.String()] = rep.Reads[rs.Range.String()]
+			done = true
+			break
+		}
+		if !done {
+			return nil, nil, ErrTimeout
+		}
+	}
+	return readShards, reads, nil
+}

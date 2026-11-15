@@ -2,7 +2,10 @@ package accord
 
 import (
 	"context"
+	"errors"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -95,6 +98,7 @@ type command struct {
 // cfk is a key's conflict index (accord.local.CommandsForKey): every
 // command on the key, and the largest timestamp witnessed there.
 type cfk struct {
+	key   Key
 	ids   []TxnID
 	maxTS Timestamp
 }
@@ -168,7 +172,7 @@ func (s *store) registerLocked(c *command, keys []Key) {
 		ks := keyString(k)
 		f := s.keys[ks]
 		if f == nil {
-			f = &cfk{}
+			f = &cfk{key: k}
 			s.keys[ks] = f
 		}
 		i, found := slices.BinarySearchFunc(f.ids, c.ID, TxnID.Compare)
@@ -687,15 +691,26 @@ func (s *store) fastCommit(id TxnID, txn *Txn, deps Deps) bool {
 // ephemeralDeps returns the writes on keys a read must wait for
 // (GetEphemeralReadDeps): every conflicting write not yet applied at every
 // replica.
-func (s *store) ephemeralDeps(keys []Key) *ephemeralReply {
+func (s *store) ephemeralDeps(keys []Key, ranges []Range) *ephemeralReply {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	d := Deps{}
+	var fs []*cfk
 	for _, k := range s.n.owned(keys, 0) {
-		f := s.keys[keyString(k)]
-		if f == nil {
-			continue
+		if f := s.keys[keyString(k)]; f != nil {
+			fs = append(fs, f)
 		}
+	}
+	if len(ranges) > 0 {
+		// Every key this replica indexes in the ranges.
+		for _, f := range s.keys {
+			if slices.ContainsFunc(ranges, func(r Range) bool { return r.contains(f.key) }) {
+				fs = append(fs, f)
+			}
+		}
+	}
+	for _, f := range fs {
+		k := f.key
 		for _, id := range f.ids {
 			c := s.cmds[id]
 			if c == nil || id.Kind != Write || c.Status == Invalidated || c.Status == Truncated || c.Status == Applied && c.Durable {
@@ -711,6 +726,11 @@ func (s *store) ephemeralDeps(keys []Key) *ephemeralReply {
 // (ReadEphemeralTxnData); dependencies unknown here are fetched.
 func (s *store) ephemeralRead(ctx context.Context, r *ephemeralReq) (*ephemeralReply, error) {
 	owned := s.n.owned(r.Keys, 0)
+	for ks := range r.Deps {
+		if k, ok := parseKeyString(ks); ok && slices.ContainsFunc(r.Ranges, func(rg Range) bool { return rg.contains(k) }) {
+			owned = append(owned, k)
+		}
+	}
 	start := s.n.cfg.Now()
 	fetched := map[TxnID]bool{}
 	s.mu.Lock()
@@ -768,12 +788,25 @@ func (s *store) ephemeralRead(ctx context.Context, r *ephemeralReq) (*ephemeralR
 	}
 	defer s.mu.Unlock()
 	reads := map[string][]byte{}
-	for _, k := range owned {
+	for _, k := range s.n.owned(r.Keys, 0) {
 		b, err := s.n.cfg.Data.Read(k, Timestamp{}, r.Txn)
 		if err != nil {
 			return nil, err
 		}
 		reads[keyString(k)] = b
+	}
+	if len(r.Ranges) > 0 {
+		rr, ok := s.n.cfg.Data.(RangeReader)
+		if !ok {
+			return nil, errors.New("accord: the data store cannot read ranges")
+		}
+		for _, rg := range r.Ranges {
+			b, err := rr.ReadRange(rg, r.Txn)
+			if err != nil {
+				return nil, err
+			}
+			reads[rg.String()] = b
+		}
 	}
 	return &ephemeralReply{Outcome: ok, Reads: reads}, nil
 }
@@ -838,4 +871,17 @@ func (s *store) missingLocked(ids []TxnID, keys []Key) bool {
 		go s.n.fetchOnce(id, slices.Clone(keys))
 	}
 	return missing
+}
+
+// parseKeyString inverts keyString.
+func parseKeyString(ks string) (Key, bool) {
+	i := strings.IndexByte(ks, '/')
+	if i < 0 {
+		return Key{}, false
+	}
+	tok, err := strconv.ParseInt(ks[:i], 10, 64)
+	if err != nil {
+		return Key{}, false
+	}
+	return Key{Token: tok, ID: ks[i+1:]}, true
 }

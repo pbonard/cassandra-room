@@ -214,3 +214,23 @@ func (d Deps) all() []TxnID {
 // Writes are a transaction's updates per key, to apply at its execution
 // timestamp.
 type Writes map[string][]byte
+
+// Range is the keys whose ID starts with Prefix (a table) and whose token
+// is in [Lo, Hi] (accord.primitives.Range, for range reads).
+type Range struct {
+	Prefix string `json:"p"`
+	Lo     int64  `json:"l"`
+	Hi     int64  `json:"h"`
+}
+
+func (r Range) contains(k Key) bool {
+	return strings.HasPrefix(k.ID, r.Prefix) && k.Token >= r.Lo && k.Token <= r.Hi
+}
+
+func (r Range) String() string { return fmt.Sprintf("%x[%d,%d]", r.Prefix, r.Lo, r.Hi) }
+
+// RangeShard is a sub-range and its replicas.
+type RangeShard struct {
+	Range
+	Nodes []NodeID
+}

@@ -655,6 +655,73 @@ func (p *parser) identList() ([]string, error) {
 // ---- terms ----
 
 func (p *parser) term() (Term, error) {
+	if p.txnVars != nil {
+		return p.additiveTerm()
+	}
+	return p.primaryTerm()
+}
+
+// additiveTerm parses an arithmetic expression of terms (Parser.g's
+// termAddition and termMultiplication), within transactions: + and -
+// below * / and %. A + followed by a plain column name is left alone (it is
+// the prepend form c = v + c).
+func (p *parser) additiveTerm() (Term, error) {
+	l, err := p.multiplicativeTerm()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		var op byte
+		var r Term
+		switch t := p.peek(); {
+		case (p.isPunct("+") || p.isPunct("-")) && !p.columnAt(1):
+			op = p.next().text[0]
+			if r, err = p.multiplicativeTerm(); err != nil {
+				return nil, err
+			}
+		case (t.kind == tInteger || t.kind == tFloat) && strings.HasPrefix(t.text, "-"):
+			// x - 1 lexes the minus into the number.
+			op = '+'
+			if r, err = p.multiplicativeTerm(); err != nil {
+				return nil, err
+			}
+		default:
+			return l, nil
+		}
+		l = &BinaryTerm{Op: op, Left: l, Right: r}
+	}
+}
+
+func (p *parser) multiplicativeTerm() (Term, error) {
+	l, err := p.primaryTerm()
+	if err != nil {
+		return nil, err
+	}
+	for p.isPunct("*") || p.isPunct("/") || p.isPunct("%") {
+		op := p.next().text[0]
+		r, err := p.primaryTerm()
+		if err != nil {
+			return nil, err
+		}
+		l = &BinaryTerm{Op: op, Left: l, Right: r}
+	}
+	return l, nil
+}
+
+// columnAt reports whether the token n ahead is a plain column name (not a
+// LET name, a function or a literal).
+func (p *parser) columnAt(n int) bool {
+	t := p.peekAt(n)
+	if t.kind != tIdent && t.kind != tQuoted {
+		return false
+	}
+	if t.kind == tIdent && (p.txnVars[t.text] || t.text == "null") {
+		return false
+	}
+	return !p.isPunctAt(n+1, "(") && !p.isPunctAt(n+1, ".")
+}
+
+func (p *parser) primaryTerm() (Term, error) {
 	t := p.peek()
 	switch t.kind {
 	case tString:
@@ -1964,9 +2031,7 @@ func (p *parser) txnConditions() ([]TxnCondition, error) {
 			if c.Right, err = p.term(); err != nil {
 				return nil, err
 			}
-			_, lref := c.Left.(*Reference)
-			_, rref := c.Right.(*Reference)
-			if !lref && !rref {
+			if !hasReference(c.Left) && !hasReference(c.Right) {
 				return nil, p.errorf("a transaction condition needs a LET reference")
 			}
 		}
@@ -1975,4 +2040,15 @@ func (p *parser) txnConditions() ([]TxnCondition, error) {
 			return out, nil
 		}
 	}
+}
+
+// hasReference reports whether a term contains a LET reference.
+func hasReference(t Term) bool {
+	switch t := t.(type) {
+	case *Reference:
+		return true
+	case *BinaryTerm:
+		return hasReference(t.Left) || hasReference(t.Right)
+	}
+	return false
 }

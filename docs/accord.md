@@ -128,9 +128,22 @@ names, not its class structure.
   - conditional statements and conditional batches, instead of Paxos;
   - plain writes and batches, as one transaction each (custom timestamps,
     and batches mixing transactional and other tables, are refused);
-  - single-partition reads at any consistency, as read transactions;
+  - single-partition reads at any consistency, as read transactions,
+    paged: each page is one transaction carrying the select's paging state;
   - reads of several partitions, which first run a read-only transaction
-    on each.
+    on each;
+  - range reads (`TxnRangeRead`, read ephemerally):
+    1. The range is split by the replica sets of the newest epoch.
+    2. For each sub-range in token order, a quorum of its replicas (in every
+       epoch not yet synchronised) reports the writes in it not yet applied
+       everywhere.
+    3. One replica reads the sub-range once those writes have applied there.
+
+    Each partition read reflects every write acknowledged before the read
+    started. The reads go sub-range by sub-range until the page is full, and
+    the paging state records the sub-range to resume from, its own paging
+    state, and what is left of the `LIMIT`. Aggregates and `GROUP BY` over
+    ranges use the ordinary read path.
 - **Transactions** (`txn.go`, `TransactionStatement`):
   `BEGIN TRANSACTION … COMMIT TRANSACTION` supports:
   - `LET` assignments of one row (the full primary key, or the partition
@@ -139,8 +152,11 @@ names, not its class structure.
   - `IF … THEN`, `ELSE IF … THEN`, `ELSE … END IF` blocks, with comparisons
     and `IS [NOT] NULL` on references;
   - references as update values;
+  - arithmetic (`+ - * / %`, with precedence) on references, literals and
+    bind markers, in values and conditions. Operand types come from the
+    references, and a null operand gives null;
   - `c += v` and `c -= v` on numeric columns (an implicit read of the
-    updated row);
+    updated row; a missing value counts as zero);
   - Cassandra's validation messages.
 
   In a cluster, the statement is one Accord transaction over every
@@ -184,8 +200,12 @@ names, not its class structure.
 
 ## Not done
 
-- **Ranges and sync points:** range transactions, and range reads of
-  transactional tables (they use the ordinary read path).
+- **Range transactions:** range reads are ephemeral, so they form a
+  per-partition snapshot, not one across the range. Range transactions
+  that commit (with range dependencies and sync points) aren't done; as in
+  Cassandra, transactions reject range reads.
+- **Range dependency lookup:** a replica answering a range read's
+  dependency request scans every key it indexes.
 - **Epoch synchronisation:** it is per node, not per range, and a node
   still on an old epoch holds it back for everyone.
 - **Write coverage after joins:** a write that a joining node missed while
@@ -193,5 +213,5 @@ names, not its class structure.
   fetches it, or by repair.
 - **Other optimisations:** per-shard command stores, journal segments
   (each command is one synced row), and `PrivilegedCoordinatorWithDeps`.
-- **Transaction features:** paging of transaction and Accord read results,
-  and arithmetic beyond `+=` / `-=` in transactions.
+- **Transaction results:** the result of a transaction is not paged (a
+  transaction executes once, as in Cassandra).

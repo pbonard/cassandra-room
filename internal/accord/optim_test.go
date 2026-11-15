@@ -179,3 +179,94 @@ func TestEpochSync(t *testing.T) {
 		require.Contains(t, vals, 3)
 	}
 }
+
+func (s *listStore) ReadRange(r Range, _ *Txn) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string][]int{}
+	for ks, l := range s.data {
+		k, _ := parseKeyString(ks)
+		if !r.contains(k) {
+			continue
+		}
+		for _, e := range l {
+			out[ks] = append(out[ks], e.Value)
+		}
+	}
+	return json.Marshal(out)
+}
+
+// TestRangeReads runs range reads during appends (with message loss): each
+// key a range read returns is a prefix of its history holding every append
+// acknowledged before the read started.
+func TestRangeReads(t *testing.T) {
+	c := newSimCluster(t, 5, 3, 8)
+	split := func(r Range) []RangeShard {
+		var out []RangeShard
+		for tok := max(r.Lo, 0); tok <= min(r.Hi, int64(len(c.keys)-1)); tok++ {
+			out = append(out, RangeShard{Range: Range{Prefix: r.Prefix, Lo: tok, Hi: tok}, Nodes: c.replicas(Key{Token: tok})})
+		}
+		return out
+	}
+	for _, id := range c.ids {
+		c.net.nodes[id].SetTopology(&Topology{Epoch: 1, Replicas: c.replicas, Nodes: c.ids, RangeReplicas: split})
+	}
+	c.net.drop = 0.02
+	type rangeRead struct {
+		start time.Time
+		vals  map[string][]int
+	}
+	var reads []rangeRead
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			start := time.Now()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			shards, out, err := c.node(int(start.UnixNano()%5)).ReadRange(ctx, Range{Lo: 0, Hi: 100}, &Txn{Kind: Read})
+			cancel()
+			if err != nil {
+				continue
+			}
+			vals := map[string][]int{}
+			for _, s := range shards {
+				var m map[string][]int
+				require.NoError(t, json.Unmarshal(out[s.Range.String()], &m))
+				for k, v := range m {
+					vals[k] = v
+				}
+			}
+			reads = append(reads, rangeRead{start, vals})
+		}
+	}()
+	records := c.run(6, 200, nil)
+	close(stop)
+	<-done
+	c.settle()
+	c.check(records)
+	require.NotEmpty(t, reads)
+	for _, rr := range reads {
+		for ks, vals := range rr.vals {
+			var hist []int
+			for _, e := range c.stores[c.replicas(func() Key { k, _ := parseKeyString(ks); return k }())[0]].data[ks] {
+				hist = append(hist, e.Value)
+			}
+			require.LessOrEqual(t, len(vals), len(hist))
+			require.Equal(t, hist[:len(vals)], vals, "a range read of %s sees a prefix", ks)
+		}
+		for _, o := range records {
+			if o.err == nil && o.end.Before(rr.start) {
+				for ks, v := range o.appends {
+					require.Contains(t, rr.vals[ks], v, "a range read sees the appends acknowledged before it")
+				}
+			}
+		}
+	}
+	t.Logf("%d range reads", len(reads))
+}

@@ -16,6 +16,9 @@ type Topology struct {
 	Pending func(Key) []NodeID
 	// Nodes are every node of the epoch (for epoch synchronisation).
 	Nodes []NodeID
+	// RangeReplicas, if set, splits a range into sub-ranges each owned by
+	// one replica set (for range reads).
+	RangeReplicas func(Range) []RangeShard
 }
 
 // Shard is a set of replicas and the keys of a transaction they own

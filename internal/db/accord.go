@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"math"
 	"slices"
 	"sync/atomic"
 	"time"
@@ -66,6 +67,16 @@ type accordUpdate struct {
 	Stmts  []accordStmt
 	Now    int64 // unix nanoseconds
 	NowSec int64
+	// Page and Paging page a read ("read", "range"): the page size and
+	// the select's paging state.
+	Page   int    `json:",omitempty"`
+	Paging []byte `json:",omitempty"`
+}
+
+// accordRows is a paged read's result.
+type accordRows struct {
+	Rows   message.RowSet
+	Paging []byte `json:",omitempty"`
 }
 
 type accordStmt struct {
@@ -169,6 +180,33 @@ func (p *proxy) accordTopology(s *Schema) {
 				out = append(out, n.Addr)
 			}
 			return out
+		},
+		RangeReplicas: func(r accord.Range) []accord.RangeShard {
+			if len(r.Prefix) < 8 {
+				return nil
+			}
+			t := s.byStorage[lsm.TableID(binary.BigEndian.Uint64([]byte(r.Prefix[:8])))]
+			if t == nil || s.Keyspaces[t.Keyspace] == nil || ring.Empty() {
+				return nil
+			}
+			repl := s.Keyspaces[t.Keyspace].Replication
+			var out []accord.RangeShard
+			for tok := r.Lo; ; {
+				end, wraps := ring.RangeEnd(tok)
+				if wraps {
+					end = math.MaxInt64
+				}
+				end = min(end, r.Hi)
+				sh := accord.RangeShard{Range: accord.Range{Prefix: r.Prefix, Lo: tok, Hi: end}}
+				for _, n := range ring.Replicas(repl, tok) {
+					sh.Nodes = append(sh.Nodes, n.Addr)
+				}
+				out = append(out, sh)
+				if end >= r.Hi {
+					return out
+				}
+				tok = end + 1
+			}
 		},
 		// Joining nodes receive every write while they bootstrap
 		// (pending replicas), so that the data they stream is not missing
@@ -305,7 +343,8 @@ func (d *DB) accordStatement(txn *accord.Txn) (statement, *execCtx, *accordUpdat
 	for i, v := range st.Values {
 		values[i] = &primitive.Value{Type: primitive.ValueType(v.T), Contents: v.V}
 	}
-	e := &execCtx{d: d, values: values, now: time.Unix(0, u.Now), nowSec: u.NowSec, cl: primitive.ConsistencyLevelOne, local: true, listSeq: new(uint32)}
+	e := &execCtx{d: d, values: values, now: time.Unix(0, u.Now), nowSec: u.NowSec, cl: primitive.ConsistencyLevelOne, local: true, listSeq: new(uint32),
+		page: u.Page, paging: u.Paging}
 	return ps.stmt, e, &u, nil
 }
 
@@ -371,11 +410,7 @@ func (a accordData) Read(k accord.Key, _ accord.Timestamp, txn *accord.Txn) ([]b
 			}
 			return json.Marshal(reads)
 		}
-		res, err := st.(*selectStmt).execute(e)
-		if err != nil {
-			return nil, err
-		}
-		return json.Marshal(res.(*message.RowsResult).Data)
+		return selectRows(st.(*selectStmt), e)
 	}
 	mods, _, err := a.d.accordMods(txn)
 	if err != nil {
@@ -559,7 +594,11 @@ func (p *proxy) accordRun(e *execCtx, mode string, keys []accord.Key, writes boo
 	if !writes {
 		kind = accord.Read
 	}
-	return p.accordCoordinate(&accordUpdate{Mode: mode, Stmts: []accordStmt{st}, Now: e.now.UnixNano(), NowSec: e.nowSec}, keys, kind)
+	u := &accordUpdate{Mode: mode, Stmts: []accordStmt{st}, Now: e.now.UnixNano(), NowSec: e.nowSec}
+	if mode == "read" {
+		u.Page, u.Paging = e.page, e.paging
+	}
+	return p.accordCoordinate(u, keys, kind)
 }
 
 func (p *proxy) accordCoordinate(u *accordUpdate, keys []accord.Key, kind accord.Kind) ([]byte, error) {
@@ -662,4 +701,132 @@ func (p *proxy) accordCAS(mods []boundModification, t *Table, pk []byte) (messag
 		return nil, err
 	}
 	return casResult(mods, res.Applied, res.Failed, res.Row), nil
+}
+
+// selectRows runs a select on this node's data and encodes its rows and
+// paging state.
+func selectRows(s *selectStmt, e *execCtx) ([]byte, error) {
+	res, err := s.execute(e)
+	if err != nil {
+		return nil, err
+	}
+	rows := res.(*message.RowsResult)
+	return json.Marshal(accordRows{Rows: rows.Data, Paging: rows.Metadata.PagingState})
+}
+
+// ReadRange reads a sub-range of a range read on this replica: the
+// select, restricted to the sub-range's tokens.
+func (a accordData) ReadRange(r accord.Range, txn *accord.Txn) ([]byte, error) {
+	st, e, _, err := a.d.accordStatement(txn)
+	if err != nil {
+		return nil, err
+	}
+	sel, ok := st.(*selectStmt)
+	if !ok {
+		return nil, errors.New("db: a range read of a statement that is not a SELECT")
+	}
+	e.tokenBounds = &[2]int64{r.Lo, r.Hi}
+	return selectRows(sel, e)
+}
+
+// accordRangePaging is the paging state of an Accord range read: the
+// token to resume from and the paging state of the sub-range read there.
+type accordRangePaging struct {
+	Token int64
+	Inner []byte `json:",omitempty"`
+	// Remaining is what is left of the LIMIT, if any.
+	Remaining int64 `json:",omitempty"`
+}
+
+// accordRangeMarker starts an Accord range read's paging state.
+const accordRangeMarker = 0xAC
+
+// accordRangeSelect runs a range read of a transactional table through
+// Accord: sub-range by sub-range in token order (each an ephemeral range
+// read: every write acknowledged before it is seen), until the page is
+// full.
+func (p *proxy) accordRangeSelect(s *selectStmt, e *execCtx) (message.Message, error) {
+	lo, hi, empty, err := s.where.tokenRange(e)
+	if err != nil {
+		return nil, err
+	}
+	md := s.metadata()
+	res := &message.RowsResult{Metadata: &message.RowsMetadata{ColumnCount: int32(len(md)), Columns: md}}
+	if empty {
+		return res, nil
+	}
+	var resume *accordRangePaging
+	if len(e.paging) > 0 {
+		if e.paging[0] != accordRangeMarker {
+			return nil, invalidf("Invalid value for the paging state")
+		}
+		resume = &accordRangePaging{}
+		if err := json.Unmarshal(e.paging[1:], resume); err != nil {
+			return nil, invalidf("Invalid value for the paging state")
+		}
+		lo = max(lo, resume.Token)
+	}
+	limit, hasLimit, err := bindInt(e, s.limit, "limit")
+	if err != nil {
+		return nil, err
+	}
+	if hasLimit && resume != nil {
+		limit = resume.Remaining
+	}
+	src, err := accordSource(e)
+	if err != nil {
+		return nil, err
+	}
+	prefix := string(binary.BigEndian.AppendUint64(nil, uint64(s.t.Storage)))
+	shards := p.accord.RangeShards(accord.Range{Prefix: prefix, Lo: lo, Hi: hi})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*p.opts.ReadTimeout)
+	defer cancel()
+	for _, sh := range shards {
+		want := 0
+		if e.page > 0 {
+			want = e.page - len(res.Data)
+		}
+		if hasLimit {
+			left := int(limit) - len(res.Data)
+			if want == 0 || left < want {
+				want = left
+			}
+		}
+		u := accordUpdate{Mode: "range", Stmts: []accordStmt{src}, Now: e.now.UnixNano(), NowSec: e.nowSec, Page: want}
+		if resume != nil && sh.Lo <= resume.Token {
+			u.Paging = resume.Inner
+		}
+		b, err := json.Marshal(u)
+		if err != nil {
+			return nil, err
+		}
+		subs, reads, err := p.accord.ReadRange(ctx, sh.Range, &accord.Txn{Kind: accord.Read, Update: b})
+		if err != nil {
+			return nil, &timeoutError{cl: e.cl}
+		}
+		for _, sub := range subs {
+			var rows accordRows
+			if err := json.Unmarshal(reads[sub.Range.String()], &rows); err != nil {
+				return nil, err
+			}
+			res.Data = append(res.Data, rows.Rows...)
+			full := e.page > 0 && len(res.Data) >= e.page
+			if hasLimit && int64(len(res.Data)) >= limit {
+				return res, nil
+			}
+			if len(rows.Paging) > 0 || full && sub.Hi < hi {
+				next := accordRangePaging{Token: sub.Lo, Inner: rows.Paging, Remaining: limit - int64(len(res.Data))}
+				if len(rows.Paging) == 0 {
+					next.Token = sub.Hi + 1
+				}
+				nb, _ := json.Marshal(next)
+				res.Metadata.PagingState = append([]byte{accordRangeMarker}, nb...)
+				return res, nil
+			}
+			if hasLimit && len(res.Data) >= int(limit) {
+				return res, nil
+			}
+		}
+	}
+	return res, nil
 }

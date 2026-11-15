@@ -176,6 +176,9 @@ type execCtx struct {
 	// src is the statement's text, for conditional statements run by
 	// Accord, which any node may have to execute again.
 	src *stmtSource
+	// tokenBounds, if set, restricts a range scan to [lo, hi] (a sub-range
+	// of an Accord range read).
+	tokenBounds *[2]int64
 	// txnRefs are the LET rows of a transaction being evaluated.
 	txnRefs map[string]map[string][]byte
 	// trace records the request's events, if traced.

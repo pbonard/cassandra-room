@@ -55,6 +55,35 @@ func TestTransactions(t *testing.T) {
 		SELECT l.note;
 	COMMIT TRANSACTION`))
 
+	// Arithmetic in values and conditions, with precedence.
+	s.ok("INSERT INTO ks.acct (id, balance, owner) VALUES (10, 7, 'x')")
+	require.Equal(t, []string{"7"}, s.rows(`BEGIN TRANSACTION
+		LET a = (SELECT balance FROM ks.acct WHERE id = 10);
+		SELECT a.balance;
+		IF a.balance * 2 + 1 = 15 AND a.balance - 1 > 5 AND 100 / a.balance = 14 THEN
+			UPDATE ks.acct SET balance = a.balance * 3 - ? WHERE id = 10;
+			INSERT INTO ks.acct (id, balance) VALUES (11, a.balance % 4 + 2 * 5);
+		END IF
+	COMMIT TRANSACTION`, 1))
+	require.ElementsMatch(t, []string{"10 20", "11 13"}, s.rows("SELECT id, balance FROM ks.acct WHERE id IN (10, 11)"))
+	// A null operand makes the result null; a missing row with += sets the
+	// value.
+	s.ok(`BEGIN TRANSACTION
+		LET m = (SELECT balance FROM ks.acct WHERE id = 99);
+		INSERT INTO ks.acct (id, balance) VALUES (12, m.balance + 1);
+		UPDATE ks.acct SET balance += 5 WHERE id = 13;
+	COMMIT TRANSACTION`)
+	require.ElementsMatch(t, []string{"12 null", "13 5"}, s.rows("SELECT id, balance FROM ks.acct WHERE id IN (12, 13)"))
+	s.fails(`BEGIN TRANSACTION LET a = (SELECT balance FROM ks.acct WHERE id = 10);
+		UPDATE ks.acct SET balance = a.balance / 0 WHERE id = 10; COMMIT TRANSACTION`, "divide by zero")
+	s.fails(`BEGIN TRANSACTION LET a = (SELECT owner FROM ks.acct WHERE id = 10);
+		UPDATE ks.acct SET balance = a.owner + 1 WHERE id = 10; COMMIT TRANSACTION`, "numeric")
+	// The prepend form is still a prepend.
+	s.ok("CREATE TABLE ks.lists (k int PRIMARY KEY, l list<int>) WITH transactional_mode = 'full'")
+	s.ok("INSERT INTO ks.lists (k, l) VALUES (1, [3])")
+	s.ok("BEGIN TRANSACTION UPDATE ks.lists SET l = [1, 2] + l WHERE k = 1; COMMIT TRANSACTION")
+	require.Equal(t, []string{"0x00000003000000040000000100000004000000020000000400000003"}, s.rows("SELECT l FROM ks.lists WHERE k = 1"), "[1, 2, 3]")
+
 	// TransactionStatement's validation.
 	s.fails("BEGIN TRANSACTION SELECT * FROM ks.plain WHERE k = 1; COMMIT TRANSACTION", "Accord transactions are disabled on table")
 	s.fails("BEGIN TRANSACTION LET l = (SELECT * FROM ks.log WHERE id = 1); SELECT l.note; COMMIT TRANSACTION", "SELECT must specify either all primary key elements")

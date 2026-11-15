@@ -27,6 +27,12 @@ type DataStore interface {
 	Apply(key Key, executeAt Timestamp, txn *Txn, write []byte) error
 }
 
+// RangeReader is implemented by DataStores that can read ranges.
+type RangeReader interface {
+	// ReadRange reads the keys of a range this node replicates.
+	ReadRange(r Range, txn *Txn) ([]byte, error)
+}
+
 // Agent computes a transaction's writes and result from what it read
 // (accord.api.Update and Query); it must be deterministic.
 type Agent interface {
@@ -373,9 +379,10 @@ type checkStatusReq struct {
 }
 
 type ephemeralReq struct {
-	Keys []Key
-	Deps Deps
-	Txn  *Txn
+	Keys   []Key
+	Ranges []Range `json:",omitempty"`
+	Deps   Deps
+	Txn    *Txn
 }
 
 type ephemeralReply struct {
@@ -452,7 +459,7 @@ func (n *Node) Handle(ctx context.Context, from NodeID, payload []byte) ([]byte,
 	case mEphemeralDeps:
 		var r ephemeralReq
 		if err = json.Unmarshal(env.B, &r); err == nil {
-			reply = n.s.ephemeralDeps(r.Keys)
+			reply = n.s.ephemeralDeps(r.Keys, r.Ranges)
 		}
 	case mEphemeralRead:
 		var r ephemeralReq

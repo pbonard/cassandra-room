@@ -978,3 +978,82 @@ func TestClusterAccordJoin(t *testing.T) {
 }
 
 func int32Bytes(i int) []byte { return binary.BigEndian.AppendUint32(nil, uint32(i)) }
+
+// TestClusterAccordReads pages single-partition and range reads of a
+// transactional table through Accord, while transactions move values
+// between partitions: every complete range read sees the total.
+func TestClusterAccordReads(t *testing.T) {
+	c := newTestCluster(t, 3)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
+	c.ok(0, quorum, "CREATE TABLE ks.acct (id int PRIMARY KEY, balance int) WITH transactional_mode = 'full'")
+	c.ok(0, quorum, "CREATE TABLE ks.rows (k int, c int, v int, PRIMARY KEY (k, c)) WITH transactional_mode = 'full'")
+	const accounts = 40
+	for i := 0; i < accounts; i++ {
+		c.ok(i%3, one, "INSERT INTO ks.acct (id, balance) VALUES (?, 10)", i)
+	}
+	for i := 0; i < 25; i++ {
+		c.ok(i%3, one, "INSERT INTO ks.rows (k, c, v) VALUES (1, ?, ?)", i, i)
+	}
+	pages := func(node int, q string, size int32) (rows [][][]byte, n int) {
+		var paging []byte
+		for {
+			p := mustPrepare(t, c.nodes[node], q)
+			res := c.nodes[node].Execute(p, &RequestOptions{Consistency: quorum, PageSize: size, PagingState: paging})
+			r, ok := res.(*message.RowsResult)
+			require.True(t, ok, "%v", res)
+			require.LessOrEqual(t, len(r.Data), int(size))
+			rows = append(rows, r.Data...)
+			n++
+			if len(r.Metadata.PagingState) == 0 {
+				return rows, n
+			}
+			paging = r.Metadata.PagingState
+		}
+	}
+	// A single partition in pages of 10.
+	rows, n := pages(1, "SELECT c FROM ks.rows WHERE k = 1", 10)
+	require.Len(t, rows, 25)
+	require.Equal(t, 3, n)
+	// Range reads in pages while transfers run.
+	transfer := `BEGIN TRANSACTION
+		LET src = (SELECT balance FROM ks.acct WHERE id = ?);
+		IF src.balance >= 1 THEN
+			UPDATE ks.acct SET balance -= 1 WHERE id = ?;
+			UPDATE ks.acct SET balance += 1 WHERE id = ?;
+		END IF
+	COMMIT TRANSACTION`
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := 0; w < 3; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				from, to := (w*7+i)%accounts, (w*7+i*3+1)%accounts
+				if from != to {
+					c.exec(w, quorum, transfer, from, from, to)
+				}
+			}
+		}()
+	}
+	for r := 0; r < 5; r++ {
+		rows, _ := pages(r%3, "SELECT id, balance FROM ks.acct", 7)
+		require.Len(t, rows, accounts, "every account once")
+	}
+	close(stop)
+	wg.Wait()
+	rows, _ = pages(2, "SELECT id, balance FROM ks.acct", 1000)
+	total := 0
+	for _, r := range rows {
+		total += int(int32(be32(r[1])))
+	}
+	require.Equal(t, accounts*10, total)
+	// LIMIT across sub-ranges.
+	rows, _ = pages(0, "SELECT id FROM ks.acct LIMIT 13", 5)
+	require.Len(t, rows, 13)
+}

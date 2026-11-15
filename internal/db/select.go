@@ -544,6 +544,10 @@ func (s *selectStmt) execute(e *execCtx) (message.Message, error) {
 		src = newVirtualSource(d, s.t)
 	} else {
 		serial := e.cl == primitive.ConsistencyLevelSerial || e.cl == primitive.ConsistencyLevelLocalSerial
+		if d.proxy != nil && !e.local && s.t.accordManaged() && !s.where.pkComplete() && e.src != nil && !s.aggregate && len(s.groupBy) == 0 {
+			// A range read of a transactional table: Accord range reads.
+			return d.proxy.accordRangeSelect(s, e)
+		}
 		if d.proxy != nil && !e.local && s.t.accordManaged() && s.where.pkComplete() {
 			// transactional_mode 'full': a single-partition read is an Accord
 			// read transaction (executed by a replica once every earlier
@@ -559,12 +563,15 @@ func (s *selectStmt) execute(e *execCtx) (message.Message, error) {
 				if err != nil {
 					return nil, err
 				}
-				var rows message.RowSet
+				var rows accordRows
 				if err := json.Unmarshal(out, &rows); err != nil {
 					return nil, err
 				}
 				md := s.metadata()
-				return &message.RowsResult{Metadata: &message.RowsMetadata{ColumnCount: int32(len(md)), Columns: md}, Data: rows}, nil
+				res := &message.RowsResult{Metadata: &message.RowsMetadata{ColumnCount: int32(len(md)), Columns: md, PagingState: rows.Paging}, Data: rows.Rows}
+				if len(rows.Paging) > 0 {
+				}
+				return res, nil
 			}
 			for _, k := range keys {
 				if err := d.proxy.accordBarrierKey(k); err != nil {
@@ -731,6 +738,10 @@ func (q *query) scan() error {
 	lo, hi, empty, err := q.s.where.tokenRange(q.e)
 	if err != nil {
 		return err
+	}
+	if b := q.e.tokenBounds; b != nil {
+		lo, hi = max(lo, b[0]), min(hi, b[1])
+		empty = empty || lo > hi
 	}
 	if empty {
 		q.exhausted = true
