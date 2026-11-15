@@ -17,8 +17,8 @@ import (
 // transformation planned on a copy of the current metadata. On a single
 // node the result is installed directly; in a cluster it is committed as
 // the next epoch through the Cluster Metadata Service, which installs it
-// on every node in epoch order. Installing a metadata snapshot is the only
-// place with side effects: storage is created for new tables and indexes,
+// on every node in epoch order, as an entry holding only the change (see
+// metalog.go). Installing metadata is the only place with side effects: storage is created for new tables and indexes,
 // storage of dropped ones is removed, new indexes are built.
 
 // maxLog is how many changes the metadata log keeps.
@@ -63,7 +63,7 @@ func (d *DB) change(kind string, plan func(next *Schema) (message.Message, bool,
 	var res message.Message
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_, err := d.proxy.cms.Commit(ctx, func(cur []byte, id string) ([]byte, error) {
+	epoch, err := d.proxy.cms.Commit(ctx, func(cur []byte, id string) ([]byte, error) {
 		next, _, err := parseSchemaFile(cur)
 		if err != nil {
 			return nil, err
@@ -79,7 +79,7 @@ func (d *DB) change(kind string, plan func(next *Schema) (message.Message, bool,
 		next.Epoch++
 		log(next, id, r)
 		next.finish()
-		return metadataBytes(next), nil
+		return diffMetadata(cur, next)
 	})
 	if errors.Is(err, errNoChange) {
 		return res, nil
@@ -87,23 +87,8 @@ func (d *DB) change(kind string, plan func(next *Schema) (message.Message, bool,
 	if err != nil {
 		return nil, err
 	}
-	d.proxy.disseminate()
+	d.proxy.disseminate(epoch)
 	return res, nil
-}
-
-// installBytes installs a metadata snapshot received from the cluster, if
-// it is newer than the current one.
-func (d *DB) installBytes(b []byte) error {
-	next, _, err := parseSchemaFile(b)
-	if err != nil {
-		return err
-	}
-	d.ddlMu.Lock()
-	defer d.ddlMu.Unlock()
-	if next.Epoch <= d.schema.Load().Epoch {
-		return nil
-	}
-	return d.installLocked(next)
 }
 
 // installLocked makes next the current metadata (holding ddlMu).
@@ -144,12 +129,6 @@ func (d *DB) installLocked(next *Schema) error {
 		d.proxy.metadataChanged(next)
 	}
 	return nil
-}
-
-// currentMetadata returns the epoch and snapshot of the metadata.
-func (d *DB) currentMetadata() (int64, []byte) {
-	s := d.schema.Load()
-	return s.Epoch, metadataBytes(s)
 }
 
 // metadataInfo is the CMS's view of a snapshot: its epoch, and whether it

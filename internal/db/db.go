@@ -94,6 +94,9 @@ type DB struct {
 	// cluster's coordinator.
 	store storage
 	proxy *proxy
+	// metaLog holds the recent entries of the metadata log, in a
+	// cluster (guarded by ddlMu).
+	metaLog []cluster.Entry
 }
 
 // localState is persisted with the schema.

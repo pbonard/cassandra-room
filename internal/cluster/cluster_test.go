@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -148,92 +149,257 @@ func TestSuspicionTimeout(t *testing.T) {
 	require.Less(t, at.Sub(start), 300*time.Millisecond, "k confirmations bring the timeout to min")
 }
 
-// TestCMS commits concurrent changes from every node: each epoch holds one
-// change, none is lost, and every node ends with the same metadata.
-func TestCMS(t *testing.T) {
-	type meta struct {
-		Epoch int64
-		Items []string
-		IDs   []string
+// memStore is a Store for tests: the metadata is a list of items, each
+// entry adds one (and may set the members).
+type memStore struct {
+	mu      sync.Mutex
+	meta    memMeta
+	log     []Entry
+	members []string
+}
+
+type memMeta struct {
+	Epoch   int64
+	Items   []string
+	IDs     []string
+	Members []string `json:",omitempty"`
+}
+
+type memEntry struct {
+	Item, ID string
+	Members  []string `json:",omitempty"`
+}
+
+func (s *memStore) Current() (int64, []byte, []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, _ := json.Marshal(s.meta)
+	members := s.meta.Members
+	if len(members) == 0 {
+		members = s.members
 	}
+	return s.meta.Epoch, b, members
+}
+
+func (s *memStore) Contains(meta []byte, id string) (bool, error) {
+	var m memMeta
+	err := json.Unmarshal(meta, &m)
+	return slices.Contains(m.IDs, id), err
+}
+
+func (s *memStore) Append(e Entry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case e.Epoch <= s.meta.Epoch:
+		return nil
+	case e.Epoch > s.meta.Epoch+1:
+		return ErrGap
+	}
+	var x memEntry
+	if err := json.Unmarshal(e.Value, &x); err != nil {
+		return err
+	}
+	s.meta.Epoch = e.Epoch
+	s.meta.Items = append(s.meta.Items, x.Item)
+	s.meta.IDs = append(s.meta.IDs, x.ID)
+	if x.Members != nil {
+		s.meta.Members = x.Members
+	}
+	s.log = append(s.log, e)
+	return nil
+}
+
+func (s *memStore) Since(epoch int64) ([]Entry, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if epoch >= s.meta.Epoch {
+		return nil, true
+	}
+	for i, e := range s.log {
+		if e.Epoch == epoch+1 {
+			return slices.Clone(s.log[i:]), true
+		}
+	}
+	return nil, false
+}
+
+func (s *memStore) Snapshot(b []byte) error {
+	var m memMeta
+	if err := json.Unmarshal(b, &m); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if m.Epoch > s.meta.Epoch {
+		s.meta, s.log = m, nil
+	}
+	return nil
+}
+
+func (s *memStore) items() (int64, []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.meta.Epoch, slices.Clone(s.meta.Items)
+}
+
+func addItem(item string, members []string) func([]byte, string) ([]byte, error) {
+	return func(_ []byte, id string) ([]byte, error) {
+		return json.Marshal(memEntry{Item: item, ID: id, Members: members})
+	}
+}
+
+func startCMS(t *testing.T, n int) ([]*Messaging, []*memStore, []*CMS) {
 	var ms []*Messaging
-	for i := 0; i < 3; i++ {
+	var members []string
+	for i := 0; i < n; i++ {
 		m, err := NewMessaging("127.0.0.1:0")
 		require.NoError(t, err)
 		ms = append(ms, m)
-	}
-	var members []string
-	for _, m := range ms {
 		members = append(members, m.Addr())
 	}
-	state := make([][]byte, 3)
-	var mus [3]sync.Mutex
+	var stores []*memStore
 	var cmss []*CMS
-	for i, m := range ms {
-		state[i], _ = json.Marshal(meta{})
-		cmss = append(cmss, NewCMS(m, func() []string { return members }, func() (int64, []byte) {
-			mus[i].Lock()
-			defer mus[i].Unlock()
-			var x meta
-			_ = json.Unmarshal(state[i], &x)
-			return x.Epoch, state[i]
-		}, func(b []byte) error {
-			var x, cur meta
-			if err := json.Unmarshal(b, &x); err != nil {
-				return err
-			}
-			mus[i].Lock()
-			defer mus[i].Unlock()
-			_ = json.Unmarshal(state[i], &cur)
-			if x.Epoch > cur.Epoch {
-				state[i] = b
-			}
-			return nil
-		}, func(b []byte, id string) (int64, bool, error) {
-			var x meta
-			err := json.Unmarshal(b, &x)
-			for _, y := range x.IDs {
-				if y == id {
-					return x.Epoch, true, err
-				}
-			}
-			return x.Epoch, false, err
-		}))
+	for _, m := range ms {
+		s := &memStore{members: members}
+		stores = append(stores, s)
+		cmss = append(cmss, NewCMS(m, s))
 		m.Start()
 	}
+	t.Cleanup(func() {
+		for _, m := range ms {
+			m.Close()
+		}
+	})
+	return ms, stores, cmss
+}
+
+// TestCMS commits concurrent changes from every node: each epoch holds one
+// change, none is lost, and every node ends with the same metadata.
+func TestCMS(t *testing.T) {
+	_, stores, cmss := startCMS(t, 3)
 	var wg sync.WaitGroup
 	for i := 0; i < 3; i++ {
 		for j := 0; j < 10; j++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				_, err := cmss[i].Commit(context.Background(), func(cur []byte, id string) ([]byte, error) {
-					var x meta
-					_ = json.Unmarshal(cur, &x)
-					x.Epoch++
-					x.Items = append(x.Items, fmt.Sprintf("%d-%d", i, j))
-					x.IDs = append(x.IDs, id)
-					return json.Marshal(x)
-				})
+				_, err := cmss[i].Commit(context.Background(), addItem(fmt.Sprintf("%d-%d", i, j), nil))
 				require.NoError(t, err)
 			}()
 		}
 	}
 	wg.Wait()
 	require.Eventually(t, func() bool {
-		for i := range ms {
-			_, b := cmss[i].current()
-			var x meta
-			_ = json.Unmarshal(b, &x)
-			if x.Epoch != 30 || len(x.Items) != 30 {
-				t.Logf("node %d: epoch %d items %d", i, x.Epoch, len(x.Items))
+		_, want := stores[0].items()
+		for i := range stores {
+			e, items := stores[i].items()
+			if e != 30 || len(items) != 30 || !slices.Equal(items, want) {
+				t.Logf("node %d: epoch %d items %d", i, e, len(items))
 				return false
 			}
 		}
 		return true
 	}, 5*time.Second, 10*time.Millisecond)
-	for _, m := range ms {
-		m.Close()
+}
+
+// TestCMSCatchUp checks that a node that missed entries replays them from
+// a peer's log, and falls back to a snapshot when the log does not reach.
+func TestCMSCatchUp(t *testing.T) {
+	_, stores, cmss := startCMS(t, 3)
+	for i := 0; i < 5; i++ {
+		_, err := cmss[0].Commit(context.Background(), addItem(fmt.Sprint(i), nil))
+		require.NoError(t, err)
+	}
+	require.Eventually(t, func() bool { e, _ := stores[2].items(); return e == 5 }, 5*time.Second, 10*time.Millisecond)
+
+	// A node that lost its state replays the log from epoch 0.
+	late := &memStore{members: stores[0].members}
+	m, err := NewMessaging("127.0.0.1:0")
+	require.NoError(t, err)
+	defer m.Close()
+	c := NewCMS(m, late)
+	m.Start()
+	require.NoError(t, c.CatchUp(cmss[1].self))
+	e, items := late.items()
+	require.Equal(t, int64(5), e)
+	require.Equal(t, []string{"0", "1", "2", "3", "4"}, items)
+	require.Len(t, late.log, 5, "replayed entry by entry")
+
+	// When the peer's log no longer reaches back, a snapshot.
+	stores[1].mu.Lock()
+	stores[1].log = stores[1].log[3:]
+	stores[1].mu.Unlock()
+	fresh := &memStore{members: stores[0].members}
+	m2, err := NewMessaging("127.0.0.1:0")
+	require.NoError(t, err)
+	defer m2.Close()
+	c2 := NewCMS(m2, fresh)
+	m2.Start()
+	require.NoError(t, c2.CatchUp(cmss[1].self))
+	e, items = fresh.items()
+	require.Equal(t, int64(5), e)
+	require.Len(t, items, 5)
+	require.Empty(t, fresh.log)
+
+	// Sync makes a node catch up from the asking one.
+	_, err = cmss[0].Commit(context.Background(), addItem("5", nil))
+	require.NoError(t, err)
+	got, err := cmss[0].Sync(context.Background(), m.Addr())
+	require.NoError(t, err)
+	require.Equal(t, int64(6), got)
+}
+
+// TestCMSMembersFollowEpochs commits while the members change: every epoch
+// is decided by the members recorded at the epoch before, so nodes never
+// disagree on an epoch.
+func TestCMSMembersFollowEpochs(t *testing.T) {
+	ms, stores, cmss := startCMS(t, 5)
+	addrs := func(idx ...int) []string {
+		var out []string
+		for _, i := range idx {
+			out = append(out, ms[i].Addr())
+		}
+		return out
+	}
+	// Start with members 0-2.
+	_, err := cmss[0].Commit(context.Background(), addItem("init", addrs(0, 1, 2)))
+	require.NoError(t, err)
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := range cmss {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; ; j++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_, err := cmss[i].Commit(ctx, addItem(fmt.Sprintf("%d-%d", i, j), nil))
+				cancel()
+				require.NoError(t, err)
+			}
+		}()
+	}
+	// Move the members one at a time to 2-4, and back.
+	for _, set := range [][]int{{0, 1, 2, 3}, {1, 2, 3}, {1, 2, 3, 4}, {2, 3, 4}, {0, 2, 3, 4}, {0, 1, 2}} {
+		_, err := cmss[2].Commit(context.Background(), addItem(fmt.Sprint(set), addrs(set...)))
+		require.NoError(t, err)
+	}
+	close(stop)
+	wg.Wait()
+	for _, c := range cmss {
+		for _, mb := range ms {
+			_ = c.CatchUp(mb.Addr())
+		}
+	}
+	_, want := stores[0].items()
+	for i := range stores {
+		_, items := stores[i].items()
+		require.Equal(t, want, items, "node %d", i)
 	}
 }
 
@@ -283,9 +449,8 @@ func TestCMSPersistence(t *testing.T) {
 	m, err := NewMessaging("127.0.0.1:0")
 	require.NoError(t, err)
 	defer m.Close()
-	cur := func() (int64, []byte) { return 0, []byte("{}") }
 	var saved []byte
-	c := NewCMS(m, func() []string { return []string{m.Addr()} }, cur, func([]byte) error { return nil }, func([]byte, string) (int64, bool, error) { return 0, false, nil })
+	c := NewCMS(m, &memStore{members: []string{m.Addr()}})
 	require.NoError(t, c.SetPersistence(nil, func(b []byte) error { saved = b; return nil }))
 	prepare := func(c *CMS, round int64) bool {
 		b, _ := json.Marshal(paxosReq{Epoch: 1, Ballot: ballot{Round: round, Node: "x"}})
@@ -297,7 +462,7 @@ func TestCMSPersistence(t *testing.T) {
 	}
 	require.True(t, prepare(c, 10))
 	require.NotEmpty(t, saved)
-	restarted := NewCMS(m, func() []string { return []string{m.Addr()} }, cur, func([]byte) error { return nil }, func([]byte, string) (int64, bool, error) { return 0, false, nil })
+	restarted := NewCMS(m, &memStore{members: []string{m.Addr()}})
 	require.NoError(t, restarted.SetPersistence(saved, func(b []byte) error { saved = b; return nil }))
 	require.False(t, prepare(restarted, 5), "a lower ballot than the one promised before the restart")
 	require.True(t, prepare(restarted, 11))
