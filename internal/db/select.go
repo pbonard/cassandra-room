@@ -544,7 +544,7 @@ func (s *selectStmt) execute(e *execCtx) (message.Message, error) {
 		src = newVirtualSource(d, s.t)
 	} else {
 		serial := e.cl == primitive.ConsistencyLevelSerial || e.cl == primitive.ConsistencyLevelLocalSerial
-		if d.proxy != nil && !e.local && s.t.accordManaged() && !s.where.pkComplete() && e.src != nil && !s.aggregate && len(s.groupBy) == 0 {
+		if d.proxy != nil && !e.local && s.t.accordManaged() && !s.where.pkComplete() && e.src != nil && !(s.json && (s.aggregate || len(s.groupBy) > 0)) {
 			// A range read of a transactional table: Accord range reads.
 			return d.proxy.accordRangeSelect(s, e)
 		}
@@ -1325,6 +1325,15 @@ func (q *query) result() (message.Message, error) {
 		q.agg = nil
 	}
 	if q.agg != nil {
+		if q.e.aggPartial {
+			// A sub-range of an Accord range read: the partial state, merged
+			// by the coordinator.
+			b, err := json.Marshal(q.agg.partial())
+			if err != nil {
+				return nil, err
+			}
+			return &message.RowsResult{Metadata: md, Data: message.RowSet{{b}}}, nil
+		}
 		row, err := q.agg.result(q)
 		if err != nil {
 			return nil, err

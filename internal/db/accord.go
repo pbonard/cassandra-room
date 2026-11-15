@@ -71,6 +71,8 @@ type accordUpdate struct {
 	// the select's paging state.
 	Page   int    `json:",omitempty"`
 	Paging []byte `json:",omitempty"`
+	// AggPartial asks a range read's sub-ranges for partial aggregates.
+	AggPartial bool `json:",omitempty"`
 }
 
 // accordRows is a paged read's result.
@@ -726,6 +728,9 @@ func (a accordData) ReadRange(r accord.Range, txn *accord.Txn) ([]byte, error) {
 		return nil, errors.New("db: a range read of a statement that is not a SELECT")
 	}
 	e.tokenBounds = &[2]int64{r.Lo, r.Hi}
+	var u struct{ AggPartial bool }
+	_ = json.Unmarshal(txn.Update, &u)
+	e.aggPartial = u.AggPartial
 	return selectRows(sel, e)
 }
 
@@ -777,6 +782,17 @@ func (p *proxy) accordRangeSelect(s *selectStmt, e *execCtx) (message.Message, e
 	if err != nil {
 		return nil, err
 	}
+	partial := s.aggregate && len(s.groupBy) == 0
+	if s.aggregate || len(s.groupBy) > 0 {
+		// Aggregates are not paged: GROUP BY groups (which hold whole
+		// partitions) come complete from each sub-range; a plain aggregate's
+		// partial states are merged.
+		e.page, resume = 0, nil
+	}
+	var agg *aggState
+	if partial {
+		agg = newAggState(s.sels)
+	}
 	prefix := string(binary.BigEndian.AppendUint64(nil, uint64(s.t.Storage)))
 	shards := p.accord.RangeShards(accord.Range{Prefix: prefix, Lo: lo, Hi: hi})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*p.opts.ReadTimeout)
@@ -792,7 +808,7 @@ func (p *proxy) accordRangeSelect(s *selectStmt, e *execCtx) (message.Message, e
 				want = left
 			}
 		}
-		u := accordUpdate{Mode: "range", Stmts: []accordStmt{src}, Now: e.now.UnixNano(), NowSec: e.nowSec, Page: want}
+		u := accordUpdate{Mode: "range", Stmts: []accordStmt{src}, Now: e.now.UnixNano(), NowSec: e.nowSec, Page: want, AggPartial: partial}
 		if resume != nil && sh.Lo <= resume.Token {
 			u.Paging = resume.Inner
 		}
@@ -808,6 +824,16 @@ func (p *proxy) accordRangeSelect(s *selectStmt, e *execCtx) (message.Message, e
 			var rows accordRows
 			if err := json.Unmarshal(reads[sub.Range.String()], &rows); err != nil {
 				return nil, err
+			}
+			if partial {
+				var p aggPartial
+				if len(rows.Rows) != 1 || json.Unmarshal(rows.Rows[0][0], &p) != nil {
+					return nil, errors.New("db: bad partial aggregate")
+				}
+				if err := agg.merge(p); err != nil {
+					return nil, err
+				}
+				continue
 			}
 			res.Data = append(res.Data, rows.Rows...)
 			full := e.page > 0 && len(res.Data) >= e.page
@@ -827,6 +853,13 @@ func (p *proxy) accordRangeSelect(s *selectStmt, e *execCtx) (message.Message, e
 				return res, nil
 			}
 		}
+	}
+	if partial {
+		row, err := agg.result(nil)
+		if err != nil {
+			return nil, err
+		}
+		res.Data = message.RowSet{row}
 	}
 	return res, nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -106,10 +107,12 @@ type cfk struct {
 // store is a node's command store (accord.local.CommandStore): every
 // handler runs under its lock.
 type store struct {
-	n       *Node
-	mu      sync.Mutex
-	cmds    map[TxnID]*command
-	keys    map[string]*cfk
+	n    *Node
+	mu   sync.Mutex
+	cmds map[TxnID]*command
+	keys map[string]*cfk
+	// sorted indexes the keys in token order, for range reads.
+	sorted  []*cfk
 	waiters map[TxnID][]TxnID
 	appends int
 }
@@ -174,6 +177,8 @@ func (s *store) registerLocked(c *command, keys []Key) {
 		if f == nil {
 			f = &cfk{key: k}
 			s.keys[ks] = f
+			i, _ := slices.BinarySearchFunc(s.sorted, k, func(c *cfk, k Key) int { return c.key.Compare(k) })
+			s.sorted = slices.Insert(s.sorted, i, f)
 		}
 		i, found := slices.BinarySearchFunc(f.ids, c.ID, TxnID.Compare)
 		if !found {
@@ -701,10 +706,11 @@ func (s *store) ephemeralDeps(keys []Key, ranges []Range) *ephemeralReply {
 			fs = append(fs, f)
 		}
 	}
-	if len(ranges) > 0 {
-		// Every key this replica indexes in the ranges.
-		for _, f := range s.keys {
-			if slices.ContainsFunc(ranges, func(r Range) bool { return r.contains(f.key) }) {
+	for _, r := range ranges {
+		// The keys this replica indexes in the range, by token.
+		i := sort.Search(len(s.sorted), func(i int) bool { return s.sorted[i].key.Token >= r.Lo })
+		for ; i < len(s.sorted) && s.sorted[i].key.Token <= r.Hi; i++ {
+			if f := s.sorted[i]; r.contains(f.key) {
 				fs = append(fs, f)
 			}
 		}

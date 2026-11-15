@@ -3,6 +3,7 @@ package accord
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"testing"
 	"time"
 
@@ -269,4 +270,26 @@ func TestRangeReads(t *testing.T) {
 		}
 	}
 	t.Logf("%d range reads", len(reads))
+}
+
+// TestRangeIndex checks that a range's dependencies come from the sorted
+// key index: only the keys in the range, whatever the table prefix.
+func TestRangeIndex(t *testing.T) {
+	n, err := NewNode(Config{ID: "n0", Data: &listStore{data: map[string][]entry{}}, Agent: listAgent{}})
+	require.NoError(t, err)
+	n.SetTopology(&Topology{Epoch: 1, Replicas: func(Key) []NodeID { return []NodeID{"n0"} }})
+	for tok := int64(-50); tok < 50; tok++ {
+		for _, prefix := range []string{"a", "b"} {
+			_, err := n.s.preAccept(&preAcceptReq{ID: n.newTxnID(Write), Txn: &Txn{Keys: []Key{{Token: tok, ID: prefix + "k"}}}})
+			require.NoError(t, err)
+		}
+	}
+	d := n.s.ephemeralDeps(nil, []Range{{Prefix: "a", Lo: -3, Hi: 4}}).Deps
+	require.Len(t, d, 8)
+	for ks := range d {
+		k, ok := parseKeyString(ks)
+		require.True(t, ok)
+		require.True(t, k.Token >= -3 && k.Token <= 4 && k.ID == "ak", ks)
+	}
+	require.True(t, slices.IsSortedFunc(n.s.sorted, func(a, b *cfk) int { return a.key.Compare(b.key) }))
 }

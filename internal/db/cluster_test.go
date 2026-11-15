@@ -1056,4 +1056,29 @@ func TestClusterAccordReads(t *testing.T) {
 	// LIMIT across sub-ranges.
 	rows, _ = pages(0, "SELECT id FROM ks.acct LIMIT 13", 5)
 	require.Len(t, rows, 13)
+
+	// Aggregates over the range: partial states merged across sub-ranges.
+	rows, _ = pages(1, "SELECT sum(balance), count(*), avg(balance), min(id), max(id) FROM ks.acct", 5)
+	require.Len(t, rows, 1)
+	require.Equal(t, accounts*10, int(int32(be32(rows[0][0]))))
+	require.Equal(t, uint64(accounts), binary.BigEndian.Uint64(rows[0][1]))
+	require.Equal(t, 10, int(int32(be32(rows[0][2]))))
+	require.Equal(t, 0, int(int32(be32(rows[0][3]))))
+	require.Equal(t, accounts-1, int(int32(be32(rows[0][4]))))
+	// GROUP BY partition over the range: one row per partition.
+	for k := 2; k <= 6; k++ {
+		for ck := 0; ck < k; ck++ {
+			c.ok(k%3, one, "INSERT INTO ks.rows (k, c, v) VALUES (?, ?, ?)", k, ck, 1)
+		}
+	}
+	rows, _ = pages(2, "SELECT k, count(*) FROM ks.rows GROUP BY k", 100)
+	got := map[int]uint64{}
+	for _, r := range rows {
+		got[int(int32(be32(r[0])))] = binary.BigEndian.Uint64(r[1])
+	}
+	require.Equal(t, map[int]uint64{1: 25, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6}, got)
+	rows, _ = pages(2, "SELECT k, count(*) FROM ks.rows GROUP BY k LIMIT 4", 100)
+	require.Len(t, rows, 4)
+	rows, _ = pages(0, "SELECT count(*) FROM ks.rows", 3)
+	require.Equal(t, uint64(25+2+3+4+5+6), binary.BigEndian.Uint64(rows[0][0]))
 }

@@ -139,11 +139,20 @@ names, not its class structure.
        everywhere.
     3. One replica reads the sub-range once those writes have applied there.
 
+    Replicas keep the keys they index in token order, so a range's pending
+    writes are found by binary search, not by scanning every key.
+
     Each partition read reflects every write acknowledged before the read
     started. The reads go sub-range by sub-range until the page is full, and
     the paging state records the sub-range to resume from, its own paging
-    state, and what is left of the `LIMIT`. Aggregates and `GROUP BY` over
-    ranges use the ordinary read path.
+    state, and what is left of the `LIMIT`.
+
+    Aggregates and `GROUP BY` over ranges:
+    - **`GROUP BY`:** groups always hold whole partitions, so each sub-range
+      returns complete groups, and the `LIMIT` is applied across them.
+    - **Plain aggregates:** each sub-range returns its partial state (count,
+      sum, min and max, first values), which the coordinator merges.
+      `avg` is merged as a sum and a count.
 - **Transactions** (`txn.go`, `TransactionStatement`):
   `BEGIN TRANSACTION … COMMIT TRANSACTION` supports:
   - `LET` assignments of one row (the full primary key, or the partition
@@ -204,8 +213,6 @@ names, not its class structure.
   per-partition snapshot, not one across the range. Range transactions
   that commit (with range dependencies and sync points) aren't done; as in
   Cassandra, transactions reject range reads.
-- **Range dependency lookup:** a replica answering a range read's
-  dependency request scans every key it indexes.
 - **Epoch synchronisation:** it is per node, not per range, and a node
   still on an old epoch holds it back for everyone.
 - **Write coverage after joins:** a write that a joining node missed while

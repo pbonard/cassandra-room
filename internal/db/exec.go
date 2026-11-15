@@ -176,6 +176,9 @@ type execCtx struct {
 	// src is the statement's text, for conditional statements run by
 	// Accord, which any node may have to execute again.
 	src *stmtSource
+	// aggPartial makes an aggregate return its partial state (a sub-range
+	// of an Accord range read).
+	aggPartial bool
 	// tokenBounds, if set, restricts a range scan to [lo, hi] (a sub-range
 	// of an Accord range read).
 	tokenBounds *[2]int64
