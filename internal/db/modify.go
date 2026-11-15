@@ -489,11 +489,6 @@ func (m *modification) addMutations(e *execCtx, b *mutation) error {
 	put := func(key []byte, r *row.Row) {
 		buf = row.Append(buf[:0], r)
 		b.put(t.Storage, key, buf, tokenOf(key))
-		if len(t.Indexes) > 0 && len(r.Cells) > 0 { // rows, and the static row
-			if err := t.addEntries(b, key, r.Cells, e.nowSec); err != nil {
-				panic(err) // values were validated
-			}
-		}
 	}
 	for _, pk := range pks {
 		p := partitionPrefix(pk)

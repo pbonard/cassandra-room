@@ -164,8 +164,6 @@ type execCtx struct {
 	counterDeltas bool
 	// local restricts reads to this node (replica-side reads).
 	local bool
-	// tokenRange restricts a scattered index query to (lo, hi].
-	tokenRange *[2]int64
 	// trace records the request's events, if traced.
 	trace *Trace
 }
@@ -206,11 +204,8 @@ type RequestOptions struct {
 	// the Paxos one of conditional updates (SERIAL if unset).
 	Consistency       primitive.ConsistencyLevel
 	SerialConsistency primitive.ConsistencyLevel
-	// forwarded marks a statement another node sent to run here; local
-	// restricts its reads to this node, tokenRange an index query to the
-	// tokens (lo, hi].
-	forwarded, local bool
-	tokenRange       *[2]int64
+	// local restricts the statement's reads to this node.
+	local bool
 }
 
 // OptionsOf converts protocol query options.
@@ -230,7 +225,7 @@ func OptionsOf(o *message.QueryOptions, v primitive.ProtocolVersion) *RequestOpt
 }
 
 func (d *DB) newCtx(o *RequestOptions, st *prepState) (*execCtx, error) {
-	e := &execCtx{d: d, now: d.opts.Now(), page: int(o.PageSize), paging: o.PagingState, noMeta: o.SkipMeta, version: o.Version, user: o.User, cl: o.Consistency, serial: o.SerialConsistency, local: o.local, tokenRange: o.tokenRange, trace: o.Trace}
+	e := &execCtx{d: d, now: d.opts.Now(), page: int(o.PageSize), paging: o.PagingState, noMeta: o.SkipMeta, version: o.Version, user: o.User, cl: o.Consistency, serial: o.SerialConsistency, local: o.local, trace: o.Trace}
 	e.nowSec = e.now.Unix()
 	if o.NowInSec != nil {
 		e.nowSec = int64(*o.NowInSec)
@@ -288,16 +283,6 @@ func (d *DB) Execute(p *Prepared, o *RequestOptions) message.Message {
 	for _, need := range st.required(p.Keyspace) {
 		if err := d.authorize(o.User, need[0], need[1]); err != nil {
 			return ErrorMessage(err)
-		}
-	}
-	if d.proxy != nil && !o.forwarded {
-		if to := d.proxy.route(st, e); to != "" {
-			vals, null, unset := packValues(e.values)
-			return d.proxy.forward(to, &forwarded{Keyspace: p.Keyspace, Query: p.Query, Values: vals, Null: null, Unset: unset,
-				CL: uint16(o.Consistency), Timestamp: o.Timestamp, NowInSec: o.NowInSec, User: o.User})
-		}
-		if sel, ok := st.stmt.(*selectStmt); ok && (sel.index != nil || sel.annIndex() != nil) {
-			return d.proxy.scatter(p, e, o)
 		}
 	}
 	res, err := st.stmt.execute(e)

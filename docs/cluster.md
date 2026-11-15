@@ -127,13 +127,6 @@ node, the coordinator in a cluster.
   Each replica's promise, accepted proposal and last commit are cells of a
   `system.paxos`-like table, synced before answering. SERIAL reads finish
   rounds in progress first. Any node can coordinate.
-- **Secondary index** queries walk the ring's token ranges in order, as
-  Cassandra's index range reads do: the coordinator asks one live replica
-  of each range to read its local index for that range, until the page is
-  full, and the paging state records the next range (and the replica's
-  own paging state inside it). LIMIT holds across pages. ANN queries ask
-  every node for its best rows and merge them by score (LIMIT at most
-  1000).
 - Drivers see the cluster through `system.peers`/`peers_v2` and route
   token-aware.
 
@@ -144,15 +137,15 @@ node, the coordinator in a cluster.
   range (sstables wholly inside it hard-linked, the sections of the others
   written out), the receiver pulls the files in 4 MiB chunks over the
   large-message connection, imports them (hard-linked into the table, not
-  rewritten) and writes the index entries of the imported rows. A node
+  rewritten). A node
   that must push a range asks the receiver to pull it. Bootstrap,
   decommission and removenode record every range they finish
   (`stream-progress.json`), so an interrupted operation run again resumes
   where it stopped. Not done: sendfile (chunks go through messages).
 - **Bootstrap**: a new node catches up with the metadata, then commits its
   registration as JOINING (TCM's PrepareJoin: from that epoch writes also
-  go to it), streams the ranges it will own from current replicas,
-  rebuilds its local indexes, and commits NORMAL (FinishJoin). The first
+  go to it), streams the ranges it will own from current replicas, and
+  commits NORMAL (FinishJoin). The first
   node of a cluster registers as NORMAL directly.
 - **Decommission** (`POST /decommission`): refused for CMS members, and if
   fewer nodes than a replication factor would remain; otherwise the node
@@ -161,8 +154,7 @@ node, the coordinator in a cluster.
 - **Repair** (`POST /repair?keyspace=`): for each range this node
   replicates, each replica builds a Merkle tree (the engine's, over purged
   rows); differing leaves are streamed both ways.
-- **Cleanup** (`POST /cleanup?keyspace=`): rewrites the tables (and their
-  indexes) without the rows of ranges this node no longer replicates, as
+- **Cleanup** (`POST /cleanup?keyspace=`): rewrites the tables without the rows of ranges this node no longer replicates, as
   nodetool cleanup does after nodes join; refused while nodes are joining
   or leaving.
 - **Removenode** (`POST /removenode?node=`, an address or host id): a dead
@@ -203,7 +195,7 @@ timeout, concurrent CMS commits from three proposers (exactly one epoch
 per change, the same snapshot everywhere), and replica placement. `internal/db/cluster_test.go` runs in-process
 clusters: schema propagation, replication at RF 3, QUORUM with a node down
 and ALL unavailable, metadata catch-up and hint replay after restart, read repair of a divergent
-replica, counters and LWT from every coordinator, scattered index queries,
+replica, counters and LWT from every coordinator,
 bootstrap streaming, repair of divergent replicas and decommission. The
 gocql test runs three nodes on 127.0.0.1-3 and checks token-aware routing
 to all of them. Three real processes were also checked with cqlsh: QUORUM

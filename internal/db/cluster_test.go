@@ -191,7 +191,7 @@ func TestClusterReplication(t *testing.T) {
 	// (QUORUM acknowledges before the third replica has applied a write.)
 	for n := range c.nodes {
 		require.Eventually(t, func() bool {
-			res := c.nodes[n].Execute(mustPrepare(t, c.nodes[n], "SELECT count(*) FROM ks.kv"), &RequestOptions{Consistency: one, local: true, forwarded: true})
+			res := c.nodes[n].Execute(mustPrepare(t, c.nodes[n], "SELECT count(*) FROM ks.kv"), &RequestOptions{Consistency: one, local: true})
 			return bytes.Equal([]byte{0, 0, 0, 0, 0, 0, 0, 100}, res.(*message.RowsResult).Data[0][0])
 		}, 5*time.Second, 10*time.Millisecond, "node %d", n)
 	}
@@ -219,7 +219,7 @@ func TestClusterReplication(t *testing.T) {
 	require.GreaterOrEqual(t, c.nodes[2].schema.Load().Epoch, epoch)
 	require.NotNil(t, c.nodes[2].schema.Load().Keyspaces["ks"].Tables["later"])
 	require.Eventually(t, func() bool {
-		res := c.nodes[2].Execute(mustPrepare(t, c.nodes[2], "SELECT v FROM ks.kv WHERE k = 7"), &RequestOptions{Consistency: one, local: true, forwarded: true})
+		res := c.nodes[2].Execute(mustPrepare(t, c.nodes[2], "SELECT v FROM ks.kv WHERE k = 7"), &RequestOptions{Consistency: one, local: true})
 		rows := res.(*message.RowsResult).Data
 		return len(rows) == 1 && string(rows[0][0]) == "missed"
 	}, 10*time.Second, 50*time.Millisecond, "hint replayed")
@@ -234,11 +234,11 @@ func TestClusterReplication(t *testing.T) {
 	mu := &mutation{}
 	require.NoError(t, mod.addMutations(e, mu))
 	require.NoError(t, c.nodes[0].applyLocal(mu.writes))
-	res = c.nodes[1].Execute(mustPrepare(t, c.nodes[1], "SELECT v FROM ks.kv WHERE k = 8"), &RequestOptions{Consistency: one, local: true, forwarded: true})
+	res = c.nodes[1].Execute(mustPrepare(t, c.nodes[1], "SELECT v FROM ks.kv WHERE k = 8"), &RequestOptions{Consistency: one, local: true})
 	require.Equal(t, "v8", string(res.(*message.RowsResult).Data[0][0]), "node 1 does not have it yet")
 	require.Equal(t, []string{"local-only"}, c.values(1, all, "SELECT v FROM ks.kv WHERE k = 8"))
 	for n := range c.nodes {
-		res := c.nodes[n].Execute(mustPrepare(t, c.nodes[n], "SELECT v FROM ks.kv WHERE k = 8"), &RequestOptions{Consistency: one, local: true, forwarded: true})
+		res := c.nodes[n].Execute(mustPrepare(t, c.nodes[n], "SELECT v FROM ks.kv WHERE k = 8"), &RequestOptions{Consistency: one, local: true})
 		require.Equal(t, "local-only", string(res.(*message.RowsResult).Data[0][0]), "node %d repaired", n)
 	}
 }
@@ -249,12 +249,11 @@ func mustPrepare(t *testing.T, d *DB, q string) *Prepared {
 	return p
 }
 
-func TestClusterCountersLWTAndIndexes(t *testing.T) {
+func TestClusterCountersAndLWT(t *testing.T) {
 	c := newTestCluster(t, 3)
 	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
 	c.ok(0, quorum, "CREATE TABLE ks.cnt (k int PRIMARY KEY, n counter)")
 	c.ok(0, quorum, "CREATE TABLE ks.u (k int PRIMARY KEY, email text)")
-	c.ok(1, quorum, "CREATE INDEX ON ks.u (email)")
 	time.Sleep(200 * time.Millisecond)
 	// Counter updates from every node go to the partition's leader.
 	for i := 0; i < 30; i++ {
@@ -267,11 +266,6 @@ func TestClusterCountersLWTAndIndexes(t *testing.T) {
 	require.Equal(t, []byte{1}, []byte(res.Data[0][0]))
 	res = c.ok(1, quorum, "INSERT INTO ks.u (k, email) VALUES (1, 'b') IF NOT EXISTS").(*message.RowsResult)
 	require.Equal(t, []byte{0}, []byte(res.Data[0][0]))
-	for i := 2; i < 40; i++ {
-		c.ok(i%3, quorum, "INSERT INTO ks.u (k, email) VALUES (?, ?)", i, fmt.Sprint("e", i%4))
-	}
-	// Index queries gather every node's local index, each partition once.
-	require.Equal(t, []string{"13", "17", "21", "25", "29", "33", "37", "5", "9"}, c.values(2, one, "SELECT k FROM ks.u WHERE email = 'e1'"))
 }
 
 var _ = errors.New
@@ -299,7 +293,7 @@ func TestClusterBootstrapDecommissionRepair(t *testing.T) {
 		return true
 	}, 5*time.Second, 20*time.Millisecond, "every ring has the new node")
 	local := func(n int) int {
-		res := c.nodes[n].Execute(mustPrepare(t, c.nodes[n], "SELECT count(*) FROM ks.kv"), &RequestOptions{Consistency: one, local: true, forwarded: true})
+		res := c.nodes[n].Execute(mustPrepare(t, c.nodes[n], "SELECT count(*) FROM ks.kv"), &RequestOptions{Consistency: one, local: true})
 		v := res.(*message.RowsResult).Data[0][0]
 		return int(v[7]) | int(v[6])<<8
 	}
@@ -345,7 +339,7 @@ func TestClusterBootstrapDecommissionRepair(t *testing.T) {
 			if !replicaOf(i, c.addrs[n]) {
 				continue
 			}
-			res := c.nodes[n].Execute(mustPrepare(t, c.nodes[n], fmt.Sprintf("SELECT v FROM ks.kv WHERE k = %d", i)), &RequestOptions{Consistency: one, local: true, forwarded: true})
+			res := c.nodes[n].Execute(mustPrepare(t, c.nodes[n], fmt.Sprintf("SELECT v FROM ks.kv WHERE k = %d", i)), &RequestOptions{Consistency: one, local: true})
 			require.Equal(t, fmt.Sprint("r", i), string(res.(*message.RowsResult).Data[0][0]), "node %d key %d", n, i)
 		}
 	}
@@ -381,7 +375,7 @@ func (c *testCluster) checkReplicas(n int) {
 				if d == nil || c.addrs[j] != r.Addr {
 					continue
 				}
-				res := d.Execute(mustPrepare(c.t, d, fmt.Sprintf("SELECT v FROM ks.kv WHERE k = %d", i)), &RequestOptions{Consistency: one, local: true, forwarded: true})
+				res := d.Execute(mustPrepare(c.t, d, fmt.Sprintf("SELECT v FROM ks.kv WHERE k = %d", i)), &RequestOptions{Consistency: one, local: true})
 				require.Len(c.t, res.(*message.RowsResult).Data, 1, "row %d on replica %d", i, j)
 			}
 		}
@@ -599,96 +593,13 @@ func TestClusterCounters(t *testing.T) {
 	}
 }
 
-// TestClusterVectorSearch runs ANN queries from every node: each node
-// searches its own index for the partitions it is the first replica of,
-// and the coordinator merges by score.
-func TestClusterVectorSearch(t *testing.T) {
-	c := newTestCluster(t, 3)
-	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
-	c.ok(0, quorum, "CREATE TABLE ks.v (id int PRIMARY KEY, emb vector<float, 4>)")
-	c.ok(1, quorum, "CREATE INDEX ON ks.v (emb) USING 'sai' WITH OPTIONS = {'similarity_function': 'euclidean'}")
-	time.Sleep(100 * time.Millisecond)
-	vecOf := func(i int) []float32 { return []float32{float32(i), float32(i % 7), float32(i % 3), 1} }
-	for i := 0; i < 150; i++ {
-		c.ok(i%3, quorum, "INSERT INTO ks.v (id, emb) VALUES (?, ?)", i, string(vec(vecOf(i)...)))
-	}
-	for n := range c.nodes {
-		got := c.values(n, one, "SELECT id FROM ks.v ORDER BY emb ANN OF ? LIMIT 3", string(vec(vecOf(40)...)))
-		require.ElementsMatch(t, []string{"40", "39", "41"}, got, "node %d", n) // (values sorts)
-		rows := c.ok(n, one, "SELECT id FROM ks.v ORDER BY emb ANN OF ? LIMIT 3", string(vec(vecOf(40)...))).(*message.RowsResult)
-		require.Equal(t, []byte{0, 0, 0, 40}, []byte(rows.Data[0][0]), "nearest first")
-		require.Len(t, rows.Metadata.Columns, 1, "no score column")
-	}
-}
-
-// TestClusterIndexPaging pages through a secondary index query in a
-// cluster: the coordinator walks the token ranges, each page resuming
-// where the last stopped, with no row missed or repeated, and LIMIT holds
-// across pages.
-func TestClusterIndexPaging(t *testing.T) {
-	c := newTestCluster(t, 3)
-	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
-	c.ok(0, quorum, "CREATE TABLE ks.u (k int, c int, color text, PRIMARY KEY (k, c))")
-	c.ok(1, quorum, "CREATE INDEX ON ks.u (color)")
-	time.Sleep(100 * time.Millisecond)
-	for k := 0; k < 100; k++ {
-		for cc := 0; cc < 3; cc++ {
-			color := "red"
-			if (k+cc)%4 == 0 {
-				color = "blue"
-			}
-			c.ok(k%3, quorum, "INSERT INTO ks.u (k, c, color) VALUES (?, ?, ?)", k, cc, color)
-		}
-	}
-	page := func(node int, q string, size int32) []string {
-		d := c.nodes[node]
-		pr := mustPrepare(t, d, q)
-		var all []string
-		var state []byte
-		for pages := 0; ; pages++ {
-			require.Less(t, pages, 1000)
-			res := d.Execute(pr, &RequestOptions{Consistency: one, PageSize: size, PagingState: state})
-			rows, ok := res.(*message.RowsResult)
-			require.True(t, ok, "%v", res)
-			require.LessOrEqual(t, len(rows.Data), int(size))
-			for _, r := range rows.Data {
-				all = append(all, fmt.Sprintf("%d/%d", be32(r[0]), be32(r[1])))
-			}
-			if rows.Metadata.PagingState == nil {
-				return all
-			}
-			state = rows.Metadata.PagingState
-		}
-	}
-	want := 0
-	for k := 0; k < 100; k++ {
-		for cc := 0; cc < 3; cc++ {
-			if (k+cc)%4 != 0 {
-				want++
-			}
-		}
-	}
-	for n := range c.nodes {
-		got := page(n, "SELECT k, c FROM ks.u WHERE color = 'red'", 25)
-		require.Len(t, got, want, "node %d", n)
-		seen := map[string]bool{}
-		for _, g := range got {
-			require.False(t, seen[g], "node %d: %s twice", n, g)
-			seen[g] = true
-		}
-	}
-	got := page(2, "SELECT k, c FROM ks.u WHERE color = 'red' LIMIT 60", 25)
-	require.Len(t, got, 60)
-}
-
 // TestClusterResumableBootstrap interrupts a bootstrap and restarts the
-// node: it streams only the ranges it had not finished, ends with every
-// row and indexes them.
+// node: it streams only the ranges it had not finished and ends with
+// every row.
 func TestClusterResumableBootstrap(t *testing.T) {
 	c := newTestCluster(t, 2)
 	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
 	c.ok(0, quorum, "CREATE TABLE ks.kv (k int PRIMARY KEY, v text)")
-	c.ok(0, quorum, "CREATE INDEX ON ks.kv (v)")
 	time.Sleep(100 * time.Millisecond)
 	for i := 0; i < 300; i++ {
 		c.ok(i%2, quorum, "INSERT INTO ks.kv (k, v) VALUES (?, ?)", i, fmt.Sprint("v", i%10))
@@ -715,8 +626,6 @@ func TestClusterResumableBootstrap(t *testing.T) {
 	require.Equal(t, "NORMAL", c.nodes[0].schema.Load().Nodes[d.local.HostID].Status)
 	require.Eventually(t, func() bool { return len(c.nodes[0].proxy.ring.Load().Nodes()) == 3 }, 5*time.Second, 10*time.Millisecond)
 	c.checkReplicas(300)
-	// The new node's index covers its rows: index queries through it.
-	require.Len(t, c.values(n, one, "SELECT k FROM ks.kv WHERE v = 'v3'"), 30)
 	_, err = d.readFile(streamProgressFile)
 	require.NoError(t, err)
 	require.Empty(t, d.progress().m["bootstrap"], "the progress is cleared once joined")
@@ -754,7 +663,7 @@ func TestClusterHintWindowAndTTL(t *testing.T) {
 	c.start(1)
 	c.waitConverged()
 	local := func(q string) int {
-		res := c.nodes[1].Execute(mustPrepare(t, c.nodes[1], q), &RequestOptions{Consistency: one, local: true, forwarded: true})
+		res := c.nodes[1].Execute(mustPrepare(t, c.nodes[1], q), &RequestOptions{Consistency: one, local: true})
 		return len(res.(*message.RowsResult).Data)
 	}
 	require.Eventually(t, func() bool { return local("SELECT k FROM ks.kv WHERE k = 1") == 1 }, 10*time.Second, 50*time.Millisecond, "the hint within the window is delivered")

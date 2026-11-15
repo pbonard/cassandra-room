@@ -30,7 +30,6 @@ const (
 	VerbMutation
 	VerbReadRow
 	VerbReadRange
-	VerbExecute
 	VerbRepair
 	VerbPing
 	VerbPingReq
@@ -174,11 +173,11 @@ const (
 	stageGossip
 	stageMetadata
 	stageStreaming
-	stageExecute
+	stageAntiEntropy
 	numStages
 )
 
-var stageWorkers = [numStages]int{stageRead: 64, stageMutation: 64, stageGossip: 16, stageMetadata: 8, stageStreaming: 4, stageExecute: 32}
+var stageWorkers = [numStages]int{stageRead: 64, stageMutation: 64, stageGossip: 16, stageMetadata: 8, stageStreaming: 4, stageAntiEntropy: 32}
 
 func stageOf(v Verb) int {
 	switch v {
@@ -194,9 +193,9 @@ func stageOf(v Verb) int {
 		return stageStreaming
 	}
 	// (Stream and repair orchestration, which wait on other nodes'
-	// streaming workers, run with statements, so two nodes streaming to
+	// streaming workers, have their own stage, so two nodes streaming to
 	// each other cannot exhaust each other's streaming workers.)
-	return stageExecute
+	return stageAntiEntropy
 }
 
 // budget is a byte limit.
@@ -312,7 +311,7 @@ type StageStat struct {
 	Dropped       uint64
 }
 
-var stageNames = [numStages]string{"ReadStage", "MutationStage", "GossipStage", "MetadataStage", "StreamingStage", "RequestResponseStage"}
+var stageNames = [numStages]string{"ReadStage", "MutationStage", "GossipStage", "MetadataStage", "StreamingStage", "AntiEntropyStage"}
 
 // Stages returns the stages' activity.
 func (m *Messaging) Stages() []StageStat {

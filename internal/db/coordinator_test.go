@@ -51,7 +51,7 @@ func TestClusterRangeReadRepair(t *testing.T) {
 	require.NoError(t, pr.state.Load().stmt.(*modification).addMutations(e, mu))
 	require.NoError(t, c.nodes[0].applyLocal(mu.writes))
 	local := func(n int) int {
-		res := c.nodes[n].Execute(mustPrepare(t, c.nodes[n], "SELECT k FROM ks.kv"), &RequestOptions{Consistency: one, local: true, forwarded: true})
+		res := c.nodes[n].Execute(mustPrepare(t, c.nodes[n], "SELECT k FROM ks.kv"), &RequestOptions{Consistency: one, local: true})
 		return len(res.(*message.RowsResult).Data)
 	}
 	require.Zero(t, local(1))

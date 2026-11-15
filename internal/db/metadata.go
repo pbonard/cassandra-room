@@ -137,29 +137,8 @@ func (d *DB) installLocked(next *Schema) error {
 			gone = append(gone, id)
 		}
 	}
-	d.vecs.mu.Lock()
-	for _, id := range gone {
-		delete(d.vecs.m, id)
-	}
-	d.vecs.mu.Unlock()
 	if err := d.dropStorage(gone...); err != nil {
 		return err
-	}
-	// Build the indexes this node has not built yet (an index's storage
-	// is new).
-	for _, k := range next.Keyspaces {
-		for _, t := range k.Tables {
-			for _, ix := range t.Indexes {
-				if !old.storage[ix.Storage] {
-					d.tableMu.RLock()
-					err := d.buildIndex(t, ix, d.opts.Now().Unix())
-					d.tableMu.RUnlock()
-					if err != nil {
-						return err
-					}
-				}
-			}
-		}
 	}
 	if d.proxy != nil {
 		d.proxy.metadataChanged(next)

@@ -9,7 +9,6 @@ import (
 	"slices"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/cassandra-room/cassandra-room/internal/cluster"
 	"github.com/cassandra-room/cassandra-room/internal/storage/lsm"
@@ -124,11 +123,6 @@ func (p *proxy) bootstrap() error {
 			}
 			if !done {
 				return fmt.Errorf("db: bootstrap streaming of range (%d, %d]: %w", r[0], r[1], errors.Join(errs...))
-			}
-		}
-		for _, ix := range t.Indexes {
-			if err := p.d.buildIndex(t, ix, time.Now().Unix()); err != nil {
-				return err
 			}
 		}
 	}
@@ -426,18 +420,6 @@ func (d *DB) Cleanup(keyspace string) (int, error) {
 		}
 		if err := lt.Cleanup(func(key []byte) bool { return keep(tokenOf(key)) }, dirty); err != nil {
 			return cleaned, err
-		}
-		for _, ix := range t.Indexes {
-			it, err := d.engine.Table(ix.Storage)
-			if err != nil {
-				return cleaned, err
-			}
-			if err := it.Cleanup(func(key []byte) bool {
-				rest, err := ix.entryRowKey(key)
-				return err != nil || len(rest) < 8 || keep(tokenOf(rest))
-			}, nil); err != nil {
-				return cleaned, err
-			}
 		}
 		cleaned++
 	}

@@ -198,10 +198,6 @@ func (st *prepState) required(session string) [][2]string {
 			return [][2]string{{"DROP", data(ks(r.Keyspace), r.Table)}}
 		case *cql.Truncate:
 			return [][2]string{{"MODIFY", data(ks(r.Keyspace), r.Table)}}
-		case *cql.CreateIndex:
-			return [][2]string{{"ALTER", data(ks(r.Keyspace), r.Table)}}
-		case *cql.DropIndex:
-			return [][2]string{{"ALTER", data(ks(r.Keyspace), "")}}
 		case *cql.CreateType:
 			return [][2]string{{"CREATE", data(ks(r.Keyspace), "")}}
 		case *cql.AlterType:

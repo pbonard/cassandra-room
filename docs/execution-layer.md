@@ -165,10 +165,6 @@ ALTER TABLE take effect when the server restarts.
   fromJson().
 - **GROUP BY** on a primary key prefix, **arithmetic** in selections,
   **conditional batches** (one partition).
-- **Secondary indexes** (legacy and `StorageAttachedIndex`): an index is a
-  storage table keyed by (value, partition, clustering), written in the
-  row's batch; reads verify entries against the base row and delete stale
-  ones. SAI indexes also serve ranges.
 - **Authentication and authorization**: PasswordAuthenticator (SASL PLAIN,
   bcrypt), roles, GRANT/REVOKE on keyspaces/tables/roles, LIST
   ROLES/USERS/PERMISSIONS.
@@ -184,40 +180,11 @@ once it is older than `gc_grace_seconds` and no older data of the
 partition (or of the range) remains outside the compaction, in other
 sstables or the memtables.
 
-## Vectors
-
-`vector<float, n>` (any element type; float or double for search) is
-sent to drivers as Cassandra's custom `VectorType(... , n)`. The
-`similarity_cosine`, `similarity_euclidean` and `similarity_dot_product`
-functions score two vectors; `ORDER BY v ANN OF [..] LIMIT k` on a column
-with an SAI index (`similarity_function` option: cosine by default,
-euclidean, dot_product) returns the k most similar rows among those the
-rest of the query selects.
-
-The index (`internal/vecindex`) is a proximity graph as Cassandra's SAI
-builds with jvector (a DiskANN/Vamana-style graph): each vector has at
-most `maximum_node_connections` (16) neighbors, chosen on insert by a
-beam search of `construction_beam_width` (100) and kept diverse (a
-candidate is kept only if it is closer to the node than to kept neighbors,
-relaxed up to alpha 1.4), with backlinks pruned past 1.2x the maximum. A
-search is a best-first beam search for `optimize_for`'s top-k of the limit
-(LATENCY by default: 16 for LIMIT 10; RECALL: 42), scored exactly. Deleted
-vectors stay in the graph for routing and are never returned, until they reach a quarter of the live ones and are cleaned out (their neighbors relinked around them). Each node
-indexes its own rows as writes are applied, in the index's table (the
-graph is cached in memory); candidates are checked against the rows, which
-drops stale entries, and more are fetched while fewer than LIMIT qualify.
-In a cluster the query goes to every node (each answering for the
-partitions it is the first replica of) and the coordinator merges by
-score. With the partition key restricted, rows are scored one by one.
-Not done: product quantization (jvector compresses graphs of 1K+ vectors
-on disk); the graph is held in memory once loaded.
-
 ## Not supported yet
 
+- secondary indexes (`CREATE INDEX`, SAI), vectors and vector search
 - user-defined functions and aggregates, materialized views,
   triggers, LIKE, data masking
-
-
 
 ## Tests
 

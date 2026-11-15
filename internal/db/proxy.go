@@ -171,7 +171,6 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	m.Handle(cluster.VerbReadRow, p.handleReadRow)
 	m.Handle(cluster.VerbReadDigest, p.handleReadDigest)
 	m.Handle(cluster.VerbReadRange, p.handleReadRange)
-	m.Handle(cluster.VerbExecute, p.handleExecute)
 	m.Handle(cluster.VerbRepair, p.handleRepair)
 	m.Handle(cluster.VerbStreamPush, p.handleStreamPush)
 	m.Handle(cluster.VerbStreamFile, p.handleStreamFile)
@@ -600,15 +599,6 @@ func (p *proxy) keyspaceOf(id lsm.TableID) *Keyspace {
 	if t := s.byStorage[id]; t != nil {
 		return s.Keyspaces[t.Keyspace]
 	}
-	for _, k := range s.Keyspaces {
-		for _, t := range k.Tables {
-			for _, ix := range t.Indexes {
-				if ix.Storage == id {
-					return k
-				}
-			}
-		}
-	}
 	return nil
 }
 
@@ -864,7 +854,7 @@ func (p *proxy) hintTTL(ws []write) int64 {
 	s := p.d.schema.Load()
 	ttl := int64(math.MaxInt32)
 	for _, w := range ws {
-		if t := s.byStorage[w.table]; t != nil { // (index entries follow their table)
+		if t := s.byStorage[w.table]; t != nil {
 			ttl = min(ttl, int64(t.Params.GCGraceSeconds))
 		}
 	}
@@ -1670,60 +1660,7 @@ func (it *distIter) Value() []byte { return it.buf[it.i].v }
 func (it *distIter) Error() error  { return it.err }
 func (it *distIter) Close() error  { return nil }
 
-// ---- forwarded statements ----
-
-// forwarded is a statement run on another node (index queries scattered
-// to every node).
-type forwarded struct {
-	Keyspace  string
-	Query     string
-	Values    [][]byte
-	Null      []bool
-	Unset     []bool
-	CL        uint16
-	Serial    uint16 `json:",omitempty"`
-	Timestamp *int64
-	NowInSec  *int32
-	User      string
-	Local     bool // read only this node's data (index scatter)
-	// TokenRange restricts an index query to the tokens (lo, hi]; PageSize
-	// and Paging page it.
-	TokenRange *[2]int64        `json:",omitempty"`
-	PageSize   int32            `json:",omitempty"`
-	Paging     []byte           `json:",omitempty"`
-	Batch      []forwardedChild `json:",omitempty"`
-	BatchType  uint8
-}
-
-type forwardedChild struct {
-	Keyspace, Query string
-	Values          [][]byte
-	Null, Unset     []bool
-}
-
-func packValues(vs []*primitive.Value) (vals [][]byte, null, unset []bool) {
-	for _, v := range vs {
-		vals = append(vals, v.Contents)
-		null = append(null, v.Type == primitive.ValueTypeNull)
-		unset = append(unset, v.Type == primitive.ValueTypeUnset)
-	}
-	return
-}
-
-func unpackValues(vals [][]byte, null, unset []bool) []*primitive.Value {
-	out := make([]*primitive.Value, len(vals))
-	for i := range vals {
-		switch {
-		case null[i]:
-			out[i] = &primitive.Value{Type: primitive.ValueTypeNull}
-		case unset[i]:
-			out[i] = &primitive.Value{Type: primitive.ValueTypeUnset}
-		default:
-			out[i] = &primitive.Value{Type: primitive.ValueTypeRegular, Contents: vals[i]}
-		}
-	}
-	return out
-}
+// ---- protocol messages between nodes ----
 
 var fwdCodec = frame.NewCodec()
 
@@ -1742,57 +1679,6 @@ func decodeMessage(b []byte) (message.Message, error) {
 	}
 	return f.Body.Message, nil
 }
-
-// forward runs a statement on another node and returns its response.
-func (p *proxy) forward(to string, f *forwarded) message.Message {
-	b, _ := json.Marshal(f)
-	ctx, cancel := context.WithTimeout(context.Background(), p.opts.WriteTimeout+p.opts.ReadTimeout)
-	defer cancel()
-	resp, err := p.m.Request(ctx, to, cluster.VerbExecute, b)
-	if err != nil {
-		return &message.WriteTimeout{ErrorMessage: "forwarded request failed: " + err.Error(), Consistency: primitive.ConsistencyLevel(f.CL), WriteType: primitive.WriteTypeSimple}
-	}
-	m, err := decodeMessage(resp)
-	if err != nil {
-		return &message.ServerError{ErrorMessage: err.Error()}
-	}
-	return m
-}
-
-func (p *proxy) handleExecute(ctx context.Context, _ string, payload []byte) ([]byte, error) {
-	var f forwarded
-	if err := json.Unmarshal(payload, &f); err != nil {
-		return nil, err
-	}
-	o := &RequestOptions{Consistency: primitive.ConsistencyLevel(f.CL), SerialConsistency: primitive.ConsistencyLevel(f.Serial), Timestamp: f.Timestamp, NowInSec: f.NowInSec,
-		User: f.User, Version: primitive.ProtocolVersion4, forwarded: true, local: f.Local,
-		PageSize: f.PageSize, PagingState: f.Paging, tokenRange: f.TokenRange}
-	var res message.Message
-	if f.Batch != nil {
-		children := make([]BatchChild, len(f.Batch))
-		for i, c := range f.Batch {
-			pr, err := p.d.Prepare(c.Keyspace, c.Query)
-			if err != nil {
-				return encodeMessage(ErrorMessage(err))
-			}
-			children[i] = BatchChild{Prepared: pr, Values: unpackValues(c.Values, c.Null, c.Unset)}
-		}
-		res = p.d.ExecuteBatch(primitive.BatchType(f.BatchType), children, o)
-	} else {
-		pr, err := p.d.Prepare(f.Keyspace, f.Query)
-		if err != nil {
-			return encodeMessage(ErrorMessage(err))
-		}
-		o.Values = unpackValues(f.Values, f.Null, f.Unset)
-		res = p.d.Execute(pr, o)
-	}
-	return encodeMessage(res)
-}
-
-// route decides where a statement runs: "" to run here. (Every statement
-// runs on its coordinator now: conditional updates run Paxos, counter
-// updates send deltas to their partitions' leaders.)
-func (p *proxy) route(st *prepState, e *execCtx) string { return "" }
 
 func (m *modification) isCounter() bool {
 	return slices.ContainsFunc(m.ops, func(o setOp) bool { return o.kind == opCounter })
@@ -1924,93 +1810,6 @@ func tokenStrings(ts []int64) []string {
 	return out
 }
 
-// scatter runs an index query across the cluster. Secondary indexes are
-// local to each node, so, as Cassandra's range reads with an index do, the
-// coordinator walks the ring's token ranges in order and asks one live
-// replica of each to read its index for that range, until the page is
-// full; the paging state says where to resume. ANN queries instead ask
-// every node for its best rows and merge them by score.
-func (p *proxy) scatter(pr *Prepared, e *execCtx, o *RequestOptions) message.Message {
-	sel := pr.state.Load().stmt.(*selectStmt)
-	if sel.ann != nil {
-		return p.scatterANN(pr, e, o, sel)
-	}
-	k := p.d.schema.Load().Keyspaces[sel.t.Keyspace]
-	limit, ok, err := bindInt(e, sel.limit, "limit")
-	if err != nil {
-		return ErrorMessage(err)
-	}
-	if !ok {
-		limit = math.MaxInt64
-	}
-	segs := p.tokenSegments()
-	st := scatterState{next: segs[0][1], remaining: limit}
-	if len(o.PagingState) > 0 {
-		if st, err = decodeScatterState(o.PagingState); err != nil {
-			return ErrorMessage(invalidf("Invalid value for the paging state"))
-		}
-	}
-	pageSize := int64(o.PageSize)
-	if pageSize <= 0 {
-		pageSize = math.MaxInt64
-	}
-	vals, null, unset := packValues(e.values)
-	out := &message.RowsResult{Metadata: &message.RowsMetadata{Columns: sel.metadata(), ColumnCount: int32(len(sel.metadata()))}, Data: message.RowSet{}}
-	more := false
-	for i, seg := range segs {
-		if seg[1] < st.next {
-			continue // done in an earlier page
-		}
-		want := min(pageSize-int64(len(out.Data)), st.remaining)
-		if want <= 0 {
-			// The page is full: resume at this segment.
-			st.next, st.inner, more = seg[1], nil, st.remaining > 0
-			break
-		}
-		reps, live := p.replicas(k, seg[1], primitive.ConsistencyLevelOne)
-		if live == 0 {
-			return ErrorMessage(&unavailableError{cl: primitive.ConsistencyLevelOne, required: 1, alive: 0})
-		}
-		f := &forwarded{Keyspace: pr.Keyspace, Query: pr.Query, Values: vals, Null: null, Unset: unset,
-			CL: uint16(primitive.ConsistencyLevelOne), Timestamp: o.Timestamp, NowInSec: o.NowInSec, User: o.User,
-			Local: true, TokenRange: &[2]int64{seg[0], seg[1]}, Paging: st.inner}
-		if want < math.MaxInt32 {
-			f.PageSize = int32(want)
-		}
-		var res message.Message
-		for _, r := range reps[:live] {
-			res = p.forward(r.Addr, f)
-			if _, failed := res.(*message.WriteTimeout); !failed {
-				break // (forward reports an unreachable node as a timeout; try the next replica)
-			}
-		}
-		rows, ok := res.(*message.RowsResult)
-		if !ok {
-			return res
-		}
-		out.Data = append(out.Data, rows.Data...)
-		st.remaining -= int64(len(rows.Data))
-		st.inner = nil
-		if rows.Metadata != nil && rows.Metadata.PagingState != nil && st.remaining > 0 {
-			// More in this segment.
-			st.next, st.inner, more = seg[1], rows.Metadata.PagingState, true
-			break
-		}
-		if i+1 < len(segs) {
-			st.next = segs[i+1][1]
-		} else {
-			st.next = math.MaxInt64
-		}
-	}
-	md := *out.Metadata
-	md.PagingState = nil
-	if more {
-		md.PagingState = st.encode()
-	}
-	out.Metadata = &md
-	return out
-}
-
 // tokenSegments are the ring's ranges as (lo, hi] in token order, the
 // range that wraps around split in two.
 func (p *proxy) tokenSegments() [][2]int64 {
@@ -2030,92 +1829,4 @@ func (p *proxy) tokenSegments() [][2]int64 {
 		out = [][2]int64{{math.MinInt64, math.MaxInt64}}
 	}
 	return out
-}
-
-// scatterState is a scattered query's paging state: the segment ending
-// at next is the first one not done (inner is its replica's paging state,
-// if under way), and remaining rows are left of the limit.
-type scatterState struct {
-	next      int64
-	inner     []byte
-	remaining int64
-}
-
-func (s scatterState) encode() []byte {
-	b := binary.AppendVarint([]byte{'S'}, s.next)
-	b = binary.AppendVarint(b, s.remaining)
-	return append(b, s.inner...)
-}
-
-func decodeScatterState(b []byte) (scatterState, error) {
-	bad := errors.New("db: bad scatter paging state")
-	if len(b) < 3 || b[0] != 'S' {
-		return scatterState{}, bad
-	}
-	var s scatterState
-	var n, m int
-	if s.next, n = binary.Varint(b[1:]); n <= 0 {
-		return s, bad
-	}
-	if s.remaining, m = binary.Varint(b[1+n:]); m <= 0 {
-		return s, bad
-	}
-	if rest := b[1+n+m:]; len(rest) > 0 {
-		s.inner = rest
-	}
-	return s, nil
-}
-
-// scatterANN asks every live node for its best rows of an ANN query (for
-// the partitions it is the first replica of) and merges them by score.
-func (p *proxy) scatterANN(pr *Prepared, e *execCtx, o *RequestOptions, sel *selectStmt) message.Message {
-	vals, null, unset := packValues(e.values)
-	f := &forwarded{Keyspace: pr.Keyspace, Query: pr.Query, Values: vals, Null: null, Unset: unset,
-		CL: uint16(primitive.ConsistencyLevelOne), Timestamp: o.Timestamp, NowInSec: o.NowInSec, User: o.User, Local: true}
-	var nodes []string
-	for _, n := range p.d.schema.Load().Nodes {
-		if n.Status == cluster.StatusNormal && (n.Addr == p.self || p.g.IsAlive(n.Addr)) {
-			nodes = append(nodes, n.Addr)
-		}
-	}
-	results := make([]message.Message, len(nodes))
-	var wg sync.WaitGroup
-	for i, n := range nodes {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			results[i] = p.forward(n, f)
-		}()
-	}
-	wg.Wait()
-	var out *message.RowsResult
-	for _, r := range results {
-		rows, ok := r.(*message.RowsResult)
-		if !ok {
-			return r
-		}
-		if out == nil {
-			out = &message.RowsResult{Metadata: rows.Metadata, Data: message.RowSet{}}
-		}
-		out.Data = append(out.Data, rows.Data...)
-	}
-	limit, _, _ := bindInt(e, sel.limit, "limit")
-	mergeANN(out, limit)
-	out.Metadata.PagingState = nil
-	return out
-}
-
-// ownsPrimary reports whether this node is the first live replica of a
-// partition (index scatter: each partition is read by one node).
-func (p *proxy) ownsPrimary(ks string, token int64) bool {
-	k := p.d.schema.Load().Keyspaces[ks]
-	if k == nil {
-		return true
-	}
-	for _, r := range p.ring.Load().Replicas(k.Replication, token) {
-		if p.up(r) {
-			return r.Addr == p.self
-		}
-	}
-	return false
 }

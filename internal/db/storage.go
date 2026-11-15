@@ -13,8 +13,7 @@ import (
 
 // mutation is a set of row fragment writes, applied atomically on each
 // replica (Mutation). Each write carries the token of the partition it
-// belongs to, which places it on the ring: for index entries, the token
-// of the indexed row.
+// belongs to, which places it on the ring.
 type mutation struct {
 	trace  *Trace
 	writes []write
@@ -72,7 +71,6 @@ func (d *DB) applyLocal(writes []write) error {
 		}
 		return err
 	}
-	d.updateVectorIndexes(writes)
 	return nil
 }
 

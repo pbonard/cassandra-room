@@ -104,16 +104,6 @@ func ToJSON(t *Type, v []byte) string {
 			parts = append(parts, k+": "+ToJSON(t.Elems[1], elems[i+1]))
 		}
 		return "{" + strings.Join(parts, ", ") + "}"
-	case Vector:
-		elems, err := SplitVector(t, v)
-		if err != nil {
-			return "null"
-		}
-		parts := make([]string, len(elems))
-		for i, e := range elems {
-			parts[i] = ToJSON(t.Elems[0], e)
-		}
-		return "[" + strings.Join(parts, ", ") + "]"
 	case Tuple, UDT:
 		fields, err := SplitTuple(v)
 		if err != nil {
@@ -318,20 +308,6 @@ func FromJSON(t *Type, v any) ([]byte, error) {
 			out = append(out, entries[i].k, entries[i].v)
 		}
 		return BuildCollection(len(out)/2, out), nil
-	case Vector:
-		arr, ok := v.([]any)
-		if !ok || len(arr) != t.Dim {
-			return bad()
-		}
-		elems := make([][]byte, len(arr))
-		for i, x := range arr {
-			e, err := FromJSON(t.Elems[0], x)
-			if err != nil {
-				return nil, err
-			}
-			elems[i] = e
-		}
-		return BuildVector(t, elems), nil
 	case Tuple:
 		arr, ok := v.([]any)
 		if !ok || len(arr) > len(t.Elems) {

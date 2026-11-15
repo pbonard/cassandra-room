@@ -38,14 +38,6 @@ func (d *DB) prepareDDL(session string, st cql.Statement) (*ddlStmt, error) {
 		if _, err := keyspaceOf(s.Keyspace, session); err != nil {
 			return nil, err
 		}
-	case *cql.CreateIndex:
-		if _, err := keyspaceOf(s.Keyspace, session); err != nil {
-			return nil, err
-		}
-	case *cql.DropIndex:
-		if _, err := keyspaceOf(s.Keyspace, session); err != nil {
-			return nil, err
-		}
 	case *cql.CreateType:
 		if _, err := keyspaceOf(s.Keyspace, session); err != nil {
 			return nil, err
@@ -211,80 +203,12 @@ func (s *ddlStmt) plan(e *execCtx, next *Schema) (res message.Message, changed b
 		if t.virtual != nil {
 			return nil, false, invalidf("Cannot truncate virtual table %s.%s", ksName, st.Table)
 		}
-		// Truncation switches the table and its indexes to new, empty
-		// storage.
+		// Truncation switches the table to new, empty storage.
 		nt := *t
 		nt.Storage = next.newStorageID()
-		nt.Indexes = nil
-		for _, ix := range t.Indexes {
-			nix := *ix
-			nix.Storage = next.newStorageID()
-			nt.Indexes = append(nt.Indexes, &nix)
-		}
 		nt.index()
 		next.Keyspaces[ksName].Tables[st.Table] = &nt
 		res = &message.VoidResult{}
-	case *cql.CreateIndex:
-		ksName, _ := keyspaceOf(st.Keyspace, s.session)
-		t, err := cur.table(ksName, st.Table)
-		if err != nil {
-			return nil, false, err
-		}
-		if t.virtual != nil {
-			return nil, false, invalidf("Secondary indexes are not supported on virtual tables")
-		}
-		ix, err := newIndex(t, st)
-		if err != nil {
-			return nil, false, err
-		}
-		for _, other := range cur.Keyspaces[ksName].Tables {
-			for _, o := range other.Indexes {
-				if o.Name == ix.Name {
-					if st.IfNotExists {
-						return &message.VoidResult{}, false, nil
-					}
-					return nil, false, invalidf("Index '%s' already exists", ix.Name)
-				}
-				if other == t && o.Column == ix.Column && o.Target == ix.Target {
-					if st.IfNotExists {
-						return &message.VoidResult{}, false, nil
-					}
-					return nil, false, invalidf("Index %s is a duplicate of existing index %s", ix.Name, o.Name)
-				}
-			}
-		}
-		ix.Storage = next.newStorageID()
-		nt := *t
-		nt.Indexes = append(slices.Clone(t.Indexes), ix)
-		nt.index()
-		next.Keyspaces[ksName].Tables[st.Table] = &nt
-		res = schemaChange(primitive.SchemaChangeTypeUpdated, ksName, st.Table)
-	case *cql.DropIndex:
-		ksName, _ := keyspaceOf(st.Keyspace, s.session)
-		k, ok := cur.Keyspaces[ksName]
-		if !ok {
-			return nil, false, invalidf("Keyspace '%s' doesn't exist", ksName)
-		}
-		var found *Table
-		var ix *Index
-		for _, t := range k.Tables {
-			for _, o := range t.Indexes {
-				if o.Name == st.Name {
-					found, ix = t, o
-				}
-			}
-		}
-		if found == nil {
-			if st.IfExists {
-				return &message.VoidResult{}, false, nil
-			}
-			return nil, false, invalidf("Index '%s.%s' doesn't exist", ksName, st.Name)
-		}
-		nt := *found
-		nt.Indexes = slices.DeleteFunc(slices.Clone(found.Indexes), func(o *Index) bool { return o == ix })
-		nt.index()
-		next.Keyspaces[ksName].Tables[found.Name] = &nt
-		res = schemaChange(primitive.SchemaChangeTypeUpdated, ksName, found.Name)
 	case *cql.CreateType, *cql.AlterType, *cql.DropType:
 		if res, err = s.typeChange(next); err != nil {
 			return nil, false, err
@@ -353,11 +277,6 @@ func alterTable(k *Keyspace, t *Table, st *cql.AlterTable) (*Table, error) {
 		}
 		if c.Kind == PartitionKey || c.Kind == Clustering {
 			return nil, invalidf("Cannot drop PRIMARY KEY column %s", name)
-		}
-		for _, ix := range nt.Indexes {
-			if ix.Column == name {
-				return nil, invalidf("Cannot drop column %s because it has dependent secondary indexes (%s)", name, ix.Name)
-			}
 		}
 		// Dropped columns' cells are ignored from now on: a re-added column
 		// gets a new id.
@@ -536,11 +455,5 @@ func (s *Schema) newStorageID() lsm.TableID {
 	return id
 }
 
-// storageIDs are the storage tables of a table and its indexes.
-func (t *Table) storageIDs() []lsm.TableID {
-	ids := []lsm.TableID{t.Storage}
-	for _, ix := range t.Indexes {
-		ids = append(ids, ix.Storage)
-	}
-	return ids
-}
+// storageIDs are the storage tables of a table.
+func (t *Table) storageIDs() []lsm.TableID { return []lsm.TableID{t.Storage} }

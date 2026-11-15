@@ -148,8 +148,6 @@ func virtualRows(ks, table string) func(d *DB) []map[string][]byte {
 		return columnRows
 	case "system_schema.types":
 		return typeRows
-	case "system_schema.indexes":
-		return indexRows
 	case "system.size_estimates":
 		return func(d *DB) []map[string][]byte { return estimateRows(d, false) }
 	case "system.table_estimates":
@@ -497,32 +495,6 @@ func typeRows(d *DB) []map[string][]byte {
 	return out
 }
 
-func indexRows(d *DB) []map[string][]byte {
-	var out []map[string][]byte
-	for _, k := range sortedKeyspaces(d) {
-		for _, t := range k.Tables {
-			for _, ix := range t.Indexes {
-				kind, opts := "COMPOSITES", map[string]string{"target": ix.targetString()}
-				if ix.Class != "" {
-					kind = "CUSTOM"
-					opts["class_name"] = ix.Class
-				}
-				for k, v := range ix.Options {
-					opts[k] = v
-				}
-				out = append(out, map[string][]byte{
-					"keyspace_name": textV(k.Name),
-					"table_name":    textV(t.Name),
-					"index_name":    textV(ix.Name),
-					"kind":          textV(kind),
-					"options":       textMapV(opts),
-				})
-			}
-		}
-	}
-	return out
-}
-
 func bigintV(n int64) []byte { return binary.BigEndian.AppendUint64(nil, uint64(n)) }
 
 func metadataLogRows(d *DB) []map[string][]byte {
@@ -669,11 +641,6 @@ func diskUsageRows(d *DB) []map[string][]byte {
 			continue
 		}
 		b := lt.Size().Bytes
-		for _, ix := range t.Indexes {
-			if it, err := d.engine.Table(ix.Storage); err == nil {
-				b += it.Size().Bytes
-			}
-		}
 		out = append(out, map[string][]byte{"keyspace_name": textV(t.Keyspace), "table_name": textV(t.Name), "mebibytes": bigintV(b >> 20)})
 	}
 	return out

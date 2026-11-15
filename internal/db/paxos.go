@@ -266,7 +266,6 @@ func (d *DB) paxosCommitLocal(r *paxosRequest) error {
 		if err != nil {
 			return err
 		}
-		d.updateVectorIndexes(ws)
 	}
 	ttl := d.paxosTTL(lsm.TableID(r.Table))
 	p := &proposal{Ballot: r.Ballot, Update: r.Update}

@@ -2,7 +2,6 @@ package db
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 	"testing"
 
@@ -66,59 +65,6 @@ func TestConditionalBatch(t *testing.T) {
 		UPDATE acct SET balance = 0 WHERE owner = 'a' AND id = 1 IF balance = 70;
 		UPDATE acct SET balance = 0 WHERE owner = 'b' AND id = 1;
 		APPLY BATCH`, "cannot span multiple partitions")
-}
-
-func TestSecondaryIndex(t *testing.T) {
-	s := newKS(t)
-	s.ok("CREATE TABLE users (id int, sub int, email text, age int, tags set<text>, attrs map<text, int>, PRIMARY KEY (id, sub))")
-	for i := 0; i < 20; i++ {
-		s.ok("INSERT INTO users (id, sub, email, age) VALUES (?, 0, ?, ?)", i, fmt.Sprintf("u%d@x", i%5), i)
-		s.ok("UPDATE users SET tags = tags + {'"+fmt.Sprint("t", i%3)+"'}, attrs['k"+fmt.Sprint(i%2)+"'] = 1 WHERE id = ? AND sub = 0", i)
-	}
-	s.fails("SELECT id FROM users WHERE email = 'u1@x'", "ALLOW FILTERING")
-	s.ok("CREATE INDEX ON users (email)") // indexes existing rows
-	s.ok("CREATE INDEX tags_idx ON users (tags)")
-	s.ok("CREATE INDEX ON users (keys(attrs))")
-	s.ok("CREATE CUSTOM INDEX age_sai ON users (age) USING 'StorageAttachedIndex'")
-	s.fails("CREATE INDEX ON users (email)", "already exists")
-	ids := func(q string) []string {
-		out := s.cqlRows(q)
-		sort.Strings(out)
-		return out
-	}
-	require.Equal(t, []string{"1", "11", "16", "6"}, ids("SELECT id FROM users WHERE email = 'u1@x'"))
-	require.Len(t, ids("SELECT id FROM users WHERE tags CONTAINS 't0'"), 7)
-	require.Len(t, ids("SELECT id FROM users WHERE attrs CONTAINS KEY 'k1'"), 10)
-	require.Equal(t, []string{"17", "18", "19"}, ids("SELECT id FROM users WHERE age > 16"))
-	require.Equal(t, []string{"0", "1"}, ids("SELECT id FROM users WHERE age <= 1"))
-	// Other restrictions with an index need ALLOW FILTERING.
-	s.fails("SELECT id FROM users WHERE email = 'u1@x' AND age > 5", "ALLOW FILTERING")
-	require.Equal(t, []string{"11", "16", "6"}, ids("SELECT id FROM users WHERE email = 'u1@x' AND age > 5 ALLOW FILTERING"))
-	// Updates and deletions leave stale entries, which reads skip.
-	s.ok("UPDATE users SET email = 'moved' WHERE id = 1 AND sub = 0")
-	s.ok("DELETE FROM users WHERE id = 6")
-	require.Equal(t, []string{"11", "16"}, ids("SELECT id FROM users WHERE email = 'u1@x'"))
-	require.Equal(t, []string{"1"}, ids("SELECT id FROM users WHERE email = 'moved'"))
-	// Paging through an index.
-	p, err := s.d.Prepare("ks", "SELECT id FROM users WHERE tags CONTAINS 't1'")
-	require.NoError(t, err)
-	var got int
-	var state []byte
-	for {
-		res := s.d.Execute(p, &RequestOptions{PageSize: 2, PagingState: state}).(*message.RowsResult)
-		got += len(res.Data)
-		if res.Metadata.PagingState == nil {
-			break
-		}
-		state = res.Metadata.PagingState
-	}
-	require.Equal(t, 7, got)
-	require.Len(t, s.rows("SELECT index_name FROM system_schema.indexes WHERE keyspace_name = 'ks'"), 4)
-	s.fails("ALTER TABLE users DROP email", "dependent secondary indexes")
-	s.ok("DROP INDEX tags_idx")
-	s.fails("SELECT id FROM users WHERE tags CONTAINS 't0'", "ALLOW FILTERING")
-	s.ok("TRUNCATE users")
-	require.Empty(t, ids("SELECT id FROM users WHERE email = 'u2@x'"))
 }
 
 func TestAuth(t *testing.T) {
@@ -206,56 +152,6 @@ func rowsOf(t *testing.T, m message.Message) []string {
 	return out
 }
 
-// TestEntriesAndStaticIndexes covers map element restrictions, entries()
-// indexes and indexes on static columns.
-func TestEntriesAndStaticIndexes(t *testing.T) {
-	s := openTest(t, nil)
-	s.ok("CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
-	s.ok("CREATE TABLE ks.m (k int PRIMARY KEY, attrs map<text, text>)")
-	s.ok("INSERT INTO ks.m (k, attrs) VALUES (1, {'color': 'red', 'size': 'L'})")
-	s.ok("INSERT INTO ks.m (k, attrs) VALUES (2, {'color': 'blue', 'size': 'L'})")
-	s.ok("INSERT INTO ks.m (k, attrs) VALUES (3, {'color': 'red'})")
-	s.fails("SELECT k FROM ks.m WHERE attrs['color'] = 'red'", "ALLOW FILTERING")
-	require.ElementsMatch(t, []string{"1", "3"}, s.rows("SELECT k FROM ks.m WHERE attrs['color'] = 'red' ALLOW FILTERING"))
-	s.ok("CREATE INDEX ON ks.m (entries(attrs))")
-	require.ElementsMatch(t, []string{"1", "3"}, s.rows("SELECT k FROM ks.m WHERE attrs['color'] = 'red'"))
-	require.ElementsMatch(t, []string{"1", "2"}, s.rows("SELECT k FROM ks.m WHERE attrs['size'] = 'L'"))
-	s.ok("UPDATE ks.m SET attrs['color'] = 'green' WHERE k = 1")
-	require.Equal(t, []string{"3"}, s.rows("SELECT k FROM ks.m WHERE attrs['color'] = 'red'"))
-	require.Equal(t, []string{"1"}, s.rows("SELECT k FROM ks.m WHERE attrs['color'] = ?", "green"))
-
-	s.ok("CREATE TABLE ks.s (k int, c int, owner text STATIC, v int, PRIMARY KEY (k, c))")
-	s.ok("INSERT INTO ks.s (k, c, owner, v) VALUES (1, 1, 'ann', 10)")
-	s.ok("INSERT INTO ks.s (k, c, v) VALUES (1, 2, 20)")
-	s.ok("INSERT INTO ks.s (k, c, owner, v) VALUES (2, 1, 'bob', 30)")
-	s.ok("CREATE INDEX ON ks.s (owner)")
-	require.Equal(t, []string{"1 1 10", "1 2 20"}, s.rows("SELECT k, c, v FROM ks.s WHERE owner = 'ann'"))
-	s.ok("UPDATE ks.s SET owner = 'bob' WHERE k = 1")
-	require.Empty(t, s.rows("SELECT k FROM ks.s WHERE owner = 'ann'"))
-	require.Len(t, s.rows("SELECT k FROM ks.s WHERE owner = 'bob'"), 3)
-}
-
-// TestIndexEntryKeys covers index entries whose row key starts with 0xFF
-// or 0xFE (after a value's terminator they must not read as an escape),
-// and text values with zero bytes in range scans.
-func TestIndexEntryKeys(t *testing.T) {
-	s := openTest(t, nil)
-	s.ok("CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
-	s.ok("CREATE TABLE ks.kv (k int PRIMARY KEY, v text)")
-	s.ok("CREATE INDEX ON ks.kv (v)")
-	for i := 0; i < 300; i++ {
-		s.ok(fmt.Sprintf("INSERT INTO ks.kv (k, v) VALUES (%d, 'v%d')", i, i%10))
-	}
-	require.Len(t, s.rows("SELECT k FROM ks.kv WHERE v = 'v3'"), 30)
-	s.ok("CREATE TABLE ks.r (k int PRIMARY KEY, v text)")
-	s.ok("CREATE INDEX ON ks.r (v) USING 'sai'")
-	s.ok("INSERT INTO ks.r (k, v) VALUES (1, 'a')")
-	s.ok("INSERT INTO ks.r (k, v) VALUES (2, ?)", []byte("a\x00b"))
-	s.ok("INSERT INTO ks.r (k, v) VALUES (3, 'b')")
-	require.ElementsMatch(t, []string{"2", "3"}, s.rows("SELECT k FROM ks.r WHERE v > 'a'"))
-	require.ElementsMatch(t, []string{"1"}, s.rows("SELECT k FROM ks.r WHERE v = 'a'"))
-}
-
 // TestEstimatesAndViews checks system.size_estimates, table_estimates
 // and the system_views node tables.
 func TestEstimatesAndViews(t *testing.T) {
@@ -281,4 +177,19 @@ func TestEstimatesAndViews(t *testing.T) {
 		return []string{v[0][len("org.apache.cassandra.dht."):]}
 	}())
 	require.Len(t, s.rows("SELECT mebibytes FROM system_views.disk_usage WHERE keyspace_name = 'ks'"), 1)
+}
+
+// TestMapElementRestriction covers m[key] = value restrictions, which
+// filter.
+func TestMapElementRestriction(t *testing.T) {
+	s := openTest(t, nil)
+	s.ok("CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+	s.ok("CREATE TABLE ks.m (k int PRIMARY KEY, attrs map<text, text>)")
+	s.ok("INSERT INTO ks.m (k, attrs) VALUES (1, {'color': 'red', 'size': 'L'})")
+	s.ok("INSERT INTO ks.m (k, attrs) VALUES (2, {'color': 'blue', 'size': 'L'})")
+	s.ok("INSERT INTO ks.m (k, attrs) VALUES (3, {'color': 'red'})")
+	s.fails("SELECT k FROM ks.m WHERE attrs['color'] = 'red'", "ALLOW FILTERING")
+	require.ElementsMatch(t, []string{"1", "3"}, s.rows("SELECT k FROM ks.m WHERE attrs['color'] = 'red' ALLOW FILTERING"))
+	require.ElementsMatch(t, []string{"1", "2"}, s.rows("SELECT k FROM ks.m WHERE attrs['size'] = ? ALLOW FILTERING", "L"))
+	s.fails("CREATE INDEX ON ks.m (attrs)", "not supported")
 }

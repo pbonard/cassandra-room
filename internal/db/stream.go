@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -23,7 +22,7 @@ import (
 // exports the range (lsm.Table.ExportRange hard-links sstables wholly
 // inside it and writes the sections of the others), the receiver pulls the
 // files in chunks over the large-message connection, imports them
-// (hard-linked into the table, not rewritten) and indexes the rows. The
+// (hard-linked into the table, not rewritten). The
 // receiver always pulls; a node that must push a range asks the receiver
 // to pull it.
 //
@@ -190,7 +189,7 @@ func (p *proxy) fetchFiles(ctx context.Context, from string, id lsm.TableID, lo,
 			return total, err
 		}
 	}
-	return total, d.indexRange(t, lo, hi)
+	return total, nil
 }
 
 func receiveFile(fs vfs.FS, path string, sf streamFile, chunk func(off int64) ([]byte, error)) error {
@@ -213,48 +212,6 @@ func receiveFile(fs vfs.FS, path string, sf streamFile, chunk func(off int64) ([
 		off += int64(len(b))
 	}
 	return f.Sync()
-}
-
-// indexRange writes the index entries of a table's rows in [lo, hi) (after
-// an import, which bypasses the write path).
-func (d *DB) indexRange(t *Table, lo, hi []byte) error {
-	if len(t.Indexes) == 0 {
-		return nil
-	}
-	lt, err := d.engine.Table(t.Storage)
-	if err != nil {
-		return err
-	}
-	if len(hi) == 0 {
-		hi = nil
-	}
-	it, err := lt.NewIter(lo, hi)
-	if err != nil {
-		return err
-	}
-	var keys [][]byte
-	for ok := it.First(); ok; ok = it.Next() {
-		keys = append(keys, slices.Clone(it.Key()))
-	}
-	err = it.Error()
-	it.Close()
-	if err != nil {
-		return err
-	}
-	for _, ix := range t.Indexes {
-		if isFloatVector(ix.col.Type) {
-			for _, k := range keys {
-				if err := d.indexVector(t, ix, k); err != nil {
-					return err
-				}
-			}
-			continue
-		}
-		if err := d.buildIndexKeys(t, ix, keys, d.opts.Now().Unix()); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // streamBetween copies a key range of a table from one node to another:

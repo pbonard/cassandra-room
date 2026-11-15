@@ -309,7 +309,7 @@ func analyzeWhere(t *Table, rels []cql.Relation, vs *vars) (*where, error) {
 			}
 			w.filters = append(w.filters, filter{col: c, op: r.Op, t: tt})
 		case "LIKE":
-			return nil, invalidf("LIKE restriction is only supported on properly indexed columns. %s is not valid.", relationString(r))
+			return nil, invalidf("LIKE restrictions are not supported: %s", relationString(r))
 		case "IS NOT NULL":
 			return nil, invalidf("Unsupported restriction: %s IS NOT NULL", c.Name)
 		}
