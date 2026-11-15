@@ -2,6 +2,7 @@ package db
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"github.com/pbonard/cassandra-room/internal/cluster"
@@ -727,4 +728,84 @@ func TestClusterTracing(t *testing.T) {
 	require.Contains(t, joined, "MUTATION acknowledged by")
 	require.Contains(t, joined, "Reading a row at QUORUM")
 	require.Len(t, c.values(1, one, "SELECT session_id FROM system_traces.sessions"), 2)
+}
+
+// TestClusterAccord runs conditional updates on a transactional_mode
+// 'full' table as Accord transactions: concurrent compare-and-set from
+// every coordinator, with and without a replica down.
+func TestClusterAccord(t *testing.T) {
+	c := newTestCluster(t, 3)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}")
+	c.ok(0, quorum, "CREATE TABLE ks.c (k int PRIMARY KEY, v int, l list<int>) WITH transactional_mode = 'full'")
+	require.Contains(t, c.values(1, one, "SELECT transactional_mode FROM system_schema.tables WHERE keyspace_name = 'ks' AND table_name = 'c'"), "full")
+	res := c.exec(1, quorum, "INSERT INTO ks.c (k, v) VALUES (1, 0) IF NOT EXISTS")
+	require.Equal(t, byte(1), res.(*message.RowsResult).Data[0][0][0])
+	res = c.exec(2, quorum, "INSERT INTO ks.c (k, v) VALUES (1, 5) IF NOT EXISTS")
+	rows := res.(*message.RowsResult)
+	require.Equal(t, byte(0), rows.Data[0][0][0], "not applied: the row exists")
+	require.Len(t, rows.Data[0], 4, "[applied] and the current row")
+
+	serial := primitive.ConsistencyLevelSerial
+	increments := func(nodes []int) int64 {
+		var applied atomic.Int64
+		var wg sync.WaitGroup
+		for w := 0; w < 6; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				node := nodes[w%len(nodes)]
+				for i := 0; i < 8; i++ {
+					res := c.exec(node, serial, "SELECT v FROM ks.c WHERE k = 1")
+					rows, ok := res.(*message.RowsResult)
+					if !ok {
+						continue
+					}
+					cur := int(int32(be32(rows.Data[0][0])))
+					res = c.exec(node, quorum, "UPDATE ks.c SET v = ?, l = l + [?] WHERE k = 1 IF v = ?", cur+1, cur+1, cur)
+					switch r := res.(type) {
+					case *message.RowsResult:
+						if r.Data[0][0][0] == 1 {
+							applied.Add(1)
+						}
+					case *message.WriteTimeout:
+						require.Equal(t, primitive.WriteTypeCas, r.WriteType)
+					default:
+						t.Errorf("unexpected %T %v", res, res)
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		return applied.Load()
+	}
+	n := increments([]int{0, 1, 2})
+	require.Positive(t, n)
+	final := c.values(2, serial, "SELECT v FROM ks.c WHERE k = 1")
+	v, err := strconv.Atoi(final[0])
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, int64(v), n, "every acknowledged increment applied")
+	// The list holds each successful increment once, in order.
+	l := c.values(0, serial, "SELECT l FROM ks.c WHERE k = 1")
+	want := binary.BigEndian.AppendUint32(nil, uint32(v))
+	for i := 1; i <= v; i++ {
+		want = binary.BigEndian.AppendUint32(want, 4)
+		want = binary.BigEndian.AppendUint32(want, uint32(i))
+	}
+	require.Equal(t, []string{string(want)}, l)
+
+	// A replica down: a quorum still commits.
+	c.stop(2)
+	require.Eventually(t, func() bool { return !c.nodes[0].proxy.g.IsAlive(c.addrs[2]) }, 5*time.Second, 10*time.Millisecond)
+	require.Positive(t, increments([]int{0, 1}))
+
+	// It restarts from its journal and catches up: the transactions it
+	// missed reach it, and it coordinates again.
+	c.start(2)
+	require.Positive(t, increments([]int{2}))
+	got := c.values(2, serial, "SELECT v FROM ks.c WHERE k = 1")
+	require.Eventually(t, func() bool {
+		n := c.nodes[2].proxy.accord
+		return n != nil
+	}, time.Second, 10*time.Millisecond)
+	require.Equal(t, c.values(0, serial, "SELECT v FROM ks.c WHERE k = 1"), got)
 }

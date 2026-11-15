@@ -105,6 +105,9 @@ type TableParams struct {
 	AdditionalWrite     string
 	ReadRepair          string
 	CDC                 bool
+	// TransactionalMode is transactional_mode: off, or full (conditional
+	// statements run as Accord transactions).
+	TransactionalMode string `json:",omitempty"`
 }
 
 func defaultParams() TableParams {
@@ -453,7 +456,7 @@ var tableOptions = map[string]bool{
 	"incremental_backups": true, "max_index_interval": true, "memtable": true,
 	"memtable_flush_period_in_ms": true, "min_index_interval": true, "read_repair": true,
 	"speculative_retry": true, "additional_write_policy": true, "id": true,
-	"dclocal_read_repair_chance": true, "read_repair_chance": true,
+	"dclocal_read_repair_chance": true, "read_repair_chance": true, "transactional_mode": true,
 }
 
 func applyTableProperties(p *TableParams, props []cql.Property) error {
@@ -514,6 +517,17 @@ func applyTableProperties(p *TableParams, props []cql.Property) error {
 				p.CRCCheckChance = f
 			} else {
 				p.BloomFilterFPChance = f
+			}
+		case "transactional_mode":
+			s, err := stringProperty(prop)
+			if err != nil {
+				return err
+			}
+			switch s = strings.ToLower(s); s {
+			case txnModeOff, txnModeFull:
+				p.TransactionalMode = s
+			default:
+				return invalidf("Invalid transactional_mode %q: off or full", s)
 			}
 		case "cdc":
 			s, err := stringProperty(prop)

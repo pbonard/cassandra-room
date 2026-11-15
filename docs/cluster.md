@@ -196,8 +196,9 @@ node, the coordinator in a cluster.
 - Metadata: applying an entry still re-encodes the whole metadata to check
   its hash; the target of an interrupted reconfiguration is not recorded
   in the metadata (TCM records it so any node can finish it).
-- Lightweight transactions stay on Paxos v1 (Accord is planned to replace
-  them).
+- Lightweight transactions use Paxos v1 unless the table has
+  `transactional_mode = 'full'`, which runs them on Accord (see
+  `docs/accord.md`).
 - Repair is full repair only (no incremental repair); streaming sends
   files through messages (no sendfile).
 

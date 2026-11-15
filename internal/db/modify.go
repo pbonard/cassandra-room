@@ -702,7 +702,7 @@ func (m *modification) buildCells(e *execCtx, ts, ttl int64, cur *current) (cell
 			default:
 				add(c, complexDeletion(c, ts-1))
 				if st == vSet {
-					els, err := e.d.elementCells(c, v, ts, false, func(p, x []byte) row.Cell { return live(c, p, x) })
+					els, err := e.d.elementCells(c, v, ts, false, e.listPath, func(p, x []byte) row.Cell { return live(c, p, x) })
 					if err != nil {
 						return nil, nil, err
 					}
@@ -715,7 +715,7 @@ func (m *modification) buildCells(e *execCtx, ts, ttl int64, cur *current) (cell
 			if st != vSet {
 				continue
 			}
-			els, err := e.d.elementCells(c, v, ts, op.kind == opPrepend, func(p, x []byte) row.Cell { return live(c, p, x) })
+			els, err := e.d.elementCells(c, v, ts, op.kind == opPrepend, e.listPath, func(p, x []byte) row.Cell { return live(c, p, x) })
 			if err != nil {
 				return nil, nil, err
 			}

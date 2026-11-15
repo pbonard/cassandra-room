@@ -2,6 +2,7 @@ package db
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -73,7 +74,7 @@ var systemTables = map[string]map[string]string{
 			extensions frozen<map<text, blob>>, flags frozen<set<text>>, gc_grace_seconds int, id uuid,
 			incremental_backups boolean, max_index_interval int, memtable text, memtable_flush_period_in_ms int,
 			min_index_interval int, read_repair text, read_repair_chance double, speculative_retry text,
-			PRIMARY KEY ((keyspace_name), table_name))`,
+			transactional_mode text, PRIMARY KEY ((keyspace_name), table_name))`,
 		"columns": `CREATE TABLE columns (keyspace_name text, table_name text, column_name text,
 			clustering_order text, column_name_bytes blob, kind text, position int, type text,
 			PRIMARY KEY ((keyspace_name), table_name, column_name))`,
@@ -328,6 +329,7 @@ func tableRows(d *DB) []map[string][]byte {
 				"read_repair":                 textV(p.ReadRepair),
 				"read_repair_chance":          doubleV(0),
 				"speculative_retry":           textV(p.SpeculativeRetry),
+				"transactional_mode":          textV(cmp.Or(p.TransactionalMode, txnModeOff)),
 			})
 		}
 	}
@@ -399,7 +401,7 @@ func newVirtualSource(d *DB, t *Table) *virtualSource {
 				continue
 			}
 			if c.Type.IsMultiCell() {
-				cells, err := d.elementCells(c, v, 0, false, func(p, x []byte) row.Cell {
+				cells, err := d.elementCells(c, v, 0, false, d.listPath, func(p, x []byte) row.Cell {
 					return row.Cell{Column: c.ID, Path: p, LocalDeletionTime: row.NoDeletionTime, Value: x}
 				})
 				if err == nil {

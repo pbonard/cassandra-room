@@ -557,7 +557,13 @@ func (s *selectStmt) execute(e *execCtx) (message.Message, error) {
 			if len(pks) != 1 {
 				return nil, invalidf("SERIAL/LOCAL_SERIAL consistency may only be requested for one partition at a time")
 			}
-			if err := d.proxy.serialReadBegin(s.t, pks[0], e.cl); err != nil {
+			if s.t.accordManaged() {
+				// Accord: a read transaction on the partition orders the
+				// read after every transaction decided before it.
+				if err := d.proxy.accordBarrier(s.t, pks[0]); err != nil {
+					return nil, err
+				}
+			} else if err := d.proxy.serialReadBegin(s.t, pks[0], e.cl); err != nil {
 				return nil, err
 			}
 		}

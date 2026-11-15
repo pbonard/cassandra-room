@@ -282,6 +282,9 @@ func tableCQL(t *Table) string {
 		"read_repair = "+cqlString(p.ReadRepair),
 		"speculative_retry = "+cqlString(p.SpeculativeRetry),
 	)
+	if p.TransactionalMode != "" && p.TransactionalMode != txnModeOff {
+		opts = append(opts, "transactional_mode = "+cqlString(p.TransactionalMode))
+	}
 	b.WriteString(" WITH ")
 	b.WriteString(strings.Join(opts, "\n    AND "))
 	b.WriteString(";")

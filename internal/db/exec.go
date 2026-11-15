@@ -164,6 +164,11 @@ type execCtx struct {
 	counterDeltas bool
 	// local restricts reads to this node (replica-side reads).
 	local bool
+	// listSeq, if set, numbers list elements deterministically (Accord).
+	listSeq *uint32
+	// src is the statement's text, for conditional statements run by
+	// Accord, which any node may have to execute again.
+	src *stmtSource
 	// trace records the request's events, if traced.
 	trace *Trace
 }
@@ -285,6 +290,7 @@ func (d *DB) Execute(p *Prepared, o *RequestOptions) message.Message {
 			return ErrorMessage(err)
 		}
 	}
+	e.src = &stmtSource{Query: p.Query, Keyspace: p.Keyspace}
 	res, err := st.stmt.execute(e)
 	if err != nil {
 		return ErrorMessage(err)
@@ -352,6 +358,7 @@ func (d *DB) ExecuteBatch(typ primitive.BatchType, children []BatchChild, o *Req
 		}
 		child := *ctx
 		child.values = c.Values
+		child.src = &stmtSource{Query: c.Prepared.Query, Keyspace: c.Prepared.Keyspace}
 		mods = append(mods, boundModification{m: m, e: &child})
 	}
 	if conditional {

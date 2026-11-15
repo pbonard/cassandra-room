@@ -23,6 +23,7 @@ import (
 	"github.com/datastax/go-cassandra-native-protocol/frame"
 	"github.com/datastax/go-cassandra-native-protocol/message"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
+	"github.com/pbonard/cassandra-room/internal/accord"
 	"github.com/pbonard/cassandra-room/internal/cluster"
 	"github.com/pbonard/cassandra-room/internal/storage/lsm"
 	"github.com/pbonard/cassandra-room/internal/storage/row"
@@ -64,11 +65,13 @@ type ClusterOptions struct {
 // by timestamp, so the merge is reconciliation) and repair the replicas
 // that were behind.
 type proxy struct {
-	d    *DB
-	m    *cluster.Messaging
-	g    *cluster.Gossiper
-	cms  *cluster.CMS
-	lats sync.Map // lsm.TableID -> *readLatency, for speculative retry
+	d   *DB
+	m   *cluster.Messaging
+	g   *cluster.Gossiper
+	cms *cluster.CMS
+	// accord runs Accord transactions (transactional_mode tables).
+	accord *accord.Node
+	lats   sync.Map // lsm.TableID -> *readLatency, for speculative retry
 	// initialCMS are the metadata service's members before the metadata
 	// records any.
 	initialCMS []string
@@ -199,6 +202,10 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 		return err
 	}
 	if err := p.cms.SetPersistence(saved, func(b []byte) error { return d.writeFileAtomic(cmsStateFileName, b) }); err != nil {
+		m.Close()
+		return err
+	}
+	if err := p.startAccord(); err != nil {
 		m.Close()
 		return err
 	}
@@ -413,6 +420,7 @@ func (p *proxy) metadataChanged(s *Schema) {
 	}
 	p.replaced.Store(&replaced)
 	p.ring.Store(cluster.NewRing(nodeList(s)))
+	p.accordTopology(s)
 	p.g.Update(func(st *cluster.EndpointState) { st.Epoch = s.Epoch })
 }
 
@@ -447,6 +455,9 @@ func (p *proxy) disseminate(epoch int64) {
 func (p *proxy) stop() {
 	close(p.stopCh)
 	p.wg.Wait()
+	if p.accord != nil {
+		p.accord.Stop()
+	}
 	p.g.Stop()
 	p.m.Close()
 }
