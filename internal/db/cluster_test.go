@@ -1079,3 +1079,46 @@ func TestClusterInterop(t *testing.T) {
 	_, isErr := c.exec(0, quorum, "BEGIN TRANSACTION SELECT v FROM ks.t_off WHERE k = 1; COMMIT TRANSACTION").(message.Error)
 	require.True(t, isErr)
 }
+
+// TestClusterAccordDurability runs Accord's durability rounds (sync points
+// applied at every replica) while conditional updates run: the redundancy
+// bound advances, records below it are forgotten, and the virtual tables
+// report it.
+func TestClusterAccordDurability(t *testing.T) {
+	c := newTestCluster(t, 0)
+	c.tweak = func(co *ClusterOptions) { co.AccordDurabilityInterval = 200 * time.Millisecond }
+	for i := 0; i < 3; i++ {
+		c.add()
+		c.start(i)
+	}
+	c.waitConverged()
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}")
+	c.ok(0, quorum, "CREATE TABLE ks.c (k int PRIMARY KEY, v int)")
+	for i := 0; i < 30; i++ {
+		c.ok(i%3, quorum, "INSERT INTO ks.c (k, v) VALUES (?, 0) IF NOT EXISTS", i%10)
+		c.ok(i%3, quorum, "UPDATE ks.c SET v = ? WHERE k = ? IF EXISTS", i, i%10)
+	}
+	stat := func(node int, name string) int64 {
+		v := c.values(node, one, "SELECT value FROM system_views.accord_stats WHERE name = ?", name)
+		require.Len(t, v, 1)
+		return int64(binary.BigEndian.Uint64([]byte(v[0])))
+	}
+	require.Eventually(t, func() bool {
+		for i := 0; i < 3; i++ {
+			if stat(i, "redundant_bounds") == 0 || stat(i, "commands") > 10 {
+				return false
+			}
+		}
+		return true
+	}, 30*time.Second, 100*time.Millisecond, "durability rounds made the transactions redundant and forgotten")
+	total := int64(0)
+	for i := 0; i < 3; i++ {
+		total += stat(i, "durability_rounds")
+	}
+	require.Positive(t, total)
+	require.Positive(t, stat(0, "fast_path")+stat(0, "slow_path")+stat(0, "medium_path")+stat(1, "fast_path")+stat(1, "slow_path"))
+	// Updates still work after the old records are gone.
+	res := c.ok(1, quorum, "UPDATE ks.c SET v = 100 WHERE k = 3 IF v = ?", 23).(*message.RowsResult)
+	require.Equal(t, byte(1), res.Data[0][0][0])
+	_ = c.values(0, one, "SELECT txn_id, status FROM system_views.accord_txns")
+}

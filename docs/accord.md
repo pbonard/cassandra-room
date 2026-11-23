@@ -24,16 +24,22 @@ names, not its class structure.
   with the merged dependencies of the fast votes. Fast quorums follow
   `Shard.simpleFastQuorumSize`: all 3 of 3 replicas, 4 of 5.
 - **Privileged coordinator** (`PrivilegedCoordinatorWithoutDeps`): when the
-  coordinator replicates one of the transaction's keys, it votes first,
+  transaction has a single key and the coordinator replicates it, it votes
+  first,
   locally, and its vote counts, so a shard's fast quorum is
   `privilegedWithoutDepsFastQuorumSize`: 2 of 3 replicas. It decides the
   fast path locally, and only if no recovery has promised a ballot there.
   A recovery that reaches the undecided coordinator therefore knows the
   fast path was not taken. A recovery that doesn't reach it assumes it
-  voted.
+  voted. As in cassandra-accord `fc4a769`, multi-key transactions don't use
+  it.
 - **Medium path**: if a slow quorum of every shard (but not a fast quorum)
   voted for the TxnID, one Accept round of that proposal commits it, with
-  the votes' dependencies. The replicas don't compute new ones.
+  the votes' dependencies. The replicas don't compute new ones. It is off
+  for privileged transactions (cassandra-accord `fc4a769`: the medium path
+  with coordinator-optimised quorums is not correctly implemented).
+- **Reads** go to the coordinator itself, then to the nearest replicas
+  (same rack, then same data center), as upstream picks read candidates.
 - **Slow path** (`Propose`): the coordinator proposes the latest timestamp
   to every replica in an Accept round. The Accept round also recomputes
   dependencies against that timestamp.
@@ -99,25 +105,58 @@ names, not its class structure.
   - **Stale epochs:** a replica refuses a new transaction from an epoch
     before that (`StaleTopology`). The coordinator then recovers it (so it
     never executes) and retries in the newer epoch.
-- **Joining nodes**:
-  - **While bootstrapping:** a pending replica receives every Apply, and
-    writes go to the replicas of every epoch up to the current one, so its
-    streamed data plus those writes are complete.
-  - **Old dependencies:** a dependency from before the node joined that it
-    doesn't know doesn't hold up applying, because its effect came with the
-    bootstrap data, and writes are timestamped cells (the latest wins in any
-    order). Reads at that node wait until such dependencies are fetched; it
-    answers "not ready" and the coordinator reads from another replica.
+- **Exclusive sync points** (`syncpoint.go`, `CoordinateSyncPoint`): a
+  transaction over ranges, with no reads or writes.
+  - **Proposal:** a quorum of every shard (in every epoch not yet
+    synchronised) witnesses it. Each replica records a barrier for its
+    ranges and returns every transaction there with a lower id.
+  - **Barrier:** a replica that witnessed it refuses any new transaction
+    with a lower id (PreAccept and the original Accept answer "stale"; a
+    recovery reports a superseding reject). Such a transaction's coordinator
+    recovers it, which invalidates it, and retries with a new id.
+  - **Applying:** a sync point is applied once every one of its
+    dependencies has applied, so afterwards every transaction with a lower
+    id on its ranges has applied or can never commit.
+  - **Abandoned ones:** a sync point is never recovered. One its coordinator
+    abandons only leaves barriers, and is invalidated locally after a while.
+- **Durability** (`CoordinateShardDurable`, `RedundantBefore`): one node
+  (the normal node with the lowest address) periodically runs a sync point
+  over each table's whole range, applied at every replica. Its id then
+  becomes the range's redundancy bound on every replica.
+  - **Forgetting:** below the bound, applied and invalidated records are
+    forgotten (with their journal records).
+  - **Late messages:** a late message about a forgotten transaction is
+    refused (PreAccept, Accept), and its recovery reports it durable.
+  - **Unknown dependencies:** below the bound they count as applied.
+- **Joining nodes** (`Bootstrap`): before streaming, a joining node takes a
+  sync point over every table, applied at every current replica (or at a
+  quorum when one is down, as when replacing it).
+  - **Streamed data:** it then holds every transaction before the sync
+    point; later ones reach the node as a pending replica, since writes go
+    to the replicas of every epoch up to the current one.
+  - **Earlier dependencies:** the node doesn't wait to apply earlier ones it
+    doesn't know, because writes are timestamped cells and the latest wins
+    in any order. Its reads wait until they are fetched; it answers "not
+    ready" and the coordinator reads from another replica.
 - **Journal** (`Journal`, `AccordJournal`): every state change is made
   durable before the replica answers, and replayed at startup.
   - **Truncation:** a transaction applied at every replica is truncated
     after `RetainApplied` to its id, status and timestamp. An erased
     command is only adopted once it is durably decided everywhere
     (CASSANDRA-18365).
-  - **Forgetting:** truncated and invalidated records are forgotten after
-    `TombstoneRetention`, and their journal records deleted. Each key keeps
-    the largest timestamp it witnessed, so a late message about a forgotten
-    transaction gets no fast-path vote. Its recovery invalidates it.
+  - **Forgetting:** below the durability bound, as above. Without
+    durability rounds, truncated and invalidated records are forgotten after
+    `TombstoneRetention`, and each key keeps the largest timestamp it
+    witnessed, so a late message about a forgotten transaction gets no
+    fast-path vote.
+- **Observability** (`Stats`, `Commands`), exposed as two virtual tables:
+  - `system_views.accord_stats`: fast, medium and slow paths, recoveries,
+    invalidations, ephemeral and range reads, sync points, durability
+    rounds, stale refusals, timeouts, command and key counts, barriers,
+    redundancy bounds, and epochs.
+  - `system_views.accord_txns`: the transactions in progress on the node,
+    with their status, execution timestamp and what they wait on
+    (`DebugBlockedTxns`).
 
 ## In the database
 
@@ -216,21 +255,33 @@ names, not its class structure.
   - a fast-path commit that reached one replica, recovered without it;
   - a transaction barely witnessed, then invalidated;
   - Accept reaching a newer epoch's replicas.
-- `TestClusterAccord` (`internal/db`) runs concurrent compare-and-set from
-  every node, with a replica down, and then after it restarts.
+- `internal/accord/syncpoint_test.go`:
+  - a sync point under load (every dependency applied, lower ids refused);
+  - durability rounds every 300 ms under message loss (all checks hold,
+    records forgotten, late messages refused);
+  - bootstrap at a sync point.
+- `TestPrivilegedRestrictions`: the two cassandra-accord `fc4a769`
+  restrictions.
+- `internal/db` cluster tests:
+  - `TestClusterAccord`: concurrent compare-and-set from every node, with a
+    replica down, and then after it restarts;
+  - `TestClusterLWT` and `TestClusterInterop`: lightweight transactions on
+    ordinary and `mixed_reads` tables;
+  - `TestClusterAccordDurability`: durability rounds, with the virtual
+    tables reporting them.
 
 ## Not done
 
-- **Range transactions:** range reads are ephemeral, so they form a
-  per-partition snapshot, not one across the range. Range transactions
-  that commit (with range dependencies and sync points) aren't done; as in
-  Cassandra, transactions reject range reads.
-- **Epoch synchronisation:** it is per node, not per range, and a node
-  still on an old epoch holds it back for everyone.
-- **Write coverage after joins:** a write that a joining node missed while
-  down (after the Apply retries give up) is only repaired when a read
-  fetches it, or by repair.
-- **Other optimisations:** per-shard command stores, journal segments
-  (each command is one synced row), and `PrivilegedCoordinatorWithDeps`.
+- **Range reads:** they are ephemeral, so they form a per-partition
+  snapshot, not one across the range. Sync points are the only range
+  transactions; as in Cassandra, `BEGIN TRANSACTION` rejects range reads.
+- **Epoch synchronisation:** it still polls nodes (per node, not per range)
+  rather than using sync points per epoch.
+- **Granularity:** durability rounds and bootstrap cover whole tables, not
+  the ranges that changed.
+- **Unported upstream work:** per-shard command stores, a segmented journal
+  (each command is one synced row), `PrivilegedCoordinatorWithDeps`,
+  replica-side execution, and Paxos migration (unnecessary here: Paxos was
+  removed).
 - **Transaction results:** the result of a transaction is not paged (a
   transaction executes once, as in Cassandra).

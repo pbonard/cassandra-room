@@ -31,6 +31,7 @@ func (n *Node) Coordinate(ctx context.Context, txn *Txn) ([]byte, error) {
 		res, err := n.coordinate(ctx, id, txn)
 		switch {
 		case errors.Is(err, errStale):
+			n.metrics.stale.Add(1)
 			// Make sure the stale attempt never executes, then retry in
 			// the newer epoch.
 			_ = n.recover(ctx, id, txn, txn.Keys)
@@ -44,7 +45,10 @@ func (n *Node) Coordinate(ctx context.Context, txn *Txn) ([]byte, error) {
 				continue
 			}
 		case errors.Is(err, errPreempted):
+			n.metrics.preempted.Add(1)
 			return n.awaitOutcome(ctx, id, txn.Keys)
+		case errors.Is(err, ErrTimeout):
+			n.metrics.timeouts.Add(1)
 		}
 		return res, err
 	}
@@ -150,12 +154,16 @@ func (n *Node) coordinate(ctx context.Context, id TxnID, txn *Txn) ([]byte, erro
 		if id.Privileged && !n.s.fastCommit(id, txn, deps) {
 			return nil, errPreempted
 		}
+		n.metrics.fastPath.Add(1)
 		return n.execute(ctx, Ballot{}, id, txn, id.Timestamp, deps)
 	}
-	if medium.done() {
+	if medium.done() && !id.Privileged {
 		// The medium path: a slow quorum of every shard voted for the
 		// TxnID; one Accept round of that proposal, without new
-		// dependencies, commits it.
+		// dependencies, commits it. Not with the privileged coordinator's
+		// quorums (cassandra-accord fc4a769: not correctly implemented with
+		// coordinator optimisation quorums).
+		n.metrics.mediumPath.Add(1)
 		return n.propose(ctx, Ballot{}, id, txn, id.Timestamp, fastDeps(), true)
 	}
 	executeAt := id.Timestamp
@@ -164,6 +172,7 @@ func (n *Node) coordinate(ctx context.Context, id TxnID, txn *Txn) ([]byte, erro
 		executeAt = maxTimestamp(executeAt, r.ExecuteAt)
 		deps = deps.with(r.Deps)
 	}
+	n.metrics.slowPath.Add(1)
 	return n.propose(ctx, Ballot{}, id, txn, executeAt, deps, false)
 }
 
@@ -196,6 +205,8 @@ func (n *Node) propose(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 		switch {
 		case r.err != nil:
 			tr.failure(r.from)
+		case r.reply.Outcome == stale && ballot.IsZero():
+			return nil, errStale
 		case r.reply.Outcome != ok:
 			return nil, errPreempted
 		default:
@@ -246,10 +257,7 @@ func (n *Node) execute(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 		if covered {
 			continue
 		}
-		order := slices.Clone(s.Nodes)
-		if i := slices.Index(order, n.cfg.ID); i > 0 {
-			order[0], order[i] = order[i], order[0]
-		}
+		order := n.readOrder(s.Nodes)
 		done := false
 		for _, to := range order {
 			req := *stable
@@ -429,6 +437,7 @@ func (n *Node) recover(ctx context.Context, id TxnID, txn *Txn, keys []Key) erro
 	if txn != nil {
 		keys = txn.Keys
 	}
+	n.metrics.recoveries.Add(1)
 	ballot := Ballot{Epoch: n.epoch(), HLC: n.clock.Next(0), Node: n.cfg.ID}
 	ts := n.phaseTopologies(keys, id.Epoch, n.epoch())
 	if len(ts.Shards) == 0 {
@@ -564,6 +573,7 @@ func phase(r *recoverReply) int {
 
 // invalidate makes sure a transaction never executes (Invalidate).
 func (n *Node) invalidate(ctx context.Context, ballot Ballot, ts *Topologies, id TxnID, keys []Key) error {
+	n.metrics.invalidations.Add(1)
 	req := &acceptReq{ID: id, Ballot: ballot, Keys: keys, Invalidate: true}
 	ch := broadcast[acceptReply](ctx, n, ts.nodes(), mAccept, func(NodeID) any { return req })
 	tr := newTracker(ts, (*Shard).slowQuorum)
@@ -669,6 +679,13 @@ func (n *Node) progressLog() {
 		for _, c := range n.s.cmds {
 			switch {
 			case c.Status == Applied || c.Status == Invalidated || c.Status == Truncated:
+			case c.ID.Kind == SyncPoint && c.Status < PreApplied:
+				// Never recovered: one its coordinator abandoned is
+				// invalidated here after a while (its barrier stays).
+				if now.Sub(c.lastChange) > 10*n.cfg.RecoverAfter {
+					c.Status = Invalidated
+					_ = n.s.saveLocked(c)
+				}
 			case c.blockedOn != nil && now.Sub(c.blockedSince) > after:
 				dep := n.s.cmds[*c.blockedOn]
 				var txn *Txn
@@ -689,6 +706,14 @@ func (n *Node) progressLog() {
 		}
 		n.s.truncateLocked()
 		n.s.mu.Unlock()
+		if n.cfg.DurabilityRanges != nil && now.Sub(n.lastDurable) > jitter(n.cfg.DurabilityInterval) {
+			n.lastDurable = now
+			n.wg.Add(1)
+			go func() {
+				defer n.wg.Done()
+				n.durability()
+			}()
+		}
 		if now.Sub(n.lastSynced) > 10*n.cfg.ProgressInterval {
 			n.lastSynced = now
 			go func() {
@@ -759,6 +784,7 @@ func (n *Node) String() string { return fmt.Sprintf("accord node %s", n.cfg.ID) 
 // applied at a quorum, which the dependency quorum intersects, so the read
 // sees it; nothing is journaled.
 func (n *Node) ephemeralRead(ctx context.Context, txn *Txn) ([]byte, error) {
+	n.metrics.ephemeralReads.Add(1)
 	epoch := n.epoch()
 	ts := n.phaseTopologies(txn.Keys, epoch, epoch)
 	if len(ts.Shards) == 0 {
@@ -790,10 +816,7 @@ func (n *Node) ephemeralRead(ctx context.Context, txn *Txn) ([]byte, error) {
 	}
 	reads := map[string][]byte{}
 	for _, s := range ts.latest() {
-		order := slices.Clone(s.Nodes)
-		if i := slices.Index(order, n.cfg.ID); i > 0 {
-			order[0], order[i] = order[i], order[0]
-		}
+		order := n.readOrder(s.Nodes)
 		done := false
 		for _, to := range order {
 			var rep ephemeralReply
@@ -884,6 +907,7 @@ func (n *Node) RangeShards(r Range) []RangeShard {
 // have applied there. The result maps each sub-range (Range.String) to
 // what the DataStore read, in token order.
 func (n *Node) ReadRange(ctx context.Context, r Range, txn *Txn) ([]RangeShard, map[string][]byte, error) {
+	n.metrics.rangeReads.Add(1)
 	latest := n.epoch()
 	ts := &Topologies{}
 	var readShards []RangeShard
@@ -933,11 +957,7 @@ func (n *Node) ReadRange(ctx context.Context, r Range, txn *Txn) ([]RangeShard, 
 	}
 	reads := map[string][]byte{}
 	for _, rs := range readShards {
-		order := slices.Clone(rs.Nodes)
-		slices.Sort(order)
-		if i := slices.Index(order, n.cfg.ID); i > 0 {
-			order[0], order[i] = order[i], order[0]
-		}
+		order := n.readOrder(rs.Nodes)
 		sub := Deps{}
 		for ks, ids := range deps {
 			if k, ok := parseKeyString(ks); ok && rs.Range.contains(k) {
@@ -962,4 +982,22 @@ func (n *Node) ReadRange(ctx context.Context, r Range, txn *Txn) ([]RangeShard, 
 		}
 	}
 	return readShards, reads, nil
+}
+
+// readOrder orders replicas to read from: this node first, then the
+// nearest (Config.Proximity), as cassandra-accord picks read candidates.
+func (n *Node) readOrder(nodes []NodeID) []NodeID {
+	order := slices.Clone(nodes)
+	slices.Sort(order)
+	rank := func(x NodeID) int {
+		switch {
+		case x == n.cfg.ID:
+			return -1
+		case n.cfg.Proximity != nil:
+			return n.cfg.Proximity(x)
+		}
+		return 0
+	}
+	slices.SortStableFunc(order, func(a, b NodeID) int { return rank(a) - rank(b) })
+	return order
 }

@@ -293,3 +293,23 @@ func TestRangeIndex(t *testing.T) {
 	}
 	require.True(t, slices.IsSortedFunc(n.s.sorted, func(a, b *cfk) int { return a.key.Compare(b.key) }))
 }
+
+// TestPrivilegedRestrictions follows cassandra-accord fc4a769: no
+// privileged coordinator for multi-key transactions, and no medium path
+// with the privileged coordinator's quorums.
+func TestPrivilegedRestrictions(t *testing.T) {
+	c := newSimCluster(t, 5, 5, 2)
+	n0 := c.node(0)
+	require.True(t, n0.newTxnID(Write, c.keys[0]).Privileged)
+	require.False(t, n0.newTxnID(Write, c.keys[0], c.keys[1]).Privileged, "multi-key: not privileged")
+	// RF 5 with two replicas down: a privileged transaction cannot use the
+	// medium path, so it takes the slow path.
+	c.crash(3)
+	c.crash(4)
+	before := n0.Stats()
+	_, err := n0.Coordinate(context.Background(), appendTxn(t, c.keys[0], 1))
+	require.NoError(t, err)
+	after := n0.Stats()
+	require.Equal(t, before.MediumPath, after.MediumPath)
+	require.Equal(t, before.SlowPath+1, after.SlowPath)
+}

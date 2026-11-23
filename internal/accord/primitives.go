@@ -76,6 +76,10 @@ type Kind uint8
 const (
 	Write Kind = iota
 	Read
+	// SyncPoint is an exclusive sync point over ranges (ExclusiveSyncPoint):
+	// it follows every transaction with a lower id on its ranges, and
+	// replicas that witnessed it refuse new ones with a lower id.
+	SyncPoint
 )
 
 // TxnID identifies a transaction: the timestamp its coordinator gave it,
@@ -92,7 +96,7 @@ type TxnID struct {
 func (id TxnID) Compare(o TxnID) int { return id.Timestamp.Compare(o.Timestamp) }
 
 // conflicts reports whether two transactions on a common key conflict.
-func (id TxnID) conflicts(o TxnID) bool { return id.Kind == Write || o.Kind == Write }
+func (id TxnID) conflicts(o TxnID) bool { return id.Kind != Read || o.Kind != Read }
 
 // Ballot orders recovery attempts; zero is the original coordinator's.
 type Ballot = Timestamp
@@ -152,10 +156,11 @@ func (k Key) Compare(o Key) int {
 // application (the Agent and the DataStore); they must be deterministic so
 // that any node can execute the transaction when recovering it.
 type Txn struct {
-	Kind   Kind   `json:"k,omitempty"`
-	Keys   []Key  `json:"keys"`
-	Read   []byte `json:"r,omitempty"`
-	Update []byte `json:"u,omitempty"`
+	Kind   Kind    `json:"k,omitempty"`
+	Keys   []Key   `json:"keys"`
+	Ranges []Range `json:"ranges,omitempty"`
+	Read   []byte  `json:"r,omitempty"`
+	Update []byte  `json:"u,omitempty"`
 }
 
 // Deps are, per key, the conflicting transactions a transaction must follow
@@ -233,4 +238,33 @@ func (r Range) String() string { return fmt.Sprintf("%x[%d,%d]", r.Prefix, r.Lo,
 type RangeShard struct {
 	Range
 	Nodes []NodeID
+}
+
+// bound is a timestamp over a range: a sync point's barrier, or the
+// redundancy bound it established.
+type bound struct {
+	R  Range
+	TS Timestamp
+}
+
+// boundFor returns the largest bound covering a key.
+func boundFor(bs []bound, k Key) Timestamp {
+	var m Timestamp
+	for _, b := range bs {
+		if b.R.contains(k) {
+			m = maxTimestamp(m, b.TS)
+		}
+	}
+	return m
+}
+
+// addBound records a bound, keeping the largest per range.
+func addBound(bs []bound, r Range, ts Timestamp) []bound {
+	for i := range bs {
+		if bs[i].R == r {
+			bs[i].TS = maxTimestamp(bs[i].TS, ts)
+			return bs
+		}
+	}
+	return append(bs, bound{r, ts})
 }

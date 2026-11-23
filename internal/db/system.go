@@ -58,6 +58,9 @@ var systemTables = map[string]map[string]string{
 		"settings":     `CREATE TABLE settings (name text, value text, PRIMARY KEY ((name)))`,
 		"disk_usage":   `CREATE TABLE disk_usage (keyspace_name text, table_name text, mebibytes bigint, PRIMARY KEY ((keyspace_name), table_name))`,
 		"thread_pools": `CREATE TABLE thread_pools (name text, active_tasks int, active_tasks_limit int, dropped_messages bigint, PRIMARY KEY ((name)))`,
+		"accord_stats": `CREATE TABLE accord_stats (name text, value bigint, PRIMARY KEY ((name)))`,
+		"accord_txns": `CREATE TABLE accord_txns (txn_id text, kind text, status text, execute_at text, keys int,
+			deps int, blocked_on text, PRIMARY KEY ((txn_id)))`,
 		"cluster_metadata_log": `CREATE TABLE cluster_metadata_log (epoch bigint, entry_id text, entry_time timestamp,
 			kind text, transformation text, PRIMARY KEY ((epoch)))`,
 		"cluster_metadata_directory": `CREATE TABLE cluster_metadata_directory (host_id uuid, address text,
@@ -163,6 +166,10 @@ func virtualRows(ks, table string) func(d *DB) []map[string][]byte {
 		return diskUsageRows
 	case "system_views.thread_pools":
 		return threadPoolRows
+	case "system_views.accord_stats":
+		return accordStatRows
+	case "system_views.accord_txns":
+		return accordTxnRows
 	case "system_views.cluster_metadata_log":
 		return metadataLogRows
 	case "system_views.cluster_metadata_directory":

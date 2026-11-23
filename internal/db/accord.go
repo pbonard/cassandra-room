@@ -144,6 +144,10 @@ func (p *proxy) startAccord() error {
 		Data:      accordData{d},
 		Agent:     accordAgent{d},
 		Journal:   &accordJournal{d: d},
+		// Durability rounds (RedundantBefore) and nearest-first reads.
+		DurabilityRanges:   p.accordDurabilityRanges,
+		DurabilityInterval: p.opts.AccordDurabilityInterval,
+		Proximity:          p.accordProximity,
 	})
 	if err != nil {
 		return err
@@ -929,4 +933,84 @@ func (p *proxy) accordAvailable(keys []accord.Key) error {
 		}
 	}
 	return nil
+}
+
+// accordStatRows are the node's Accord metrics (system_views.accord_stats).
+func accordStatRows(d *DB) []map[string][]byte {
+	if d.proxy == nil || d.proxy.accord == nil {
+		return nil
+	}
+	st := d.proxy.accord.Stats()
+	var out []map[string][]byte
+	for _, kv := range []struct {
+		name string
+		v    int64
+	}{
+		{"fast_path", st.FastPath}, {"medium_path", st.MediumPath}, {"slow_path", st.SlowPath},
+		{"recoveries", st.Recoveries}, {"invalidations", st.Invalidations}, {"ephemeral_reads", st.EphemeralReads},
+		{"range_reads", st.RangeReads}, {"sync_points", st.SyncPoints}, {"durability_rounds", st.DurabilityRounds},
+		{"preempted", st.Preempted}, {"stale_epoch_or_barrier", st.Stale}, {"timeouts", st.Timeouts},
+		{"commands", int64(st.Commands)}, {"keys", int64(st.Keys)}, {"barriers", int64(st.Barriers)},
+		{"redundant_bounds", int64(st.Redundant)}, {"epoch", st.Epoch}, {"synced_epoch", st.SyncedEpoch},
+	} {
+		out = append(out, map[string][]byte{"name": textV(kv.name), "value": bigintV(kv.v)})
+	}
+	return out
+}
+
+// accordTxnRows are the transactions in progress on this node and what
+// they wait for (system_views.accord_txns, DebugBlockedTxns).
+func accordTxnRows(d *DB) []map[string][]byte {
+	if d.proxy == nil || d.proxy.accord == nil {
+		return nil
+	}
+	var out []map[string][]byte
+	for _, c := range d.proxy.accord.Commands() {
+		kind := map[accord.Kind]string{accord.Write: "write", accord.Read: "read", accord.SyncPoint: "sync_point"}[c.Kind]
+		r := map[string][]byte{"txn_id": textV(c.ID.String()), "kind": textV(kind), "status": textV(c.Status.String()),
+			"execute_at": textV(c.ExecuteAt.String()), "keys": intV(c.Keys), "deps": intV(c.Deps)}
+		if c.BlockedOn != nil {
+			r["blocked_on"] = textV(c.BlockedOn.String())
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// accordDurabilityRanges are the ranges this node runs durability rounds
+// over: every table's, on one node (the normal node with the lowest
+// address), so rounds are not repeated.
+func (p *proxy) accordDurabilityRanges() []accord.Range {
+	s := p.d.schema.Load()
+	for _, n := range s.Nodes {
+		if n.Status == cluster.StatusNormal && n.Addr < p.self && p.up(n) {
+			return nil
+		}
+	}
+	return p.accordTableRanges()
+}
+
+// accordTableRanges are the whole token ranges of the user tables.
+func (p *proxy) accordTableRanges() []accord.Range {
+	var out []accord.Range
+	for _, t := range p.d.userTables() {
+		out = append(out, accord.Range{Prefix: string(binary.BigEndian.AppendUint64(nil, uint64(t.Storage))), Lo: math.MinInt64, Hi: math.MaxInt64})
+	}
+	return out
+}
+
+// accordProximity ranks a node by distance: same rack, same data center,
+// elsewhere.
+func (p *proxy) accordProximity(addr accord.NodeID) int {
+	s := p.d.schema.Load()
+	me, other := s.nodeByAddr(p.self), s.nodeByAddr(addr)
+	switch {
+	case me == nil || other == nil:
+		return 3
+	case me.DataCenter == other.DataCenter && me.Rack == other.Rack:
+		return 1
+	case me.DataCenter == other.DataCenter:
+		return 2
+	}
+	return 3
 }

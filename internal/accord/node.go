@@ -71,6 +71,16 @@ type Config struct {
 	// NoPrivilegedCoordinator disables the privileged coordinator fast
 	// path (a coordinator replica counting its own vote).
 	NoPrivilegedCoordinator bool
+	// DurabilityRanges, if set, returns the ranges this node runs
+	// durability rounds over, every DurabilityInterval (default 30s): a
+	// sync point applied at every replica, which then makes everything
+	// below it redundant (RedundantBefore). Without it, records are
+	// forgotten after TombstoneRetention.
+	DurabilityRanges   func() []Range
+	DurabilityInterval time.Duration
+	// Proximity, if set, ranks another node by distance (lower is nearer):
+	// reads go to the nearest replicas first.
+	Proximity func(NodeID) int
 }
 
 // Errors returned by Coordinate.
@@ -98,12 +108,13 @@ type Node struct {
 	// progress: phases include every epoch from it on, so transactions
 	// started before a topology change are witnessed by the replicas of
 	// the new one until none is left (epoch synchronisation).
-	synced     atomic.Int64
-	lastSynced time.Time
-	// joined is the first epoch this node was part of (it started, or
-	// joined, then): transactions of earlier epochs are reflected in the
-	// data it bootstrapped with.
-	joined atomic.Int64
+	synced      atomic.Int64
+	lastSynced  time.Time
+	metrics     metrics
+	lastDurable time.Time
+	// bootstrapped is the sync point this node bootstrapped at: the
+	// transactions before it are reflected in the data it streamed.
+	bootstrapped atomic.Pointer[Timestamp]
 
 	stop    chan struct{}
 	stopped atomic.Bool
@@ -125,6 +136,9 @@ func NewNode(cfg Config) (*Node, error) {
 	}
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 2 * time.Second
+	}
+	if cfg.DurabilityInterval <= 0 {
+		cfg.DurabilityInterval = 30 * time.Second
 	}
 	if cfg.TombstoneRetention <= 0 {
 		cfg.TombstoneRetention = 10 * cfg.RetainApplied
@@ -153,9 +167,6 @@ func (n *Node) SetTopology(t *Topology) {
 	n.topoMu.Lock()
 	n.topos[t.Epoch] = t
 	n.latest = max(n.latest, t.Epoch)
-	if n.joined.Load() == 0 && (len(t.Nodes) == 0 || slices.Contains(t.Nodes, n.cfg.ID)) {
-		n.joined.Store(t.Epoch)
-	}
 	for e := range n.topos {
 		if e < n.latest-64 {
 			delete(n.topos, e)
@@ -219,11 +230,12 @@ func (n *Node) owned(keys []Key, from int64) []Key {
 	return out
 }
 
-// newTxnID returns a new transaction id; it is privileged when this node
-// replicates one of keys.
+// newTxnID returns a new transaction id; it is privileged when it has a
+// single key this node replicates (cassandra-accord fc4a769 disabled the
+// coordinator optimisation for multi-key transactions).
 func (n *Node) newTxnID(kind Kind, keys ...Key) TxnID {
 	id := TxnID{Timestamp: Timestamp{Epoch: n.epoch(), HLC: n.clock.Next(0), Node: n.cfg.ID}, Kind: kind}
-	if !n.cfg.NoPrivilegedCoordinator && len(keys) > 0 && len(n.owned(keys, id.Epoch)) > 0 {
+	if !n.cfg.NoPrivilegedCoordinator && len(keys) == 1 && len(n.owned(keys, id.Epoch)) > 0 {
 		id.Privileged = true
 	}
 	return id
@@ -257,6 +269,8 @@ const (
 	mEphemeralDeps msgType = "GetEphemeralReadDeps"
 	mEphemeralRead msgType = "ReadEphemeralTxnData"
 	mEpochStatus   msgType = "EpochStatus"
+	mSyncPropose   msgType = "ProposeSyncPoint"
+	mRedundant     msgType = "SetShardDurable"
 )
 
 type envelope struct {
@@ -468,6 +482,16 @@ func (n *Node) Handle(ctx context.Context, from NodeID, payload []byte) ([]byte,
 		}
 	case mEpochStatus:
 		reply = n.s.epochStatus()
+	case mSyncPropose:
+		var r syncReq
+		if err = json.Unmarshal(env.B, &r); err == nil {
+			reply, err = n.s.syncPropose(&r)
+		}
+	case mRedundant:
+		var r syncReq
+		if err = json.Unmarshal(env.B, &r); err == nil {
+			err = n.s.markRedundant(r.ID, r.Txn.Ranges)
+		}
 	default:
 		err = fmt.Errorf("accord: unknown message %q", env.T)
 	}
@@ -550,5 +574,73 @@ func (n *Node) Pending() []string {
 		}
 		out = append(out, c.ID.String()+" "+c.Status.String()+" blocked="+blocked)
 	}
+	return out
+}
+
+// bootstrappedBefore returns the sync point this node bootstrapped at (zero
+// if it did not).
+func (n *Node) bootstrappedBefore() Timestamp {
+	if t := n.bootstrapped.Load(); t != nil {
+		return *t
+	}
+	return Timestamp{}
+}
+
+// metrics count what the node did (exported through Stats).
+type metrics struct {
+	fastPath, mediumPath, slowPath, recoveries, invalidations atomic.Int64
+	ephemeralReads, rangeReads, syncPoints, durableRounds     atomic.Int64
+	preempted, stale, timeouts                                atomic.Int64
+}
+
+// Stats are a node's Accord metrics and state (for virtual tables).
+type Stats struct {
+	FastPath, MediumPath, SlowPath, Recoveries, Invalidations int64
+	EphemeralReads, RangeReads, SyncPoints, DurabilityRounds  int64
+	Preempted, Stale, Timeouts                                int64
+	Commands, Keys, Barriers, Redundant                       int
+	Epoch, SyncedEpoch                                        int64
+}
+
+// Stats returns the node's metrics.
+func (n *Node) Stats() Stats {
+	m := &n.metrics
+	st := Stats{FastPath: m.fastPath.Load(), MediumPath: m.mediumPath.Load(), SlowPath: m.slowPath.Load(),
+		Recoveries: m.recoveries.Load(), Invalidations: m.invalidations.Load(), EphemeralReads: m.ephemeralReads.Load(),
+		RangeReads: m.rangeReads.Load(), SyncPoints: m.syncPoints.Load(), DurabilityRounds: m.durableRounds.Load(),
+		Preempted: m.preempted.Load(), Stale: m.stale.Load(), Timeouts: m.timeouts.Load(),
+		Epoch: n.epoch(), SyncedEpoch: n.synced.Load()}
+	n.s.mu.Lock()
+	st.Commands, st.Keys, st.Barriers, st.Redundant = len(n.s.cmds), len(n.s.keys), len(n.s.barriers), len(n.s.redundant)
+	n.s.mu.Unlock()
+	return st
+}
+
+// CommandInfo describes a command a node holds (for virtual tables).
+type CommandInfo struct {
+	ID        TxnID
+	Status    Status
+	ExecuteAt Timestamp
+	Keys      int
+	Deps      int
+	BlockedOn *TxnID
+	Kind      Kind
+}
+
+// Commands lists the commands a node holds that are not applied,
+// invalidated or truncated (DebugBlockedTxns).
+func (n *Node) Commands() []CommandInfo {
+	n.s.mu.Lock()
+	defer n.s.mu.Unlock()
+	var out []CommandInfo
+	for _, c := range n.s.cmds {
+		switch c.Status {
+		case Applied, Invalidated, Truncated:
+			continue
+		}
+		ci := CommandInfo{ID: c.ID, Status: c.Status, ExecuteAt: c.ExecuteAt, Keys: len(c.Keys), Deps: len(c.Deps.all()), BlockedOn: c.blockedOn, Kind: c.ID.Kind}
+		out = append(out, ci)
+	}
+	slices.SortFunc(out, func(a, b CommandInfo) int { return a.ID.Compare(b.ID) })
 	return out
 }
