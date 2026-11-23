@@ -354,10 +354,14 @@ func (s *store) dirty(r Range) bool {
 
 // adoptRedundant records redundancy bounds another replica of the ranges
 // has (a SetShardDurable this replica missed: the sync point applied here
-// too), and wakes the commands waiting on a transaction below them.
-func (s *store) adoptRedundant(id TxnID, bs []bound) {
+// too), and wakes the commands waiting on a transaction below them; only
+// for a transaction this replica does not know (it reports whether).
+func (s *store) adoptRedundant(id TxnID, bs []bound) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if c := s.cmds[id]; c != nil && c.Status != NotDefined {
+		return false
+	}
 	for _, b := range bs {
 		s.redundant = addBound(s.redundant, b.R, b.TS)
 		s.barriers = addBound(s.barriers, b.R, b.TS)
@@ -367,4 +371,5 @@ func (s *store) adoptRedundant(id TxnID, bs []bound) {
 			s.maybeExecuteLocked(wc)
 		}
 	}
+	return true
 }

@@ -786,6 +786,7 @@ func (n *Node) progressLog() {
 // here (FetchData / Propagate); it reports whether one was found.
 func (n *Node) fetch(ctx context.Context, id TxnID, keys []Key) bool {
 	ts := n.topologies(keys, id.Epoch, n.epoch())
+	var truncated []bound
 	for _, to := range ts.nodes() {
 		if to == n.cfg.ID {
 			continue
@@ -796,10 +797,9 @@ func (n *Node) fetch(ctx context.Context, id TxnID, keys []Key) bool {
 		}
 		switch {
 		case rep.Status == Truncated && len(rep.Redundant) > 0:
-			// Forgotten there below a universal sync point, which applied
-			// here too: this replica missed the redundancy bound.
-			n.s.adoptRedundant(id, rep.Redundant)
-			return true
+			// Forgotten there below a universal sync point; another replica
+			// may still have the outcome, so it is only adopted after.
+			truncated = append(truncated, rep.Redundant...)
 		case rep.Status == Invalidated:
 			_, err := n.s.commit(ctx, &commitReq{ID: id, Keys: rep.Keys, Invalidate: true})
 			return err == nil
@@ -817,6 +817,12 @@ func (n *Node) fetch(ctx context.Context, id TxnID, keys []Key) bool {
 			_, err := n.s.commit(ctx, &commitReq{ID: id, Ballot: rep.Accepted, ExecuteAt: rep.ExecuteAt, Deps: rep.Deps, Txn: rep.Txn, Keys: rep.Keys, Stable: true})
 			_ = err
 		}
+	}
+	// Nobody has it any more, and it is below a universal sync point,
+	// which applied here too: this replica missed the redundancy bound. A
+	// transaction it knows (beyond a placeholder) still needs recovering.
+	if len(truncated) > 0 && n.s.adoptRedundant(id, truncated) {
+		return true
 	}
 	return false
 }
