@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -714,12 +715,12 @@ func (n *Node) progressLog() {
 				n.durability()
 			}()
 		}
-		if now.Sub(n.lastSynced) > 10*n.cfg.ProgressInterval {
-			n.lastSynced = now
+		if n.synced.Load() < n.epoch() && n.cfg.IsLeader != nil && n.cfg.IsLeader() && n.syncing.CompareAndSwap(false, true) {
+			n.wg.Add(1)
 			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), n.cfg.RequestTimeout)
-				defer cancel()
-				n.syncEpochs(ctx)
+				defer n.wg.Done()
+				defer n.syncing.Store(false)
+				n.syncEpochs()
 			}()
 		}
 		for _, s := range todo {
@@ -842,28 +843,118 @@ func (n *Node) ephemeralRead(ctx context.Context, txn *Txn) ([]byte, error) {
 
 // ---- epoch synchronisation ----
 
-// syncEpochs advances the synchronised epoch to the oldest epoch any node
-// still has a transaction of in progress (every node must answer).
-func (n *Node) syncEpochs(ctx context.Context) {
-	n.topoMu.RLock()
-	t := n.topos[n.latest]
-	n.topoMu.RUnlock()
-	if t == nil {
-		return
-	}
-	active := n.s.epochStatus().Active
-	for _, node := range t.Nodes {
-		if node == n.cfg.ID {
-			continue
+// syncEpochs synchronises the epochs after the synchronised one, in order
+// (the leader does): for each, a sync point over every range whose
+// replicas changed from the epoch before, with quorums in both. Its
+// barrier refuses any transaction of an earlier epoch it does not follow,
+// so once it is applied no earlier-epoch transaction is in progress on
+// those ranges, and every node is told the epoch is synchronised: phases
+// stop including the earlier epochs.
+func (n *Node) syncEpochs() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-n.stop:
+			cancel()
+		case <-ctx.Done():
 		}
-		var st epochStatus
-		if err := n.send(ctx, node, mEpochStatus, struct{}{}, &st); err != nil {
+	}()
+	for {
+		n.topoMu.RLock()
+		synced, latest := n.synced.Load(), n.latest
+		var prev, cur *Topology
+		e := synced + 1
+		for ; e <= latest && n.topos[e] == nil; e++ {
+		}
+		if e <= latest {
+			cur, prev = n.topos[e], n.topos[e-1]
+		}
+		n.topoMu.RUnlock()
+		if cur == nil {
 			return
 		}
-		active = min(active, st.Active, st.Latest)
+		ranges := n.changedRanges(prev, cur)
+		for _, r := range ranges {
+			sctx, scancel := context.WithTimeout(ctx, 2*n.recoveryTimeout())
+			_, err := n.SyncPoint(sctx, r, false)
+			scancel()
+			if err != nil {
+				return // retried at the next opportunity
+			}
+		}
+		n.metrics.epochSyncs.Add(1)
+		for _, to := range cur.Nodes {
+			_ = n.send(ctx, to, mEpochSynced, &epochSynced{Epoch: e}, nil)
+		}
+		n.advanceSynced(e)
 	}
-	if active > n.synced.Load() {
-		n.synced.Store(active)
+}
+
+// changedRanges returns the parts of the epoch ranges whose replicas
+// differ between two topologies (all of them without the earlier one).
+func (n *Node) changedRanges(prev, cur *Topology) []Range {
+	if n.cfg.EpochRanges == nil || cur.RangeReplicas == nil {
+		return nil
+	}
+	var out []Range
+	for _, r := range n.cfg.EpochRanges() {
+		if prev == nil || prev.RangeReplicas == nil {
+			out = append(out, r)
+			continue
+		}
+		a, b := prev.RangeReplicas(r), cur.RangeReplicas(r)
+		owner := func(shards []RangeShard, tok int64) string {
+			for _, s := range shards {
+				if tok >= s.Lo && tok <= s.Hi {
+					nodes := slices.Clone(s.Nodes)
+					slices.Sort(nodes)
+					return strings.Join(nodes, ",")
+				}
+			}
+			return ""
+		}
+		// The boundaries of either split, walked in order.
+		var starts []int64
+		for _, s := range append(slices.Clone(a), b...) {
+			starts = append(starts, s.Lo)
+			if s.Hi < r.Hi {
+				starts = append(starts, s.Hi+1)
+			}
+		}
+		starts = append(starts, r.Lo)
+		slices.Sort(starts)
+		starts = slices.Compact(starts)
+		for i, lo := range starts {
+			if lo < r.Lo || lo > r.Hi {
+				continue
+			}
+			hi := r.Hi
+			if i+1 < len(starts) {
+				hi = starts[i+1] - 1
+			}
+			if owner(a, lo) == owner(b, lo) {
+				continue
+			}
+			if k := len(out); k > 0 && out[k-1].Prefix == r.Prefix && out[k-1].Hi+1 == lo {
+				out[k-1].Hi = hi // merge adjacent
+				continue
+			}
+			out = append(out, Range{Prefix: r.Prefix, Lo: lo, Hi: hi})
+		}
+	}
+	return out
+}
+
+// epochSynced tells a node an epoch is synchronised.
+type epochSynced struct{ Epoch int64 }
+
+func (n *Node) advanceSynced(e int64) {
+	for {
+		cur := n.synced.Load()
+		if e <= cur || n.synced.CompareAndSwap(cur, e) {
+			return
+		}
 	}
 }
 

@@ -1117,6 +1117,16 @@ func TestClusterAccordDurability(t *testing.T) {
 	}
 	require.Positive(t, total)
 	require.Positive(t, stat(0, "fast_path")+stat(0, "slow_path")+stat(0, "medium_path")+stat(1, "fast_path")+stat(1, "slow_path"))
+	// Every epoch is synchronised (by sync points over the ranges that
+	// changed, run by the leader).
+	require.Eventually(t, func() bool {
+		for i := 0; i < 3; i++ {
+			if stat(i, "synced_epoch") != stat(i, "epoch") {
+				return false
+			}
+		}
+		return true
+	}, 30*time.Second, 100*time.Millisecond, "epochs synchronised")
 	// Updates still work after the old records are gone.
 	res := c.ok(1, quorum, "UPDATE ks.c SET v = 100 WHERE k = 3 IF v = ?", 23).(*message.RowsResult)
 	require.Equal(t, byte(1), res.Data[0][0][0])

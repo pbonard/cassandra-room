@@ -78,6 +78,11 @@ type Config struct {
 	// forgotten after TombstoneRetention.
 	DurabilityRanges   func() []Range
 	DurabilityInterval time.Duration
+	// IsLeader, if set, reports whether this node synchronises epochs (one
+	// node should); EpochRanges are the ranges compared between epochs to
+	// find those that changed (every table's whole range).
+	IsLeader    func() bool
+	EpochRanges func() []Range
 	// Proximity, if set, ranks another node by distance (lower is nearer):
 	// reads go to the nearest replicas first.
 	Proximity func(NodeID) int
@@ -109,7 +114,7 @@ type Node struct {
 	// started before a topology change are witnessed by the replicas of
 	// the new one until none is left (epoch synchronisation).
 	synced      atomic.Int64
-	lastSynced  time.Time
+	syncing     atomic.Bool
 	metrics     metrics
 	lastDurable time.Time
 	// bootstrapped is the sync point this node bootstrapped at: the
@@ -268,7 +273,7 @@ const (
 	mInformDurable msgType = "InformDurable"
 	mEphemeralDeps msgType = "GetEphemeralReadDeps"
 	mEphemeralRead msgType = "ReadEphemeralTxnData"
-	mEpochStatus   msgType = "EpochStatus"
+	mEpochSynced   msgType = "EpochSynced"
 	mSyncPropose   msgType = "ProposeSyncPoint"
 	mRedundant     msgType = "SetShardDurable"
 )
@@ -405,12 +410,6 @@ type ephemeralReply struct {
 	Reads   map[string][]byte
 }
 
-type epochStatus struct {
-	// Active is the oldest epoch of a transaction in progress here (the
-	// latest epoch if there is none); Latest the newest epoch known.
-	Active, Latest int64
-}
-
 type checkStatusReply struct {
 	Status    Status
 	Promised  Ballot
@@ -480,8 +479,11 @@ func (n *Node) Handle(ctx context.Context, from NodeID, payload []byte) ([]byte,
 		if err = json.Unmarshal(env.B, &r); err == nil {
 			reply, err = n.s.ephemeralRead(ctx, &r)
 		}
-	case mEpochStatus:
-		reply = n.s.epochStatus()
+	case mEpochSynced:
+		var r epochSynced
+		if err = json.Unmarshal(env.B, &r); err == nil {
+			n.advanceSynced(r.Epoch)
+		}
 	case mSyncPropose:
 		var r syncReq
 		if err = json.Unmarshal(env.B, &r); err == nil {
@@ -590,14 +592,14 @@ func (n *Node) bootstrappedBefore() Timestamp {
 type metrics struct {
 	fastPath, mediumPath, slowPath, recoveries, invalidations atomic.Int64
 	ephemeralReads, rangeReads, syncPoints, durableRounds     atomic.Int64
-	preempted, stale, timeouts                                atomic.Int64
+	preempted, stale, timeouts, epochSyncs                    atomic.Int64
 }
 
 // Stats are a node's Accord metrics and state (for virtual tables).
 type Stats struct {
 	FastPath, MediumPath, SlowPath, Recoveries, Invalidations int64
 	EphemeralReads, RangeReads, SyncPoints, DurabilityRounds  int64
-	Preempted, Stale, Timeouts                                int64
+	Preempted, Stale, Timeouts, EpochSyncs                    int64
 	Commands, Keys, Barriers, Redundant                       int
 	Epoch, SyncedEpoch                                        int64
 }
@@ -608,7 +610,7 @@ func (n *Node) Stats() Stats {
 	st := Stats{FastPath: m.fastPath.Load(), MediumPath: m.mediumPath.Load(), SlowPath: m.slowPath.Load(),
 		Recoveries: m.recoveries.Load(), Invalidations: m.invalidations.Load(), EphemeralReads: m.ephemeralReads.Load(),
 		RangeReads: m.rangeReads.Load(), SyncPoints: m.syncPoints.Load(), DurabilityRounds: m.durableRounds.Load(),
-		Preempted: m.preempted.Load(), Stale: m.stale.Load(), Timeouts: m.timeouts.Load(),
+		Preempted: m.preempted.Load(), Stale: m.stale.Load(), Timeouts: m.timeouts.Load(), EpochSyncs: m.epochSyncs.Load(),
 		Epoch: n.epoch(), SyncedEpoch: n.synced.Load()}
 	n.s.mu.Lock()
 	st.Commands, st.Keys, st.Barriers, st.Redundant = len(n.s.cmds), len(n.s.keys), len(n.s.barriers), len(n.s.redundant)

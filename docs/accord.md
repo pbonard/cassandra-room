@@ -119,18 +119,29 @@ names, not its class structure.
     id on its ranges has applied or can never commit.
   - **Abandoned ones:** a sync point is never recovered. One its coordinator
     abandons only leaves barriers, and is invalidated locally after a while.
-- **Durability** (`CoordinateShardDurable`, `RedundantBefore`): one node
-  (the normal node with the lowest address) periodically runs a sync point
-  over each table's whole range, applied at every replica. Its id then
-  becomes the range's redundancy bound on every replica.
+- **Epoch synchronisation**: for each new epoch, in order, the leader (the
+  live normal node with the lowest address) finds the ranges whose replicas
+  changed from the previous epoch.
+  1. It runs a sync point over each of them, with quorums in both epochs.
+     The barrier refuses any earlier-epoch transaction the sync point doesn't
+     follow.
+  2. Once the sync points apply, no earlier-epoch transaction is in progress
+     there, and every node is told the epoch is synchronised.
+  3. Phases then stop including the earlier epochs. An epoch that changed no
+     replicas (a schema change) needs no sync point.
+- **Durability** (`CoordinateShardDurable`, `RedundantBefore`): each node
+  periodically runs a sync point over the ranges it is the first replica
+  of, applied at every replica. It skips ranges with no transaction above
+  their current bound. Each sync point's id then becomes the range's
+  redundancy bound on every replica.
   - **Forgetting:** below the bound, applied and invalidated records are
     forgotten (with their journal records).
   - **Late messages:** a late message about a forgotten transaction is
     refused (PreAccept, Accept), and its recovery reports it durable.
   - **Unknown dependencies:** below the bound they count as applied.
 - **Joining nodes** (`Bootstrap`): before streaming, a joining node takes a
-  sync point over every table, applied at every current replica (or at a
-  quorum when one is down, as when replacing it).
+  sync point over the ranges it will own in every table, applied at every
+  current replica (or at a quorum when one is down, as when replacing it).
   - **Streamed data:** it then holds every transaction before the sync
     point; later ones reach the node as a pending replica, since writes go
     to the replicas of every epoch up to the current one.
@@ -275,10 +286,6 @@ names, not its class structure.
 - **Range reads:** they are ephemeral, so they form a per-partition
   snapshot, not one across the range. Sync points are the only range
   transactions; as in Cassandra, `BEGIN TRANSACTION` rejects range reads.
-- **Epoch synchronisation:** it still polls nodes (per node, not per range)
-  rather than using sync points per epoch.
-- **Granularity:** durability rounds and bootstrap cover whole tables, not
-  the ranges that changed.
 - **Unported upstream work:** per-shard command stores, a segmented journal
   (each command is one synced row), `PrivilegedCoordinatorWithDeps`,
   replica-side execution, and Paxos migration (unnecessary here: Paxos was

@@ -146,6 +146,8 @@ func (p *proxy) startAccord() error {
 		Journal:   &accordJournal{d: d},
 		// Durability rounds (RedundantBefore) and nearest-first reads.
 		DurabilityRanges:   p.accordDurabilityRanges,
+		IsLeader:           p.accordLeader,
+		EpochRanges:        p.accordTableRanges,
 		DurabilityInterval: p.opts.AccordDurabilityInterval,
 		Proximity:          p.accordProximity,
 	})
@@ -977,17 +979,57 @@ func accordTxnRows(d *DB) []map[string][]byte {
 	return out
 }
 
-// accordDurabilityRanges are the ranges this node runs durability rounds
-// over: every table's, on one node (the normal node with the lowest
-// address), so rounds are not repeated.
-func (p *proxy) accordDurabilityRanges() []accord.Range {
-	s := p.d.schema.Load()
-	for _, n := range s.Nodes {
+// accordLeader reports whether this node synchronises Accord's epochs:
+// the live normal node with the lowest address.
+func (p *proxy) accordLeader() bool {
+	for _, n := range p.d.schema.Load().Nodes {
 		if n.Status == cluster.StatusNormal && n.Addr < p.self && p.up(n) {
-			return nil
+			return false
 		}
 	}
-	return p.accordTableRanges()
+	return true
+}
+
+// accordDurabilityRanges are the ranges this node runs durability rounds
+// over: those it is the first replica of, in every table (each node
+// covers its own; ranges without transactions since their last round are
+// skipped).
+func (p *proxy) accordDurabilityRanges() []accord.Range {
+	return p.accordOwnedRanges(p.ring.Load(), true)
+}
+
+// accordOwnedRanges are the accord ranges of every table this node
+// replicates in a ring (only those it is the first replica of, if
+// primary).
+func (p *proxy) accordOwnedRanges(ring *cluster.Ring, primary bool) []accord.Range {
+	s := p.d.schema.Load()
+	if ring.Empty() {
+		return nil
+	}
+	var out []accord.Range
+	for _, t := range p.d.userTables() {
+		k := s.Keyspaces[t.Keyspace]
+		if k == nil {
+			continue
+		}
+		prefix := string(binary.BigEndian.AppendUint64(nil, uint64(t.Storage)))
+		for _, r := range ring.Ranges() {
+			reps := ring.Replicas(k.Replication, r[1])
+			if primary && (len(reps) == 0 || reps[0].Addr != p.self) || !primary && !containsAddr(reps, p.self) {
+				continue
+			}
+			// (start, end]: a range wrapping around the token space is two.
+			if r[0] < r[1] {
+				out = append(out, accord.Range{Prefix: prefix, Lo: r[0] + 1, Hi: r[1]})
+				continue
+			}
+			if r[0] < math.MaxInt64 {
+				out = append(out, accord.Range{Prefix: prefix, Lo: r[0] + 1, Hi: math.MaxInt64})
+			}
+			out = append(out, accord.Range{Prefix: prefix, Lo: math.MinInt64, Hi: r[1]})
+		}
+	}
+	return out
 }
 
 // accordTableRanges are the whole token ranges of the user tables.

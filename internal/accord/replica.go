@@ -201,11 +201,15 @@ func (s *store) registerLocked(c *command, keys []Key) {
 	}
 }
 
-// witness records a timestamp on the command's keys.
+// witness records a timestamp on the command's keys (a sync point's
+// barrier is recorded per range instead).
 func (s *store) witnessLocked(c *command, ts Timestamp) {
-	for _, k := range c.owned {
-		f := s.keys[keyString(k)]
-		f.maxTS = maxTimestamp(f.maxTS, ts)
+	if c.ID.Kind != SyncPoint {
+		for _, k := range c.owned {
+			if f := s.keys[keyString(k)]; f != nil {
+				f.maxTS = maxTimestamp(f.maxTS, ts)
+			}
+		}
 	}
 	s.n.clock.Observe(ts.HLC)
 }
@@ -858,29 +862,6 @@ func (s *store) ephemeralRead(ctx context.Context, r *ephemeralReq) (*ephemeralR
 		}
 	}
 	return &ephemeralReply{Outcome: ok, Reads: reads}, nil
-}
-
-// epochStatus reports the oldest epoch of a transaction in progress here.
-func (s *store) epochStatus() *epochStatus {
-	latest := s.n.epoch()
-	st := &epochStatus{Active: latest, Latest: latest}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, c := range s.cmds {
-		switch c.Status {
-		case Applied, Invalidated, Truncated:
-			continue
-		case NotDefined:
-			if c.Promised.IsZero() {
-				continue
-			}
-		}
-		if c.ID.Kind == SyncPoint {
-			continue
-		}
-		st.Active = min(st.Active, c.ID.Epoch)
-	}
-	return st
 }
 
 // forgetLocked drops the tombstones of transactions truncated or

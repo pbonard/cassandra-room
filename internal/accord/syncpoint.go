@@ -201,6 +201,9 @@ func (n *Node) SyncPoint(ctx context.Context, r Range, universal bool) (TxnID, e
 // replica (CoordinateShardDurable, then SetShardDurable).
 func (n *Node) durability() {
 	for _, r := range n.cfg.DurabilityRanges() {
+		if !n.s.dirty(r) {
+			continue // nothing above its redundancy bound
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*n.recoveryTimeout())
 		go func() {
 			select {
@@ -246,4 +249,19 @@ func (n *Node) Bootstrap(ctx context.Context, ranges []Range) error {
 		n.bootstrapped.Store(&at)
 	}
 	return nil
+}
+
+// dirty reports whether a range has had transactions here since its
+// redundancy bound: only those need a durability round.
+func (s *store) dirty(r Range) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := sort.Search(len(s.sorted), func(i int) bool { return s.sorted[i].key.Token >= r.Lo })
+	for ; i < len(s.sorted) && s.sorted[i].key.Token <= r.Hi; i++ {
+		f := s.sorted[i]
+		if r.contains(f.key) && len(f.ids) > 0 && boundFor(s.redundant, f.key).Less(f.maxTS) {
+			return true
+		}
+	}
+	return false
 }
