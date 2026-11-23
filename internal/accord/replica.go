@@ -127,6 +127,9 @@ type store struct {
 	// with a lower id is refused there. redundant are the bounds below
 	// which every transaction is durable or never commits.
 	barriers, redundant []bound
+	// majority are bounds below which every transaction applied at a
+	// majority of the replicas (or never commits): not kept across restarts.
+	majority []bound
 	// gc commits journal records in groups, outside the lock (nil: the
 	// journal is written synchronously under it); lastSeq is the last
 	// record queued.
@@ -234,12 +237,21 @@ func (s *store) witnessLocked(c *command, ts Timestamp) {
 	s.n.clock.Observe(ts.HLC)
 }
 
+// keyLocked returns a key's conflicts (empty, not to be changed, for a key
+// forgotten).
+func (s *store) keyLocked(k Key) *cfk {
+	if f := s.keys[keyString(k)]; f != nil {
+		return f
+	}
+	return &cfk{key: k}
+}
+
 // maxConflict returns the largest timestamp witnessed on the command's
 // keys before it.
 func (s *store) maxConflictLocked(c *command) Timestamp {
 	var m Timestamp
 	for _, k := range c.owned {
-		m = maxTimestamp(m, s.keys[keyString(k)].maxTS)
+		m = maxTimestamp(m, s.keyLocked(k).maxTS)
 	}
 	return m
 }
@@ -249,7 +261,7 @@ func (s *store) maxConflictLocked(c *command) Timestamp {
 func (s *store) depsLocked(c *command, bound Timestamp) Deps {
 	d := Deps{}
 	for _, k := range c.owned {
-		for _, id := range s.keys[keyString(k)].ids {
+		for _, id := range s.keyLocked(k).ids {
 			if !id.Timestamp.Less(bound) {
 				break
 			}
@@ -666,7 +678,7 @@ func (s *store) beginRecoveryLocked2(r *recoverReq) (*recoverReply, error) {
 	// The superseding transactions (BeginRecovery's visitor).
 	for _, k := range c.owned {
 		ks := keyString(k)
-		for _, id := range s.keys[ks].ids {
+		for _, id := range s.keyLocked(k).ids {
 			o := s.cmds[id]
 			if id == c.ID || o == nil || !id.conflicts(c.ID) || !c.ID.Timestamp.Less(o.ExecuteAt) {
 				continue
@@ -740,13 +752,14 @@ func (s *store) informDurableLocked2(id TxnID) error {
 // adopted once it is durably decided everywhere).
 func (s *store) truncateLocked() {
 	s.forgetLocked()
+	s.compactMajorityLocked()
 	now := s.n.cfg.Now()
 	for _, c := range s.cmds {
 		if c.Status != Applied || !c.Durable || now.Sub(c.appliedAt) < s.n.cfg.RetainApplied {
 			continue
 		}
 		for _, k := range c.owned {
-			f := s.keys[keyString(k)]
+			f := s.keyLocked(k)
 			if i, found := slices.BinarySearchFunc(f.ids, c.ID, TxnID.Compare); found {
 				f.ids = slices.Delete(f.ids, i, i+1)
 			}
@@ -1024,6 +1037,18 @@ func (s *store) forgetLocked() {
 			delete(s.cmds, id)
 			delete(s.waiters, id)
 		}
+	}
+	// A key with no transactions left whose latest timestamp is below its
+	// redundancy bound is forgotten too: the barrier refuses anything that
+	// timestamp would have ordered.
+	if len(s.redundant) > 0 {
+		s.sorted = slices.DeleteFunc(s.sorted, func(f *cfk) bool {
+			if len(f.ids) == 0 && f.maxTS.Less(boundFor(s.redundant, f.key)) {
+				delete(s.keys, keyString(f.key))
+				return true
+			}
+			return false
+		})
 	}
 }
 

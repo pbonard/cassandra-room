@@ -120,6 +120,9 @@ type Node struct {
 	// bootstrapped is the sync point this node bootstrapped at: the
 	// transactions before it are reflected in the data it streamed.
 	bootstrapped atomic.Pointer[Timestamp]
+	// persisting bounds the transactions whose outcome is being retried
+	// to replicas that missed it.
+	persisting chan struct{}
 
 	stop    chan struct{}
 	stopped atomic.Bool
@@ -127,6 +130,9 @@ type Node struct {
 	// recovering marks transactions this node is recovering or fetching.
 	recovering sync.Map
 }
+
+// maxPersisting bounds the background apply retries of a node.
+const maxPersisting = 1024
 
 // NewNode creates a node and replays its journal.
 func NewNode(cfg Config) (*Node, error) {
@@ -154,7 +160,8 @@ func NewNode(cfg Config) (*Node, error) {
 	if cfg.Journal == nil {
 		cfg.Journal = &MemJournal{}
 	}
-	n := &Node{cfg: cfg, clock: NewClock(cfg.Tag, cfg.Now), topos: map[int64]*Topology{}, stop: make(chan struct{})}
+	n := &Node{cfg: cfg, clock: NewClock(cfg.Tag, cfg.Now), topos: map[int64]*Topology{}, stop: make(chan struct{}),
+		persisting: make(chan struct{}, maxPersisting)}
 	n.s = newStore(n)
 	if err := n.s.replay(); err != nil {
 		return nil, err
@@ -284,6 +291,7 @@ const (
 	mEpochSynced   msgType = "EpochSynced"
 	mSyncPropose   msgType = "ProposeSyncPoint"
 	mRedundant     msgType = "SetShardDurable"
+	mMajority      msgType = "SetMajorityDurable"
 )
 
 type envelope struct {
@@ -511,6 +519,11 @@ func (n *Node) Handle(ctx context.Context, from NodeID, payload []byte) ([]byte,
 		if err = json.Unmarshal(env.B, &r); err == nil {
 			err = n.s.markRedundant(r.ID, r.Txn.Ranges)
 		}
+	case mMajority:
+		var r syncReq
+		if err = json.Unmarshal(env.B, &r); err == nil {
+			n.s.markMajority(r.ID, r.Txn.Ranges)
+		}
 	default:
 		err = fmt.Errorf("accord: unknown message %q", env.T)
 	}
@@ -609,6 +622,7 @@ func (n *Node) bootstrappedBefore() Timestamp {
 type metrics struct {
 	fastPath, mediumPath, slowPath, recoveries, invalidations atomic.Int64
 	ephemeralReads, rangeReads, syncPoints, durableRounds     atomic.Int64
+	majorityRounds, persistShed                               atomic.Int64
 	preempted, stale, timeouts, epochSyncs, journalErrors     atomic.Int64
 }
 
@@ -616,6 +630,7 @@ type metrics struct {
 type Stats struct {
 	FastPath, MediumPath, SlowPath, Recoveries, Invalidations int64
 	EphemeralReads, RangeReads, SyncPoints, DurabilityRounds  int64
+	MajorityRounds, PersistShed                               int64
 	Preempted, Stale, Timeouts, EpochSyncs, JournalErrors     int64
 	Commands, Keys, Barriers, Redundant                       int
 	Epoch, SyncedEpoch                                        int64
@@ -626,7 +641,7 @@ func (n *Node) Stats() Stats {
 	m := &n.metrics
 	st := Stats{FastPath: m.fastPath.Load(), MediumPath: m.mediumPath.Load(), SlowPath: m.slowPath.Load(),
 		Recoveries: m.recoveries.Load(), Invalidations: m.invalidations.Load(), EphemeralReads: m.ephemeralReads.Load(),
-		RangeReads: m.rangeReads.Load(), SyncPoints: m.syncPoints.Load(), DurabilityRounds: m.durableRounds.Load(),
+		RangeReads: m.rangeReads.Load(), SyncPoints: m.syncPoints.Load(), DurabilityRounds: m.durableRounds.Load(), MajorityRounds: m.majorityRounds.Load(), PersistShed: m.persistShed.Load(),
 		Preempted: m.preempted.Load(), Stale: m.stale.Load(), Timeouts: m.timeouts.Load(), EpochSyncs: m.epochSyncs.Load(), JournalErrors: m.journalErrors.Load(),
 		Epoch: n.epoch(), SyncedEpoch: n.synced.Load()}
 	n.s.mu.Lock()

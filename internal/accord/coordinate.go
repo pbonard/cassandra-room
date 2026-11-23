@@ -358,7 +358,17 @@ func (n *Node) persist(ctx context.Context, ts *Topologies, id TxnID, txn *Txn, 
 	if !tr.done() {
 		return ErrTimeout
 	}
+	select {
+	case n.persisting <- struct{}{}:
+	default:
+		// Too many transactions are retrying (a replica is down): leave
+		// the rest to the replicas' own progress (fetching what they miss)
+		// and to durability rounds.
+		n.metrics.persistShed.Add(1)
+		return nil
+	}
 	go func() {
+		defer func() { <-n.persisting }()
 		// Every replica must apply it: retry those that failed (a replica
 		// that was down learns the outcome when it is back), then tell
 		// them all it is durable.
@@ -731,7 +741,7 @@ func (n *Node) progressLog() {
 				}
 				todo = append(todo, stalled{*c.blockedOn, txn, keys})
 				c.blockedSince = now
-			case now.Sub(c.lastChange) > after<<min(c.recoveries, 4) && (c.Status != NotDefined || !c.Promised.IsZero()) && len(c.Keys) > 0:
+			case now.Sub(c.lastChange) > n.homeDelay(c.Keys, after)<<min(c.recoveries, 4) && (c.Status != NotDefined || !c.Promised.IsZero()) && len(c.Keys) > 0:
 				todo = append(todo, stalled{c.ID, c.Txn, c.Keys})
 				c.lastChange = now
 				c.recoveries++
@@ -1178,4 +1188,14 @@ func (n *Node) readOrder(nodes []NodeID) []NodeID {
 	}
 	slices.SortStableFunc(order, func(a, b NodeID) int { return rank(a) - rank(b) })
 	return order
+}
+
+// homeDelay is how long a stalled transaction waits before this replica
+// recovers it: the replicas of its home key (the first) recover first
+// (accord's home shard progress log); the others only if those fail.
+func (n *Node) homeDelay(keys []Key, after time.Duration) time.Duration {
+	if len(keys) == 0 || len(n.owned(keys[:1], 0)) > 0 {
+		return after
+	}
+	return 3 * after
 }

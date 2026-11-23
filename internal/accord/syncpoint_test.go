@@ -82,12 +82,12 @@ func TestDurability(t *testing.T) {
 		for _, id := range c.ids {
 			n := c.net.nodes[id]
 			st := n.Stats()
-			if st.Redundant == 0 || st.Commands > 20 {
+			if st.Redundant == 0 || st.Commands > 20 || st.Keys > 0 {
 				return false
 			}
 		}
 		return true
-	}, 30*time.Second, 50*time.Millisecond, "records below the redundancy bound forgotten")
+	}, 30*time.Second, 50*time.Millisecond, "records and keys below the redundancy bound forgotten")
 	var first *opRecord
 	for _, r := range records {
 		if r.err == nil && len(r.appends) > 0 {
@@ -133,4 +133,37 @@ func TestBootstrapSyncPoint(t *testing.T) {
 	c.crash(2)
 	c.start(2)
 	require.Equal(t, at, c.node(2).bootstrappedBefore())
+}
+
+// TestMajorityDurability: with a replica down, durability rounds fall back
+// to sync points applied at a majority, which shrink applied records.
+func TestMajorityDurability(t *testing.T) {
+	c := newSimCluster(t, 3, 3, 3)
+	c.setRanges(true, 200*time.Millisecond)
+	c.crash(2)
+	records := c.run(2, 30, nil)
+	for _, r := range records {
+		require.NoError(t, r.err)
+	}
+	require.Eventually(t, func() bool {
+		n := c.node(0)
+		if n.Stats().MajorityRounds == 0 {
+			return false
+		}
+		n.s.mu.Lock()
+		defer n.s.mu.Unlock()
+		for _, cmd := range n.s.cmds {
+			if cmd.Status == Applied && cmd.ID.Kind != SyncPoint && cmd.LocalDeps != nil {
+				return false
+			}
+		}
+		return true
+	}, 60*time.Second, 100*time.Millisecond, "applied records below the majority bound compacted")
+	// Back up, the node catches up through the next universal round,
+	// whose sync point waits for (and fetches) what it missed.
+	rounds := c.node(0).Stats().DurabilityRounds
+	c.start(2)
+	require.Eventually(t, func() bool { return c.node(0).Stats().DurabilityRounds > rounds }, 60*time.Second, 100*time.Millisecond)
+	c.settle()
+	c.check(records)
 }

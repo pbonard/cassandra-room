@@ -123,6 +123,39 @@ func (s *store) markRedundantLocked2(id TxnID, ranges []Range) error {
 	return s.saveLocked(c)
 }
 
+// markMajority records that a sync point applied at a majority of every
+// shard of its ranges: the transactions below it need no local dependencies
+// any more (a recovery finds them decided), so their records shrink.
+func (s *store) markMajority(id TxnID, ranges []Range) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range ranges {
+		s.majority = addBound(s.majority, r, id.Timestamp)
+		s.barriers = addBound(s.barriers, r, id.Timestamp)
+	}
+}
+
+// compactMajorityLocked drops the local dependencies of applied commands
+// below a majority bound (TruncatedApplyWithOutcome keeps the outcome).
+func (s *store) compactMajorityLocked() {
+	if len(s.majority) == 0 {
+		return
+	}
+	for id, c := range s.cmds {
+		if c.Status != Applied || c.LocalDeps == nil || len(c.Keys) == 0 {
+			continue
+		}
+		below := true
+		for _, k := range c.Keys {
+			below = below && id.Timestamp.Less(boundFor(s.majority, k))
+		}
+		if below {
+			c.LocalDeps = nil
+			_ = s.saveLocked(c)
+		}
+	}
+}
+
 // rangeTopologies returns the shards of a range in every epoch not yet
 // synchronised.
 func (n *Node) rangeTopologies(r Range) *Topologies {
@@ -227,12 +260,25 @@ func (n *Node) durability() {
 			case <-ctx.Done():
 			}
 		}()
-		id, err := n.SyncPoint(ctx, r, true)
+		uctx, ucancel := context.WithTimeout(ctx, n.recoveryTimeout())
+		id, err := n.SyncPoint(uctx, r, true)
+		ucancel()
+		msg := mRedundant
+		if err != nil {
+			// A replica is down or slow: a sync point applied at a majority
+			// still bounds what the others must keep (MajorityDurable).
+			msg = mMajority
+			id, err = n.SyncPoint(ctx, r, false)
+		}
 		if err == nil {
 			for _, to := range n.rangeTopologies(r).nodes() {
-				_ = n.send(ctx, to, mRedundant, &syncReq{ID: id, Txn: &Txn{Kind: SyncPoint, Ranges: []Range{r}}}, nil)
+				_ = n.send(ctx, to, msg, &syncReq{ID: id, Txn: &Txn{Kind: SyncPoint, Ranges: []Range{r}}}, nil)
 			}
-			n.metrics.durableRounds.Add(1)
+			if msg == mRedundant {
+				n.metrics.durableRounds.Add(1)
+			} else {
+				n.metrics.majorityRounds.Add(1)
+			}
 		}
 		cancel()
 	}
