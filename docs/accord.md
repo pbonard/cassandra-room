@@ -11,8 +11,9 @@ names, not its class structure.
 
 - **Timestamps** (`primitives.go`): epoch, hybrid logical clock, node.
   Each node's clock is strictly increasing and carries a per-node tag in
-  its low 10 bits. Clock values from different nodes therefore never
-  collide, so an execution timestamp's hlc can be the write timestamp of
+  its low 10 bits: the node's ordinal, a number unique among the cluster's
+  nodes that the cluster metadata assigns when the node registers. Clock
+  values from different nodes therefore never collide, so an execution timestamp's hlc can be the write timestamp of
   the transaction's updates (`Timestamp.uniqueHlc`).
 - **PreAccept** (`replica.go`, `Commands.preaccept`): a replica proposes
   executing at the TxnID if nothing conflicting on its keys has a later
@@ -139,9 +140,24 @@ names, not its class structure.
   - **Late messages:** a late message about a forgotten transaction is
     refused (PreAccept, Accept), and its recovery reports it durable.
   - **Unknown dependencies:** below the bound they count as applied.
+  - **Missed bounds:** a replica that missed a bound and waits on a
+    transaction the others forgot learns the bound from their status reply
+    (`Truncated`, with their bounds) and adopts it: the sync point applied
+    there too.
+  - **Majority fallback** (`SetMajorityDurable`): when a replica is down
+    the universal sync point times out. The round then settles for one
+    applied at a majority: barriers rise everywhere, and applied records
+    below it drop their local dependencies. A replica coming back catches
+    up through the next universal round, whose sync point waits for (and
+    fetches) what it missed.
+  - **Idle keys:** a key with no transactions left whose latest timestamp is
+    below its bound is forgotten; the barrier refuses anything it would
+    have ordered.
 - **Joining nodes** (`Bootstrap`): before streaming, a joining node takes a
   sync point over the ranges it will own in every table, applied at every
   current replica (or at a quorum when one is down, as when replacing it).
+  - **Persisted:** the bootstrap point is journaled and restored on
+    restart.
   - **Streamed data:** it then holds every transaction before the sync
     point; later ones reach the node as a pending replica, since writes go
     to the replicas of every epoch up to the current one.
@@ -151,6 +167,14 @@ names, not its class structure.
     ready" and the coordinator reads from another replica.
 - **Journal** (`Journal`, `AccordJournal`): every state change is made
   durable before the replica answers, and replayed at startup.
+  - **Group commit** (`BatchJournal`): handlers encode their records under
+    the store lock and queue them; one writer makes each batch durable with
+    one sync, and a handler waits for its records after releasing the lock.
+    Replicas also read transaction data outside the lock (a command's own
+    writes wait for its reads in progress).
+  - **Errors:** a failed write fails the request it was for; the record of
+    an applied command is retried (the command stays `PreApplied`, its
+    writes being idempotent). Failures are counted (`journal_errors`).
   - **Truncation:** a transaction applied at every replica is truncated
     after `RetainApplied` to its id, status and timestamp. An erased
     command is only adopted once it is durably decided everywhere
@@ -160,10 +184,16 @@ names, not its class structure.
     `TombstoneRetention`, and each key keeps the largest timestamp it
     witnessed, so a late message about a forgotten transaction gets no
     fast-path vote.
+- **Progress** (`ProgressLog`): a stalled transaction is recovered first by
+  the replicas of its home key (the first); the others wait three times
+  longer. Background retries of an outcome to replicas that missed it are
+  bounded (1024 transactions); beyond that, replicas catch up by fetching
+  and through durability rounds.
 - **Observability** (`Stats`, `Commands`), exposed as two virtual tables:
   - `system_views.accord_stats`: fast, medium and slow paths, recoveries,
     invalidations, ephemeral and range reads, sync points, durability
-    rounds, stale refusals, timeouts, command and key counts, barriers,
+    and majority rounds, epoch syncs, journal errors, shed retries, stale
+    refusals, timeouts, command and key counts, barriers,
     redundancy bounds, and epochs.
   - `system_views.accord_txns`: the transactions in progress on the node,
     with their status, execution timestamp and what they wait on
@@ -243,8 +273,14 @@ names, not its class structure.
   conditions and computes the writes, timestamped with the execution hlc.
   List element paths are deterministic, so every coordinator computes the
   same writes.
-- **Storage:** the journal is an engine table (one row per command), synced
-  on every write. Messages use `VerbAccord` on their own stage.
+- **Schema pinning:** a transaction carries the metadata epoch it was made
+  at and a fingerprint of each table it uses. A replica behind that epoch
+  catches up before reading; one whose table changed since reads nothing,
+  and the transaction then writes nothing and fails with "the schema of a
+  table changed during the transaction; retry it". So no replica runs the
+  statements against a different table definition.
+- **Storage:** the journal is an engine table (one row per command); each
+  group-committed batch is one synced write. Messages use `VerbAccord` on their own stage.
 
 ## Tests
 
@@ -270,7 +306,12 @@ names, not its class structure.
   - a sync point under load (every dependency applied, lower ids refused);
   - durability rounds every 300 ms under message loss (all checks hold,
     records forgotten, late messages refused);
-  - bootstrap at a sync point.
+  - bootstrap at a sync point, kept across a restart;
+  - majority durability with a replica down, and its catching up.
+- `internal/accord/review_test.go`: recovery across epochs, a `Truncated`
+  outcome, and ephemeral reads retried at a newer epoch.
+- `TestTransactionSchemaPinned` (`internal/db`): a table changed under a
+  transaction.
 - `TestPrivilegedRestrictions`: the two cassandra-accord `fc4a769`
   restrictions.
 - `internal/db` cluster tests:
@@ -286,8 +327,8 @@ names, not its class structure.
 - **Range reads:** they are ephemeral, so they form a per-partition
   snapshot, not one across the range. Sync points are the only range
   transactions; as in Cassandra, `BEGIN TRANSACTION` rejects range reads.
-- **Unported upstream work:** per-shard command stores, a segmented journal
-  (each command is one synced row), `PrivilegedCoordinatorWithDeps`,
+- **Unported upstream work:** per-shard command stores, a segmented binary
+  journal (records are JSON rows, group-committed), partial dependencies, `PrivilegedCoordinatorWithDeps`,
   replica-side execution, and Paxos migration (unnecessary here: Paxos was
   removed).
 - **Transaction results:** the result of a transaction is not paged (a

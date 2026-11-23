@@ -172,6 +172,10 @@ func NewNode(cfg Config) (*Node, error) {
 	return n, nil
 }
 
+// SetTag sets the tag of the node's clock (a number unique among the
+// cluster's nodes, below 1024): no two nodes then make the same timestamp.
+func (n *Node) SetTag(tag int) { n.clock.SetTag(tag) }
+
 // ID returns the node's id.
 func (n *Node) ID() NodeID { return n.cfg.ID }
 
