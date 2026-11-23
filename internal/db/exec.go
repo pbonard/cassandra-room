@@ -221,7 +221,7 @@ type RequestOptions struct {
 	// Trace, if set, records the request's events (TRACING ON).
 	Trace *Trace
 	// Consistency is the request's consistency level; SerialConsistency
-	// the Paxos one of conditional updates (SERIAL if unset).
+	// the serial one of conditional updates (SERIAL if unset).
 	Consistency       primitive.ConsistencyLevel
 	SerialConsistency primitive.ConsistencyLevel
 	// local restricts the statement's reads to this node.

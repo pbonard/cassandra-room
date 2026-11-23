@@ -70,6 +70,10 @@ type Command struct {
 	Result   []byte `json:",omitempty"`
 	// Durable: applied at every replica.
 	Durable bool `json:",omitempty"`
+	// Redundant: a sync point applied at every replica of its ranges, so
+	// every transaction with a lower id there is durable or never commits
+	// (RedundantBefore).
+	Redundant bool `json:",omitempty"`
 }
 
 // command is a Command with its runtime state.
@@ -112,9 +116,13 @@ type store struct {
 	cmds map[TxnID]*command
 	keys map[string]*cfk
 	// sorted indexes the keys in token order, for range reads.
-	sorted  []*cfk
-	waiters map[TxnID][]TxnID
-	appends int
+	sorted []*cfk
+	// barriers are the sync points witnessed per range: a new transaction
+	// with a lower id is refused there. redundant are the bounds below
+	// which every transaction is durable or never commits.
+	barriers, redundant []bound
+	waiters             map[TxnID][]TxnID
+	appends             int
 }
 
 func newStore(n *Node) *store {
@@ -248,6 +256,12 @@ func (s *store) preAccept(r *preAcceptReq) (*preAcceptReply, error) {
 	if r.Ballot.Less(c.Promised) {
 		return &preAcceptReply{Outcome: rejectedBallot}, nil
 	}
+	if c.Status == NotDefined && r.Ballot.IsZero() && r.Txn != nil && s.belowBarrierLocked(r.ID, r.Txn.Keys) {
+		// A sync point witnessed here follows every transaction with a
+		// lower id it knew of: a new one is refused (it is retried with a
+		// new id).
+		return &preAcceptReply{Outcome: stale}, nil
+	}
 	if c.Status == NotDefined && r.Ballot.IsZero() && r.ID.Epoch < s.n.synced.Load() {
 		// A coordinator still on an epoch every node has moved past: its
 		// replicas may no longer be the ones that matter (StaleTopology).
@@ -296,6 +310,9 @@ func (s *store) accept(r *acceptReq) (*acceptReply, error) {
 	}
 	if c.Status >= Committed {
 		return &acceptReply{Outcome: redundant}, nil
+	}
+	if c.Status == NotDefined && r.Ballot.IsZero() && !r.Invalidate && s.belowBarrierLocked(r.ID, r.Keys) {
+		return &acceptReply{Outcome: stale}, nil
 	}
 	c.Promised, c.Accepted = r.Ballot, r.Ballot
 	if r.Invalidate {
@@ -436,6 +453,9 @@ func (s *store) apply(ctx context.Context, r *applyReq) (*applyReply, error) {
 		}
 		s.registerLocked(c, r.Txn.Keys)
 		c.Status, c.ExecuteAt, c.Deps, c.Writes, c.Result = PreApplied, r.ExecuteAt, r.Deps, r.Writes, r.Result
+		if r.Txn.Kind == SyncPoint {
+			s.syncOwnedLocked(c)
+		}
 		s.witnessLocked(c, r.ExecuteAt)
 		if err := s.saveLocked(c); err != nil {
 			s.mu.Unlock()
@@ -473,11 +493,14 @@ func (s *store) maybeExecuteLocked(c *command) {
 					switch {
 					case d.Status == Applied || d.Status == Invalidated || d.Status == Truncated:
 						continue
-					case d.Status.decided() && c.ExecuteAt.Less(d.ExecuteAt):
-						continue // it executes after this one
+					case d.Status.decided() && c.ExecuteAt.Less(d.ExecuteAt) && (c.Txn == nil || c.Txn.Kind != SyncPoint):
+						continue // it executes after this one (a sync point waits for every dependency)
 					}
 				}
-				if (d == nil || d.Status < PreAccepted) && id.Epoch < s.n.joined.Load() {
+				if (d == nil || d.Status < PreAccepted) && id.Timestamp.Less(boundFor(s.redundant, k)) {
+					continue // forgotten: durable
+				}
+				if (d == nil || d.Status < PreAccepted) && id.Timestamp.Less(s.n.bootstrappedBefore()) {
 					if !slices.Contains(c.skipped, id) {
 						c.skipped = append(c.skipped, id)
 					}
@@ -543,6 +566,12 @@ func (s *store) beginRecovery(r *recoverReq) (*recoverReply, error) {
 	if r.Ballot.Less(c.Promised) {
 		return &recoverReply{Outcome: rejectedBallot}, nil
 	}
+	unknown := c.Status == NotDefined
+	if unknown && s.belowRedundantLocked(r.ID, r.Keys) {
+		// Forgotten (or refused) long ago: durable, or never committed.
+		return &recoverReply{Outcome: ok, Status: Truncated}, nil
+	}
+	refused := unknown && s.belowBarrierLocked(r.ID, r.Keys)
 	c.Promised = r.Ballot
 	s.registerLocked(c, r.Keys)
 	if c.Status != NotDefined || r.Txn == nil {
@@ -556,7 +585,7 @@ func (s *store) beginRecovery(r *recoverReq) (*recoverReply, error) {
 		return nil, err
 	}
 	rep := &recoverReply{Outcome: ok, Status: c.Status, Accepted: c.Accepted, ExecuteAt: c.ExecuteAt, Deps: c.Deps,
-		LocalDeps: c.LocalDeps, FastVote: c.FastVote, Txn: c.Txn, Writes: c.Writes, Result: c.Result}
+		LocalDeps: c.LocalDeps, FastVote: c.FastVote, Txn: c.Txn, Writes: c.Writes, Result: c.Result, Rejects: refused}
 	if c.Status >= Accepted {
 		return rep, nil
 	}
@@ -657,6 +686,14 @@ func (s *store) replay() error {
 		c := &command{Command: *saved, changed: make(chan struct{}), lastChange: now, appliedAt: now}
 		s.cmds[c.ID] = c
 		s.n.clock.Observe(max(c.ID.HLC, c.ExecuteAt.HLC))
+		if c.Txn != nil && c.Txn.Kind == SyncPoint && c.Status != Invalidated {
+			for _, r := range c.Txn.Ranges {
+				s.barriers = addBound(s.barriers, r, c.ID.Timestamp)
+				if c.Redundant {
+					s.redundant = addBound(s.redundant, r, c.ID.Timestamp)
+				}
+			}
+		}
 	}
 	s.appends = len(cs)
 	return nil
@@ -744,6 +781,9 @@ func (s *store) ephemeralRead(ctx context.Context, r *ephemeralReq) (*ephemeralR
 		var wait *command
 		for _, k := range owned {
 			for _, id := range r.Deps[keyString(k)] {
+				if s.cmds[id] == nil && id.Timestamp.Less(boundFor(s.redundant, k)) {
+					continue // forgotten: durable
+				}
 				c := s.get(id)
 				if c.Status == Applied || c.Status == Invalidated || c.Status == Truncated {
 					continue
@@ -751,7 +791,10 @@ func (s *store) ephemeralRead(ctx context.Context, r *ephemeralReq) (*ephemeralR
 				if len(c.Keys) == 0 {
 					s.registerLocked(c, []Key{k})
 				}
-				if c.Status < PreAccepted && id.Epoch < s.n.joined.Load() {
+				if c.Status < PreAccepted && id.Timestamp.Less(boundFor(s.redundant, k)) {
+					continue // forgotten: durable
+				}
+				if c.Status < PreAccepted && id.Timestamp.Less(s.n.bootstrappedBefore()) {
 					// From before this node joined: another replica reads.
 					s.missingLocked([]TxnID{id}, []Key{k})
 					s.mu.Unlock()
@@ -832,6 +875,9 @@ func (s *store) epochStatus() *epochStatus {
 				continue
 			}
 		}
+		if c.ID.Kind == SyncPoint {
+			continue
+		}
 		st.Active = min(st.Active, c.ID.Epoch)
 	}
 	return st
@@ -844,7 +890,35 @@ func (s *store) epochStatus() *epochStatus {
 func (s *store) forgetLocked() {
 	now := s.n.cfg.Now()
 	for id, c := range s.cmds {
-		if c.Status != Truncated && c.Status != Invalidated || now.Sub(c.lastChange) < s.n.cfg.TombstoneRetention {
+		terminal := c.Status == Applied || c.Status == Invalidated || c.Status == Truncated
+		var drop bool
+		switch {
+		case c.Status == NotDefined && c.Promised.IsZero() && len(c.Keys) > 0 && len(s.redundant) > 0 && s.belowRedundantLocked(id, c.Keys):
+			drop = true // a placeholder for a dependency made redundant
+		case !terminal:
+		case c.Txn != nil && c.Txn.Kind == SyncPoint:
+			// A sync point superseded by a newer redundancy bound on every
+			// one of its ranges.
+			drop = len(s.redundant) > 0
+			for _, r := range c.Txn.Ranges {
+				newer := false
+				for _, b := range s.redundant {
+					if b.R == r && id.Timestamp.Less(b.TS) {
+						newer = true
+					}
+				}
+				drop = drop && newer
+			}
+		case len(s.redundant) > 0 && len(c.Keys) > 0 && s.belowRedundantLocked(id, c.Keys):
+			// RedundantBefore: every replica applied it (or it never
+			// committed); it can never be needed again.
+			drop = true
+		case s.n.cfg.DurabilityRanges == nil:
+			// Without durability rounds: forget truncated or invalidated
+			// records after a retention period.
+			drop = (c.Status == Truncated || c.Status == Invalidated) && now.Sub(c.lastChange) >= s.n.cfg.TombstoneRetention
+		}
+		if !drop {
 			continue
 		}
 		for _, k := range c.owned {
@@ -890,4 +964,33 @@ func parseKeyString(ks string) (Key, bool) {
 		return Key{}, false
 	}
 	return Key{Token: tok, ID: ks[i+1:]}, true
+}
+
+// belowBarrierLocked reports whether a transaction's id is below a sync
+// point witnessed on one of its keys here.
+func (s *store) belowBarrierLocked(id TxnID, keys []Key) bool {
+	if len(s.barriers) == 0 {
+		return false
+	}
+	for _, k := range s.n.owned(keys, id.Epoch) {
+		if id.Timestamp.Less(boundFor(s.barriers, k)) {
+			return true
+		}
+	}
+	return false
+}
+
+// belowRedundantLocked reports whether a transaction's id is below the
+// redundancy bound on all of its keys here.
+func (s *store) belowRedundantLocked(id TxnID, keys []Key) bool {
+	owned := s.n.owned(keys, id.Epoch)
+	if len(s.redundant) == 0 || len(owned) == 0 {
+		return false
+	}
+	for _, k := range owned {
+		if !id.Timestamp.Less(boundFor(s.redundant, k)) {
+			return false
+		}
+	}
+	return true
 }

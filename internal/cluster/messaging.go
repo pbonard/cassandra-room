@@ -38,9 +38,6 @@ const (
 	VerbPaxosAccept
 	VerbMetadataFetch
 	VerbMetadataPush
-	VerbLWTPrepare
-	VerbLWTPropose
-	VerbLWTCommit
 	VerbStreamPush
 	VerbReadDigest
 	VerbCounterMutation
@@ -120,8 +117,8 @@ type MessagingOptions struct {
 const (
 	// ProtocolVersion is this node's messaging version; MinProtocolVersion
 	// the oldest it can talk to.
-	ProtocolVersion    = 3
-	MinProtocolVersion = 3
+	ProtocolVersion    = 4
+	MinProtocolVersion = 4
 
 	kindRequest    = 1
 	kindResponse   = 2
@@ -187,7 +184,7 @@ func stageOf(v Verb) int {
 	switch v {
 	case VerbReadRow, VerbReadDigest, VerbReadRange:
 		return stageRead
-	case VerbMutation, VerbCounterMutation, VerbLWTPrepare, VerbLWTPropose, VerbLWTCommit:
+	case VerbMutation, VerbCounterMutation:
 		return stageMutation
 	case VerbGossip, VerbPing, VerbPingReq, VerbBroadcast:
 		return stageGossip

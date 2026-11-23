@@ -67,6 +67,19 @@ func containsAddr(nodes []*cluster.Node, addr string) bool {
 // their current replicas, then rebuilds its local indexes.
 func (p *proxy) bootstrap() error {
 	cur := p.ring.Load()
+	// Accord's bootstrap: a sync point over every table, applied at every
+	// current replica, before streaming. The data streamed then holds every
+	// transaction before it (later ones reach this node as a pending
+	// replica), and this node does not wait for the earlier ones it never
+	// saw.
+	// It is best effort: when a range has no quorum (a replica being
+	// replaced at RF 2), this node instead fetches the earlier transactions
+	// it does not know before using them.
+	if p.accord != nil && !cur.Empty() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_ = p.accord.Bootstrap(ctx, p.accordTableRanges())
+		cancel()
+	}
 	future := cluster.NewFutureRing(nodeList(p.d.schema.Load()))
 	for _, t := range p.d.userTables() {
 		k := p.d.schema.Load().Keyspaces[t.Keyspace]

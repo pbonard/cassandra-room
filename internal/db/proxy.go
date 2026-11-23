@@ -44,6 +44,9 @@ type ClusterOptions struct {
 	// WriteTimeout and ReadTimeout bound requests to replicas
 	// (write_request_timeout, read_request_timeout): 2 s and 5 s.
 	WriteTimeout, ReadTimeout time.Duration
+	// AccordDurabilityInterval is how often Accord's durability rounds run
+	// (30 s by default).
+	AccordDurabilityInterval time.Duration
 	// Hinted handoff: MaxHintWindow is how long a node may be down and
 	// still get hints (max_hint_window, default 3h); HintThrottle the
 	// bytes per second hints are replayed at, shared by the nodes being
@@ -178,9 +181,6 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	m.Handle(cluster.VerbStreamPush, p.handleStreamPush)
 	m.Handle(cluster.VerbStreamFile, p.handleStreamFile)
 	m.Handle(cluster.VerbCounterMutation, p.handleCounterMutation)
-	for _, v := range []cluster.Verb{cluster.VerbLWTPrepare, cluster.VerbLWTPropose, cluster.VerbLWTCommit} {
-		m.Handle(v, p.handlePaxos(v))
-	}
 	p.g = cluster.NewGossiper(m, cluster.EndpointState{HostID: d.local.HostID, Epoch: d.schema.Load().Epoch}, o.Seeds)
 	if o.Membership != nil {
 		p.g.SetConfig(*o.Membership)
