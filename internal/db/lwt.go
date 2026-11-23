@@ -13,8 +13,9 @@ import (
 
 // Lightweight transactions. On one node the condition is read and the
 // update applied under a lock on the partition, so conditional statements
-// on a partition are linearizable among themselves; in a cluster they run
-// Paxos among the partition's replicas (paxos.go).
+// on a partition are linearizable among themselves; in a cluster they are
+// Accord transactions (accord.go), on every table: tables whose other
+// writes bypass Accord have their conditions read at QUORUM (interop).
 
 type condition struct {
 	ifNotExists, ifExists bool
@@ -107,34 +108,8 @@ func (d *DB) executeCAS(mods []boundModification, batchCtx *execCtx) (message.Me
 		pk = p
 	}
 	t := mods[0].m.t
-	if d.proxy != nil && t.accordManaged() {
-		return d.proxy.accordCAS(mods, t, pk)
-	}
 	if k := d.schema.Load().Keyspaces[t.Keyspace]; d.proxy != nil && k != nil && !k.virtual {
-		var res message.Message
-		err := d.proxy.cas(t, pk, batchCtx.serial, batchCtx.cl, func(ts int64, readCL primitive.ConsistencyLevel) (bool, []write, error) {
-			applied, r, err := d.checkConditions(mods, readCL)
-			if err != nil || !applied {
-				res = r
-				return false, nil, err
-			}
-			res = r
-			// The update is timestamped with the ballot, so decisions apply
-			// in ballot order.
-			batchCtx.ts = ts
-			mu := &mutation{}
-			for _, bm := range mods {
-				bm.e.ts = ts
-				if err := bm.m.addMutations(bm.e, mu); err != nil {
-					return false, nil, err
-				}
-			}
-			return true, mu.writes, nil
-		})
-		if err != nil {
-			return nil, err
-		}
-		return res, nil
+		return d.proxy.accordCAS(mods, t, pk)
 	}
 	lock := &casLocks[maphash.Bytes(casSeed, pk)%uint64(len(casLocks))]
 	lock.Lock()

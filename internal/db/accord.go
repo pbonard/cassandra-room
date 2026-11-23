@@ -22,7 +22,8 @@ import (
 
 // Accord integration (Cassandra's service/accord): tables created or
 // altered WITH transactional_mode = 'full' run their conditional statements
-// (lightweight transactions) as Accord transactions instead of Paxos.
+// (lightweight transactions) as Accord transactions; so do the other
+// tables (Paxos was removed), reading their conditions at QUORUM.
 //
 //   - A transaction's key is a partition: its token and its table's
 //     storage id followed by the partition key. The topology of an epoch
@@ -43,13 +44,25 @@ const accordStorage lsm.TableID = 1<<40 + 2
 
 // TransactionalMode values (transactional_mode).
 const (
-	txnModeOff  = "off"
+	// off: conditional statements and SERIAL reads run on Accord, reading
+	// at QUORUM (interop); other reads and writes do not.
+	txnModeOff = "off"
+	// mixed_reads: every write runs on Accord; non-SERIAL reads do not.
+	txnModeMixedReads = "mixed_reads"
+	// full: every read and write runs on Accord.
 	txnModeFull = "full"
 )
 
+// accordManaged reports whether every write of the table goes through
+// Accord (full and mixed_reads): transactions may use it.
 func (t *Table) accordManaged() bool {
-	return t.Params.TransactionalMode != "" && t.Params.TransactionalMode != txnModeOff
+	return t.Params.TransactionalMode == txnModeFull || t.Params.TransactionalMode == txnModeMixedReads
 }
+
+// accordReads reports whether the table's reads go through Accord too
+// (full): its data is only ever written by Accord, so a replica's own data
+// is complete once earlier transactions applied there.
+func (t *Table) accordReads() bool { return t.Params.TransactionalMode == txnModeFull }
 
 // stmtSource is a statement's text and keyspace.
 type stmtSource struct {
@@ -424,7 +437,14 @@ func (a accordData) Read(k accord.Key, _ accord.Timestamp, txn *accord.Txn) ([]b
 			continue
 		}
 		e := bm.e
-		res, err := bm.m.cond.read.execute(&execCtx{d: a.d, values: e.values, now: e.now, nowSec: e.nowSec, cl: primitive.ConsistencyLevelOne, local: true})
+		re := &execCtx{d: a.d, values: e.values, now: e.now, nowSec: e.nowSec, cl: primitive.ConsistencyLevelOne, local: true}
+		if !bm.m.t.accordReads() {
+			// Interop (AccordInteropRead): the table also takes writes
+			// outside Accord, so the condition is read at QUORUM (this
+			// replica first), with blocking read repair.
+			re.cl, re.local = primitive.ConsistencyLevelQuorum, false
+		}
+		res, err := bm.m.cond.read.execute(re)
 		if err != nil {
 			return nil, err
 		}
@@ -541,6 +561,9 @@ func (p *proxy) accordBarrier(t *Table, pk []byte) error {
 }
 
 func (p *proxy) accordBarrierKey(k accord.Key) error {
+	if err := p.accordAvailable([]accord.Key{k}); err != nil {
+		return err
+	}
 	b, _ := json.Marshal(accordUpdate{})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*p.opts.ReadTimeout)
 	defer cancel()
@@ -606,6 +629,9 @@ func (p *proxy) accordRun(e *execCtx, mode string, keys []accord.Key, writes boo
 func (p *proxy) accordCoordinate(u *accordUpdate, keys []accord.Key, kind accord.Kind) ([]byte, error) {
 	if len(keys) == 0 {
 		return nil, invalidf("A transaction needs at least one partition")
+	}
+	if err := p.accordAvailable(keys); err != nil {
+		return nil, err
 	}
 	b, err := json.Marshal(u)
 	if err != nil {
@@ -689,9 +715,13 @@ func (p *proxy) accordCAS(mods []boundModification, t *Table, pk []byte) (messag
 	if err != nil {
 		return nil, err
 	}
+	key := accordKey(t.Storage, pk)
+	if err := p.accordAvailable([]accord.Key{key}); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*p.opts.WriteTimeout)
 	defer cancel()
-	out, err := p.accord.Coordinate(ctx, &accord.Txn{Kind: accord.Write, Keys: []accord.Key{accordKey(t.Storage, pk)}, Update: b})
+	out, err := p.accord.Coordinate(ctx, &accord.Txn{Kind: accord.Write, Keys: []accord.Key{key}, Update: b})
 	switch {
 	case errors.Is(err, accord.ErrTimeout), errors.Is(err, accord.ErrInvalidated):
 		return nil, &timeoutError{write: true, cas: true, cl: primitive.ConsistencyLevelSerial}
@@ -862,4 +892,41 @@ func (p *proxy) accordRangeSelect(s *selectStmt, e *execCtx) (message.Message, e
 		res.Data = message.RowSet{row}
 	}
 	return res, nil
+}
+
+// liveCell is a cell with an optional TTL.
+func liveCell(col uint32, ts int64, ttl uint32, nowSec int64, v []byte) row.Cell {
+	c := row.Cell{Column: col, Timestamp: ts, LocalDeletionTime: row.NoDeletionTime, Value: v}
+	if ttl > 0 {
+		c.TTL, c.LocalDeletionTime = ttl, nowSec+int64(ttl)
+	}
+	return c
+}
+
+// accordAvailable fails fast when fewer than a quorum of some key's
+// replicas are alive (the transaction could not complete).
+func (p *proxy) accordAvailable(keys []accord.Key) error {
+	s := p.d.schema.Load()
+	ring := p.ring.Load()
+	for _, k := range keys {
+		id, _, err := splitAccordKey(k)
+		if err != nil {
+			continue
+		}
+		t := s.byStorage[id]
+		if t == nil || s.Keyspaces[t.Keyspace] == nil {
+			continue
+		}
+		replicas := ring.Replicas(s.Keyspaces[t.Keyspace].Replication, k.Token)
+		alive := 0
+		for _, n := range replicas {
+			if p.up(n) {
+				alive++
+			}
+		}
+		if need := len(replicas)/2 + 1; alive < need {
+			return &unavailableError{cl: primitive.ConsistencyLevelSerial, required: need, alive: alive}
+		}
+	}
+	return nil
 }

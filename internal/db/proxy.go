@@ -178,9 +178,6 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	m.Handle(cluster.VerbStreamPush, p.handleStreamPush)
 	m.Handle(cluster.VerbStreamFile, p.handleStreamFile)
 	m.Handle(cluster.VerbCounterMutation, p.handleCounterMutation)
-	for _, v := range []cluster.Verb{cluster.VerbLWTPrepare, cluster.VerbLWTPropose, cluster.VerbLWTCommit} {
-		m.Handle(v, p.handlePaxos(v))
-	}
 	p.g = cluster.NewGossiper(m, cluster.EndpointState{HostID: d.local.HostID, Epoch: d.schema.Load().Epoch}, o.Seeds)
 	if o.Membership != nil {
 		p.g.SetConfig(*o.Membership)

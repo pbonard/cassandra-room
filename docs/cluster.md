@@ -128,15 +128,11 @@ node, the coordinator in a cluster.
 - **EACH_QUORUM** under NetworkTopologyStrategy needs a quorum in every
   data center, for reads and writes; writes also wait for pending
   replicas on top of any consistency level (blockForWrite).
-- **Lightweight transactions** run single-decree Paxos per partition among
-  its replicas (Cassandra's Paxos v1, as ScyllaDB's `service/paxos`):
-  prepare (finishing an accepted but uncommitted round, repairing replicas
-  that missed the last commit), a QUORUM read and the condition check,
-  propose (the update timestamped with the ballot), commit at the
-  statement's consistency level, and prune once every replica learnt it.
-  Each replica's promise, accepted proposal and last commit are cells of a
-  `system.paxos`-like table, synced before answering. SERIAL reads finish
-  rounds in progress first. Any node can coordinate.
+- **Lightweight transactions** are Accord transactions on every table
+  (Paxos was removed; see `docs/accord.md`). Tables whose other writes
+  bypass Accord (`transactional_mode` `off`, the default) have their
+  conditions read at QUORUM by the executing replica (interop reads). SERIAL
+  reads first run an Accord read-only transaction, then read at QUORUM.
 - Drivers see the cluster through `system.peers`/`peers_v2` and route
   token-aware.
 
@@ -196,9 +192,6 @@ node, the coordinator in a cluster.
 - Metadata: applying an entry still re-encodes the whole metadata to check
   its hash; the target of an interrupted reconfiguration is not recorded
   in the metadata (TCM records it so any node can finish it).
-- Lightweight transactions use Paxos v1 unless the table has
-  `transactional_mode = 'full'`, which runs them on Accord (see
-  `docs/accord.md`).
 - Repair is full repair only (no incremental repair); streaming sends
   files through messages (no sendfile).
 

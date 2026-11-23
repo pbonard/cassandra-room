@@ -123,9 +123,21 @@ names, not its class structure.
 
 `internal/db/accord.go` connects the protocol to the database:
 
-- **Which tables:** tables `WITH transactional_mode = 'full'` route every
-  statement through Accord:
-  - conditional statements and conditional batches, instead of Paxos;
+- **Every table** runs its conditional statements (and conditional
+  batches) and SERIAL reads on Accord: Paxos was removed. The
+  `transactional_mode` table option chooses what else does:
+  - `off` (the default): nothing else. The transaction reads the
+    conditions at QUORUM from the executing replica (`AccordInteropRead`),
+    because other writes bypass Accord. SERIAL reads run an Accord
+    read-only transaction, then read at QUORUM with blocking read repair.
+  - `mixed_reads`: plain writes run on Accord too, and the table takes
+    `BEGIN TRANSACTION` (with interop reads); non-SERIAL reads don't.
+  - `full`: every statement runs on Accord.
+
+  When fewer than a quorum of a key's replicas are alive, the statement
+  fails with Unavailable before coordinating.
+- **`full` tables** route every statement through Accord:
+  - conditional statements and conditional batches;
   - plain writes and batches, as one transaction each (custom timestamps,
     and batches mixing transactional and other tables, are refused);
   - single-partition reads at any consistency, as read transactions,

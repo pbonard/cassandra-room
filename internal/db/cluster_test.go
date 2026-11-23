@@ -393,12 +393,11 @@ func testMembership() *cluster.Config {
 	return &c
 }
 
-// TestClusterPaxos runs compare-and-set increments of one cell from every
-// coordinator at once: with Paxos, every applied update is based on the
-// previous one, so the final value is the number applied. It then checks
-// that a round accepted by a quorum but never committed is finished by the
-// next SERIAL read.
-func TestClusterPaxos(t *testing.T) {
+// TestClusterLWT runs compare-and-set increments of one cell from every
+// coordinator at once, on a table outside transactional_mode (Accord with
+// interop reads): every applied update is based on the previous one, so
+// the final value is the number applied.
+func TestClusterLWT(t *testing.T) {
 	c := newTestCluster(t, 3)
 	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}")
 	c.ok(0, quorum, "CREATE TABLE ks.c (k int PRIMARY KEY, v int)")
@@ -451,38 +450,12 @@ func TestClusterPaxos(t *testing.T) {
 		}, 5*time.Second, 10*time.Millisecond, "node %d", i)
 	}
 
-	// A coordinator that died after its proposal was accepted by two
-	// replicas: the next serial read completes the round.
-	d := c.nodes[0]
-	tbl := d.schema.Load().Keyspaces["ks"].Tables["c"]
-	pk := []byte{0, 0, 0, 1}
-	pr := mustPrepare(t, d, "UPDATE ks.c SET v = 1000 WHERE k = 1")
-	b := newBallot(time.Now().UnixMicro())
-	e := &execCtx{d: d, now: time.Now(), ts: b.micros()}
-	e.nowSec = e.now.Unix()
-	mu := &mutation{}
-	require.NoError(t, pr.state.Load().stmt.(*modification).addMutations(e, mu))
-	for _, n := range c.nodes[:2] {
-		r := &paxosRequest{Table: uint64(tbl.Storage), Key: pk, Ballot: b}
-		resp, err := n.paxosPrepare(r)
-		require.NoError(t, err)
-		require.True(t, resp.OK)
-		r.Update = encodeWrites(mu.writes)
-		resp, err = n.paxosAccept(r)
-		require.NoError(t, err)
-		require.True(t, resp.OK)
-	}
-	require.Equal(t, final, c.values(2, one, "SELECT v FROM ks.c WHERE k = 1"), "not committed yet")
-	require.Equal(t, []string{"1000"}, c.values(2, serial, "SELECT v FROM ks.c WHERE k = 1"))
-	require.Eventually(t, func() bool {
-		got := c.values(2, one, "SELECT v FROM ks.c WHERE k = 1")
-		return len(got) == 1 && got[0] == "1000"
-	}, 5*time.Second, 10*time.Millisecond, "committed everywhere")
-
 	// One replica down: quorum still decides; two down: unavailable.
 	c.stop(2)
 	require.Eventually(t, func() bool { return !c.nodes[0].proxy.g.IsAlive(c.addrs[2]) }, 5*time.Second, 20*time.Millisecond)
-	res := c.ok(0, quorum, "UPDATE ks.c SET v = 1001 WHERE k = 1 IF v = 1000").(*message.RowsResult)
+	cur, err := strconv.Atoi(c.values(0, serial, "SELECT v FROM ks.c WHERE k = 1")[0])
+	require.NoError(t, err)
+	res := c.ok(0, quorum, "UPDATE ks.c SET v = 1001 WHERE k = 1 IF v = ?", cur).(*message.RowsResult)
 	require.Equal(t, []byte{1}, []byte(res.Data[0][0]))
 	c.stop(1)
 	require.Eventually(t, func() bool { return !c.nodes[0].proxy.g.IsAlive(c.addrs[1]) }, 5*time.Second, 20*time.Millisecond)
@@ -1081,4 +1054,28 @@ func TestClusterAccordReads(t *testing.T) {
 	require.Len(t, rows, 4)
 	rows, _ = pages(0, "SELECT count(*) FROM ks.rows", 3)
 	require.Equal(t, uint64(25+2+3+4+5+6), binary.BigEndian.Uint64(rows[0][0]))
+}
+
+// TestClusterInterop checks Accord's interop on tables whose writes bypass
+// it: a conditional update reads at QUORUM, so it sees plain QUORUM writes;
+// mixed_reads routes plain writes through Accord too.
+func TestClusterInterop(t *testing.T) {
+	c := newTestCluster(t, 3)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}")
+	for _, mode := range []string{"off", "mixed_reads"} {
+		tbl := "t_" + mode
+		c.ok(0, quorum, "CREATE TABLE ks."+tbl+" (k int PRIMARY KEY, v int) WITH transactional_mode = '"+mode+"'")
+		for i := 0; i < 20; i++ {
+			c.ok(i%3, quorum, "INSERT INTO ks."+tbl+" (k, v) VALUES (?, ?)", i, i)
+			res := c.ok((i+1)%3, quorum, "UPDATE ks."+tbl+" SET v = ? WHERE k = ? IF v = ?", i+100, i, i).(*message.RowsResult)
+			require.Equal(t, byte(1), res.Data[0][0][0], "%s: the condition sees the plain write", mode)
+			require.Equal(t, []string{strconv.Itoa(i + 100)}, c.values((i+2)%3, quorum, "SELECT v FROM ks."+tbl+" WHERE k = ?", i))
+		}
+	}
+	require.Contains(t, c.values(1, one, "SELECT transactional_mode FROM system_schema.tables WHERE keyspace_name = 'ks' AND table_name = 't_mixed_reads'"), "mixed_reads")
+	// mixed_reads takes transactions; off does not.
+	c.ok(0, quorum, "BEGIN TRANSACTION LET a = (SELECT v FROM ks.t_mixed_reads WHERE k = 1); UPDATE ks.t_mixed_reads SET v = a.v + 1 WHERE k = 2; COMMIT TRANSACTION")
+	require.Equal(t, []string{"102"}, c.values(0, quorum, "SELECT v FROM ks.t_mixed_reads WHERE k = 2"))
+	_, isErr := c.exec(0, quorum, "BEGIN TRANSACTION SELECT v FROM ks.t_off WHERE k = 1; COMMIT TRANSACTION").(message.Error)
+	require.True(t, isErr)
 }

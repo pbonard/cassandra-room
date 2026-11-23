@@ -345,7 +345,11 @@ func (tx *txnStmt) readLocal(e *execCtx, key *accord.Key) (txnReads, error) {
 				continue
 			}
 		}
-		res, err := s.execute(&execCtx{d: e.d, values: e.values, now: e.now, nowSec: e.nowSec, cl: primitive.ConsistencyLevelOne, local: true})
+		re := &execCtx{d: e.d, values: e.values, now: e.now, nowSec: e.nowSec, cl: primitive.ConsistencyLevelOne, local: true}
+		if !s.t.accordReads() && e.d.proxy != nil {
+			re.cl, re.local = primitive.ConsistencyLevelQuorum, false // interop
+		}
+		res, err := s.execute(re)
 		if err != nil {
 			return nil, err
 		}

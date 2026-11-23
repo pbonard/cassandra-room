@@ -544,11 +544,11 @@ func (s *selectStmt) execute(e *execCtx) (message.Message, error) {
 		src = newVirtualSource(d, s.t)
 	} else {
 		serial := e.cl == primitive.ConsistencyLevelSerial || e.cl == primitive.ConsistencyLevelLocalSerial
-		if d.proxy != nil && !e.local && s.t.accordManaged() && !s.where.pkComplete() && e.src != nil && !(s.json && (s.aggregate || len(s.groupBy) > 0)) {
+		if d.proxy != nil && !e.local && s.t.accordReads() && !s.where.pkComplete() && e.src != nil && !(s.json && (s.aggregate || len(s.groupBy) > 0)) {
 			// A range read of a transactional table: Accord range reads.
 			return d.proxy.accordRangeSelect(s, e)
 		}
-		if d.proxy != nil && !e.local && s.t.accordManaged() && s.where.pkComplete() {
+		if d.proxy != nil && !e.local && s.t.accordReads() && s.where.pkComplete() {
 			// transactional_mode 'full': a single-partition read is an Accord
 			// read transaction (executed by a replica once every earlier
 			// transaction on the partition applied); a read of several
@@ -579,8 +579,10 @@ func (s *selectStmt) execute(e *execCtx) (message.Message, error) {
 				}
 			}
 		} else if serial && d.proxy != nil && !e.local {
-			// A SERIAL read first finishes any Paxos round in progress on the
-			// partition, so it sees every decided update (readWithPaxos).
+			// A SERIAL read first runs an Accord read-only transaction on the
+			// partition: every transaction decided before it is applied at a
+			// quorum, which the QUORUM read (with blocking read repair) then
+			// sees.
 			var pks [][]byte
 			if s.where.pkComplete() {
 				var err error
@@ -591,13 +593,7 @@ func (s *selectStmt) execute(e *execCtx) (message.Message, error) {
 			if len(pks) != 1 {
 				return nil, invalidf("SERIAL/LOCAL_SERIAL consistency may only be requested for one partition at a time")
 			}
-			if s.t.accordManaged() {
-				// Accord: a read transaction on the partition orders the
-				// read after every transaction decided before it.
-				if err := d.proxy.accordBarrier(s.t, pks[0]); err != nil {
-					return nil, err
-				}
-			} else if err := d.proxy.serialReadBegin(s.t, pks[0], e.cl); err != nil {
+			if err := d.proxy.accordBarrier(s.t, pks[0]); err != nil {
 				return nil, err
 			}
 		}

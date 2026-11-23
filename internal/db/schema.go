@@ -524,10 +524,10 @@ func applyTableProperties(p *TableParams, props []cql.Property) error {
 				return err
 			}
 			switch s = strings.ToLower(s); s {
-			case txnModeOff, txnModeFull:
+			case txnModeOff, txnModeMixedReads, txnModeFull:
 				p.TransactionalMode = s
 			default:
-				return invalidf("Invalid transactional_mode %q: off or full", s)
+				return invalidf("Invalid transactional_mode %q: off, mixed_reads or full", s)
 			}
 		case "cdc":
 			s, err := stringProperty(prop)
