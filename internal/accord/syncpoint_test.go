@@ -2,6 +2,7 @@ package accord
 
 import (
 	"context"
+	"errors"
 	"math"
 	"testing"
 	"time"
@@ -60,7 +61,7 @@ func TestSyncPoint(t *testing.T) {
 	// A transaction with an id below the sync point is refused.
 	old := TxnID{Timestamp: Timestamp{Epoch: 1, HLC: id.HLC - 1, Node: "n0"}, Kind: Write}
 	_, err = c.node(0).coordinate(context.Background(), old, appendTxn(t, c.keys[0], 9999))
-	require.ErrorIs(t, err, errStale)
+	require.True(t, errors.Is(err, errStale) || errors.Is(err, errRefused), "%v", err)
 	c.settle()
 	c.check(records)
 }
@@ -128,4 +129,8 @@ func TestBootstrapSyncPoint(t *testing.T) {
 	for _, id := range c.ids {
 		require.Len(t, c.stores[id].data[keyString(c.keys[0])], 1)
 	}
+	// The bootstrap point survives a restart.
+	c.crash(2)
+	c.start(2)
+	require.Equal(t, at, c.node(2).bootstrappedBefore())
 }

@@ -266,25 +266,52 @@ func journalKey(id accord.TxnID) []byte {
 	return append(b, 0, byte(id.Kind))
 }
 
-func (j *accordJournal) Append(c *accord.Command) error {
-	v, err := json.Marshal(c)
-	if err != nil {
-		return err
-	}
+func (j *accordJournal) nextTS() int64 {
 	ts := j.d.opts.Now().UnixMicro()
 	for {
 		last := j.last.Load()
 		ts = max(ts, last+1)
 		if j.last.CompareAndSwap(last, ts) {
-			break
+			return ts
 		}
 	}
-	r := &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: row.NoTimestamp}, Cells: []row.Cell{liveCell(0, ts, 0, 0, v)}}
-	b := lsm.NewBatch()
-	b.Put(accordStorage, journalKey(c.ID), row.Append(nil, r))
+}
+
+// put adds a record to a batch: the command's state, or (no data) a row
+// deletion newer than its records.
+func (j *accordJournal) put(b *lsm.Batch, id accord.TxnID, data []byte) {
+	ts := j.nextTS()
+	r := &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: ts, LocalDeletionTime: j.d.opts.Now().Unix()}}
+	if data != nil {
+		r = &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: row.NoTimestamp}, Cells: []row.Cell{liveCell(0, ts, 0, 0, data)}}
+	}
+	b.Put(accordStorage, journalKey(id), row.Append(nil, r))
+}
+
+func (j *accordJournal) apply(b *lsm.Batch) error {
 	j.d.tableMu.RLock()
 	defer j.d.tableMu.RUnlock()
 	return j.d.engine.Apply(b, lsm.Sync)
+}
+
+func (j *accordJournal) Append(c *accord.Command) error {
+	v, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	b := lsm.NewBatch()
+	j.put(b, c.ID, v)
+	return j.apply(b)
+}
+
+// AppendBatch writes several records with one synced commit-log write
+// (the node's group commit).
+func (j *accordJournal) AppendBatch(recs []accord.Record) error {
+	b := lsm.NewBatch()
+	for _, r := range recs {
+		j.put(b, r.ID, r.Data)
+	}
+	return j.apply(b)
 }
 
 func (j *accordJournal) Load() ([]*accord.Command, error) {
@@ -320,20 +347,9 @@ func (j *accordJournal) Load() ([]*accord.Command, error) {
 
 // Delete forgets a command (a row deletion newer than its record).
 func (j *accordJournal) Delete(id accord.TxnID) error {
-	ts := j.d.opts.Now().UnixMicro()
-	for {
-		last := j.last.Load()
-		ts = max(ts, last+1)
-		if j.last.CompareAndSwap(last, ts) {
-			break
-		}
-	}
-	r := &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: ts, LocalDeletionTime: j.d.opts.Now().Unix()}}
 	b := lsm.NewBatch()
-	b.Put(accordStorage, journalKey(id), row.Append(nil, r))
-	j.d.tableMu.RLock()
-	defer j.d.tableMu.RUnlock()
-	return j.d.engine.Apply(b, lsm.Sync)
+	j.put(b, id, nil)
+	return j.apply(b)
 }
 
 // Compact is a no-op: each command has one record, replaced in place.

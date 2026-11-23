@@ -2,6 +2,7 @@ package accord
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"slices"
 	"sort"
@@ -74,6 +75,9 @@ type Command struct {
 	// every transaction with a lower id there is durable or never commits
 	// (RedundantBefore).
 	Redundant bool `json:",omitempty"`
+	// Bootstrap: not a command, but the sync point this node bootstrapped
+	// at (its ID), kept across restarts.
+	Bootstrap bool `json:",omitempty"`
 }
 
 // command is a Command with its runtime state.
@@ -86,6 +90,8 @@ type command struct {
 	// ready: every dependency that executes earlier has applied.
 	ready     bool
 	executing bool
+	// reading counts reads of the command in progress: its writes wait.
+	reading int
 	// skipped are dependencies from before this node joined that it does
 	// not know: their effects came with its bootstrap data, so applying
 	// does not wait for them, but reads do (they are fetched first).
@@ -121,8 +127,15 @@ type store struct {
 	// with a lower id is refused there. redundant are the bounds below
 	// which every transaction is durable or never commits.
 	barriers, redundant []bound
-	waiters             map[TxnID][]TxnID
-	appends             int
+	// gc commits journal records in groups, outside the lock (nil: the
+	// journal is written synchronously under it); lastSeq is the last
+	// record queued.
+	gc      *groupCommit
+	lastSeq uint64
+	waiters map[TxnID][]TxnID
+	appends int
+	// bootstrapRec is the journal record of the bootstrap point.
+	bootstrapRec *Command
 }
 
 func newStore(n *Node) *store {
@@ -142,7 +155,14 @@ func (s *store) get(id TxnID) *command {
 func (s *store) saveLocked(c *command) error {
 	c.lastChange = s.n.cfg.Now()
 	c.recoveries = 0
-	if err := s.n.cfg.Journal.Append(&c.Command); err != nil {
+	if s.gc != nil {
+		b, err := json.Marshal(&c.Command)
+		if err != nil {
+			return err
+		}
+		s.lastSeq = s.gc.enqueue(Record{ID: c.ID, Data: b})
+	} else if err := s.n.cfg.Journal.Append(&c.Command); err != nil {
+		s.n.metrics.journalErrors.Add(1)
 		return err
 	}
 	s.appends++
@@ -248,13 +268,20 @@ func (s *store) depsLocked(c *command, bound Timestamp) Deps {
 
 // ---- handlers ----
 
+func (s *store) preAccept(r *preAcceptReq) (*preAcceptReply, error) {
+	s.mu.Lock()
+	rep, err := s.preAcceptLocked2(r)
+	if uerr := s.unlock(); err == nil {
+		err = uerr
+	}
+	return rep, err
+}
+
 // preAccept witnesses a transaction (Commands.preaccept): its execution
 // timestamp is its TxnID if nothing conflicting has a later timestamp and
 // this is the original coordinator's round, a new later timestamp
 // otherwise.
-func (s *store) preAccept(r *preAcceptReq) (*preAcceptReply, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *store) preAcceptLocked2(r *preAcceptReq) (*preAcceptReply, error) {
 	s.n.clock.Observe(r.ID.HLC)
 	c := s.get(r.ID)
 	if r.Ballot.Less(c.Promised) {
@@ -303,11 +330,18 @@ func (s *store) preAcceptLocked(c *command, txn *Txn, recovering bool) error {
 	return s.saveLocked(c)
 }
 
-// accept accepts a proposal (Commands.accept) and returns the dependencies
-// this replica knows before the proposed timestamp.
 func (s *store) accept(r *acceptReq) (*acceptReply, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	rep, err := s.acceptLocked2(r)
+	if uerr := s.unlock(); err == nil {
+		err = uerr
+	}
+	return rep, err
+}
+
+// accept accepts a proposal (Commands.accept) and returns the dependencies
+// this replica knows before the proposed timestamp.
+func (s *store) acceptLocked2(r *acceptReq) (*acceptReply, error) {
 	c := s.get(r.ID)
 	if r.Ballot.Less(c.Promised) {
 		return &acceptReply{Outcome: rejectedBallot, Promised: c.Promised}, nil
@@ -346,36 +380,35 @@ func (s *store) commit(ctx context.Context, r *commitReq) (*commitReply, error) 
 	c := s.get(r.ID)
 	if r.Invalidate {
 		err := s.invalidateLocked(c, r.Keys)
-		s.mu.Unlock()
+		if uerr := s.unlock(); err == nil {
+			err = uerr
+		}
 		return &commitReply{Outcome: ok}, err
 	}
 	if c.Status == Invalidated {
-		s.mu.Unlock()
-		return &commitReply{Outcome: redundant}, nil
+		return &commitReply{Outcome: redundant}, s.unlock()
 	}
 	if err := s.commitLocked(c, r.ExecuteAt, r.Deps, r.Txn, r.Keys, r.Ballot, r.Stable); err != nil {
 		s.mu.Unlock()
 		return nil, err
 	}
 	if !r.Read {
-		s.mu.Unlock()
-		return &commitReply{Outcome: ok}, nil
+		return &commitReply{Outcome: ok}, s.unlock()
 	}
-	// Wait until the command can execute. The read happens under the
-	// lock, so the command's own writes (from another coordinator) cannot
-	// be applied in between; once they are known the outcome is answered
-	// instead.
+	// Wait until the command can execute; once its writes are known the
+	// outcome is answered instead.
 	for {
 		if c.Status >= PreApplied && c.Status != Invalidated {
 			rep := &commitReply{Outcome: ok, Applied: true, Writes: c.Writes, Result: c.Result}
-			s.mu.Unlock()
-			return rep, nil
+			return rep, s.unlock()
 		}
 		if c.ready {
 			break
 		}
 		ch := c.changed
-		s.mu.Unlock()
+		if err := s.unlock(); err != nil {
+			return nil, err
+		}
 		select {
 		case <-ch:
 		case <-ctx.Done():
@@ -383,17 +416,33 @@ func (s *store) commit(ctx context.Context, r *commitReq) (*commitReply, error) 
 		}
 		s.mu.Lock()
 	}
-	defer s.mu.Unlock()
 	if s.missingLocked(c.skipped, c.Keys) {
-		return &commitReply{Outcome: notReady}, nil
+		return &commitReply{Outcome: notReady}, s.unlock()
 	}
+	// The read happens outside the lock: while it runs, the command's own
+	// writes (from another coordinator) are held back (reading), and no
+	// later conflicting transaction applies before them.
+	c.reading++
+	owned, executeAt, txn := slices.Clone(c.owned), c.ExecuteAt, c.Txn
+	err := s.unlock()
 	reads := map[string][]byte{}
-	for _, k := range c.owned {
-		b, err := s.n.cfg.Data.Read(k, c.ExecuteAt, c.Txn)
+	for _, k := range owned {
 		if err != nil {
-			return nil, err
+			break
 		}
-		reads[keyString(k)] = b
+		var b []byte
+		if b, err = s.n.cfg.Data.Read(k, executeAt, txn); err == nil {
+			reads[keyString(k)] = b
+		}
+	}
+	s.mu.Lock()
+	c.reading--
+	if c.reading == 0 {
+		s.maybeExecuteLocked(c)
+	}
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
 	}
 	return &commitReply{Outcome: ok, Reads: reads}, nil
 }
@@ -448,8 +497,7 @@ func (s *store) apply(ctx context.Context, r *applyReq) (*applyReply, error) {
 	s.mu.Lock()
 	c := s.get(r.ID)
 	if c.Status == Invalidated {
-		s.mu.Unlock()
-		return &applyReply{Outcome: redundant}, nil
+		return &applyReply{Outcome: redundant}, s.unlock()
 	}
 	if c.Status < PreApplied {
 		if c.Txn == nil {
@@ -469,7 +517,9 @@ func (s *store) apply(ctx context.Context, r *applyReq) (*applyReply, error) {
 	}
 	for c.Status != Applied && c.Status != Truncated {
 		ch := c.changed
-		s.mu.Unlock()
+		if err := s.unlock(); err != nil {
+			return nil, err
+		}
 		select {
 		case <-ch:
 		case <-ctx.Done():
@@ -477,8 +527,7 @@ func (s *store) apply(ctx context.Context, r *applyReq) (*applyReply, error) {
 		}
 		s.mu.Lock()
 	}
-	s.mu.Unlock()
-	return &applyReply{Outcome: ok}, nil
+	return &applyReply{Outcome: ok}, s.unlock()
 }
 
 // maybeExecuteLocked checks whether a stable command can execute: every
@@ -524,7 +573,7 @@ func (s *store) maybeExecuteLocked(c *command) {
 		close(c.changed)
 		c.changed = make(chan struct{})
 	}
-	if c.Status != PreApplied {
+	if c.Status != PreApplied || c.reading > 0 {
 		return
 	}
 	c.executing = true
@@ -547,25 +596,46 @@ func (s *store) applyWrites(id TxnID, txn *Txn, executeAt Timestamp, owned []Key
 	if s.n.stopped.Load() {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	c := s.cmds[id]
-	c.executing = false
-	if c.Status != PreApplied {
+	// Record it applied; if the journal fails, it stays PreApplied (its
+	// writes are idempotent) and the record is retried.
+	for !s.n.stopped.Load() {
+		s.mu.Lock()
+		c := s.cmds[id]
+		if c == nil || c.Status != PreApplied {
+			if c != nil {
+				c.executing = false
+			}
+			s.mu.Unlock()
+			return
+		}
+		c.Status, c.appliedAt = Applied, s.n.cfg.Now()
+		if err := s.saveLocked(c); err != nil {
+			c.Status = PreApplied
+			s.mu.Unlock()
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		c.executing = false
+		delete(s.waiters, id)
+		_ = s.unlock() // a failed group write is replayed as PreApplied
 		return
 	}
-	c.Status, c.appliedAt = Applied, s.n.cfg.Now()
-	_ = s.saveLocked(c)
-	delete(s.waiters, id)
+}
+
+func (s *store) beginRecovery(r *recoverReq) (*recoverReply, error) {
+	s.mu.Lock()
+	rep, err := s.beginRecoveryLocked2(r)
+	if uerr := s.unlock(); err == nil {
+		err = uerr
+	}
+	return rep, err
 }
 
 // beginRecovery answers a recovery coordinator (BeginRecovery): it promises
 // the ballot, pre-accepts the transaction if it had not been (without a
 // fast path vote), and reports what it knows, including whether a
 // transaction that executes later has not witnessed this one.
-func (s *store) beginRecovery(r *recoverReq) (*recoverReply, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *store) beginRecoveryLocked2(r *recoverReq) (*recoverReply, error) {
 	c := s.get(r.ID)
 	if r.Ballot.Less(c.Promised) {
 		return &recoverReply{Outcome: rejectedBallot}, nil
@@ -624,12 +694,23 @@ func (s *store) beginRecovery(r *recoverReq) (*recoverReply, error) {
 	return rep, nil
 }
 
-func (s *store) checkStatus(id TxnID) *checkStatusReply {
+func (s *store) checkStatus(id TxnID, keys []Key) *checkStatusReply {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer func() { _ = s.unlock() }() // answer only with durable state
 	c := s.cmds[id]
-	if c == nil {
-		return &checkStatusReply{}
+	if c == nil || c.Status == NotDefined {
+		if len(keys) > 0 && s.belowRedundantLocked(id, keys) {
+			var bs []bound
+			for _, b := range s.redundant {
+				if slices.ContainsFunc(keys, b.R.contains) && id.Timestamp.Less(b.TS) {
+					bs = append(bs, b)
+				}
+			}
+			return &checkStatusReply{Status: Truncated, Redundant: bs}
+		}
+		if c == nil {
+			return &checkStatusReply{}
+		}
 	}
 	return &checkStatusReply{Status: c.Status, Promised: c.Promised, Accepted: c.Accepted, ExecuteAt: c.ExecuteAt,
 		Deps: c.Deps, Txn: c.Txn, Keys: c.Keys, Writes: c.Writes, Result: c.Result}
@@ -637,7 +718,14 @@ func (s *store) checkStatus(id TxnID) *checkStatusReply {
 
 func (s *store) informDurable(id TxnID) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	err := s.informDurableLocked2(id)
+	if uerr := s.unlock(); err == nil {
+		err = uerr
+	}
+	return err
+}
+
+func (s *store) informDurableLocked2(id TxnID) error {
 	c := s.cmds[id]
 	if c == nil || c.Durable || c.Status != Applied {
 		return nil
@@ -671,6 +759,12 @@ func (s *store) truncateLocked() {
 		for _, c := range s.cmds {
 			all = append(all, &c.Command)
 		}
+		if s.bootstrapRec != nil {
+			all = append(all, s.bootstrapRec)
+		}
+		if s.gc != nil && s.gc.wait(s.lastSeq) != nil {
+			return
+		}
 		if s.n.cfg.Journal.Compact(all) == nil {
 			s.appends = len(all)
 		}
@@ -687,6 +781,12 @@ func (s *store) replay() error {
 	defer s.mu.Unlock()
 	now := s.n.cfg.Now()
 	for _, saved := range cs {
+		if saved.Bootstrap {
+			s.bootstrapRec = saved
+			at := saved.ExecuteAt
+			s.n.bootstrapped.Store(&at)
+			continue
+		}
 		c := &command{Command: *saved, changed: make(chan struct{}), lastChange: now, appliedAt: now}
 		s.cmds[c.ID] = c
 		s.n.clock.Observe(max(c.ID.HLC, c.ExecuteAt.HLC))
@@ -718,12 +818,16 @@ func (s *store) rescanLocked() {
 	}
 }
 
+func (s *store) fastCommit(id TxnID, txn *Txn, deps Deps) bool {
+	s.mu.Lock()
+	ok := s.fastCommitLocked2(id, txn, deps)
+	return s.unlock() == nil && ok
+}
+
 // fastCommit is the privileged coordinator's local decision of the fast
 // path: it commits only if no recovery has promised a ballot here, which a
 // recovery that reaches this node relies on to invalidate safely.
-func (s *store) fastCommit(id TxnID, txn *Txn, deps Deps) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *store) fastCommitLocked2(id TxnID, txn *Txn, deps Deps) bool {
 	c := s.get(id)
 	if !c.Promised.IsZero() {
 		return c.Status.decided() && c.ExecuteAt == id.Timestamp
@@ -739,7 +843,7 @@ func (s *store) fastCommit(id TxnID, txn *Txn, deps Deps) bool {
 // replica.
 func (s *store) ephemeralDeps(keys []Key, ranges []Range) *ephemeralReply {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer func() { _ = s.unlock() }() // answer only with durable state
 	d := Deps{}
 	var fs []*cfk
 	for _, k := range s.n.owned(keys, 0) {
@@ -766,7 +870,7 @@ func (s *store) ephemeralDeps(keys []Key, ranges []Range) *ephemeralReply {
 			d.add(k, id)
 		}
 	}
-	return &ephemeralReply{Outcome: ok, Deps: d}
+	return &ephemeralReply{Outcome: ok, Deps: d, Epoch: s.n.epoch()}
 }
 
 // ephemeralRead reads keys once every dependency on them has applied here
@@ -839,7 +943,8 @@ func (s *store) ephemeralRead(ctx context.Context, r *ephemeralReq) (*ephemeralR
 		}
 		s.mu.Lock()
 	}
-	defer s.mu.Unlock()
+	// Every dependency is applied here: the read needs no lock.
+	s.mu.Unlock()
 	reads := map[string][]byte{}
 	for _, k := range s.n.owned(r.Keys, 0) {
 		b, err := s.n.cfg.Data.Read(k, Timestamp{}, r.Txn)
@@ -876,6 +981,12 @@ func (s *store) forgetLocked() {
 		switch {
 		case c.Status == NotDefined && c.Promised.IsZero() && len(c.Keys) > 0 && len(s.redundant) > 0 && s.belowRedundantLocked(id, c.Keys):
 			drop = true // a placeholder for a dependency made redundant
+		case !terminal && !c.Status.decided() && c.ID.Kind != SyncPoint && len(c.Keys) > 0 && len(s.redundant) > 0 && s.belowRedundantLocked(id, c.Keys):
+			// Undecided below the redundancy bound: had it been a dependency
+			// of the durable sync point, that sync point could not have
+			// applied here before it. So it never commits: invalidated here.
+			c.Status = Invalidated
+			_ = s.saveLocked(c)
 		case !terminal:
 		case c.Txn != nil && c.Txn.Kind == SyncPoint:
 			// A sync point superseded by a newer redundancy bound on every
@@ -909,7 +1020,7 @@ func (s *store) forgetLocked() {
 				}
 			}
 		}
-		if s.n.cfg.Journal.Delete(id) == nil {
+		if s.forgetRecordLocked(id) == nil {
 			delete(s.cmds, id)
 			delete(s.waiters, id)
 		}
@@ -974,4 +1085,24 @@ func (s *store) belowRedundantLocked(id TxnID, keys []Key) bool {
 		}
 	}
 	return true
+}
+
+// forgetRecordLocked removes a command's journal record.
+func (s *store) forgetRecordLocked(id TxnID) error {
+	if s.gc != nil {
+		s.lastSeq = s.gc.enqueue(Record{ID: id})
+		return nil
+	}
+	return s.n.cfg.Journal.Delete(id)
+}
+
+// unlock releases the store lock, then waits until every journal record
+// queued so far is durable: a handler answers only after its changes are.
+func (s *store) unlock() error {
+	seq := s.lastSeq
+	s.mu.Unlock()
+	if s.gc == nil || seq == 0 {
+		return nil
+	}
+	return s.gc.wait(seq)
 }

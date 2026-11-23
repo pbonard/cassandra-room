@@ -159,6 +159,9 @@ func NewNode(cfg Config) (*Node, error) {
 	if err := n.s.replay(); err != nil {
 		return nil, err
 	}
+	if bj, ok := cfg.Journal.(BatchJournal); ok {
+		n.s.gc = newGroupCommit(bj, func() { n.metrics.journalErrors.Add(1) })
+	}
 	return n, nil
 }
 
@@ -172,8 +175,10 @@ func (n *Node) SetTopology(t *Topology) {
 	n.topoMu.Lock()
 	n.topos[t.Epoch] = t
 	n.latest = max(n.latest, t.Epoch)
+	// Recent epochs are kept, and every epoch from the synchronised one
+	// on: phases still need their quorums.
 	for e := range n.topos {
-		if e < n.latest-64 {
+		if e < n.latest-64 && e < n.synced.Load() {
 			delete(n.topos, e)
 		}
 	}
@@ -196,7 +201,7 @@ func (n *Node) topologies(keys []Key, from, to int64) *Topologies {
 	n.topoMu.RLock()
 	defer n.topoMu.RUnlock()
 	ts := &Topologies{}
-	for e := max(from, n.latest-64); e <= to; e++ {
+	for e := from; e <= to; e++ {
 		if t := n.topos[e]; t != nil {
 			ts.Shards = append(ts.Shards, t.shards(keys)...)
 		}
@@ -257,6 +262,9 @@ func (n *Node) Stop() {
 	n.stopped.Store(true)
 	close(n.stop)
 	n.wg.Wait()
+	if n.s.gc != nil {
+		n.s.gc.close()
+	}
 }
 
 // ---- messages ----
@@ -395,6 +403,9 @@ type recoverReply struct {
 
 type checkStatusReq struct {
 	ID TxnID
+	// Keys, if given, let a replica tell an unknown transaction below its
+	// redundancy bound (reported Truncated).
+	Keys []Key `json:",omitempty"`
 }
 
 type ephemeralReq struct {
@@ -408,6 +419,9 @@ type ephemeralReply struct {
 	Outcome outcome
 	Deps    Deps
 	Reads   map[string][]byte
+	// Epoch is the replica's newest epoch: a coordinator behind it retries
+	// once it caught up (GetEphemeralReadDeps).
+	Epoch int64 `json:",omitempty"`
 }
 
 type checkStatusReply struct {
@@ -420,6 +434,9 @@ type checkStatusReply struct {
 	Keys      []Key
 	Writes    Writes
 	Result    []byte
+	// Redundant are the replica's redundancy bounds over the keys, with
+	// Status Truncated: the transaction is below one.
+	Redundant []bound `json:",omitempty"`
 }
 
 // Handle answers a request from another node.
@@ -462,7 +479,7 @@ func (n *Node) Handle(ctx context.Context, from NodeID, payload []byte) ([]byte,
 	case mCheckStatus:
 		var r checkStatusReq
 		if err = json.Unmarshal(env.B, &r); err == nil {
-			reply = n.s.checkStatus(r.ID)
+			reply = n.s.checkStatus(r.ID, r.Keys)
 		}
 	case mInformDurable:
 		var r checkStatusReq
@@ -592,14 +609,14 @@ func (n *Node) bootstrappedBefore() Timestamp {
 type metrics struct {
 	fastPath, mediumPath, slowPath, recoveries, invalidations atomic.Int64
 	ephemeralReads, rangeReads, syncPoints, durableRounds     atomic.Int64
-	preempted, stale, timeouts, epochSyncs                    atomic.Int64
+	preempted, stale, timeouts, epochSyncs, journalErrors     atomic.Int64
 }
 
 // Stats are a node's Accord metrics and state (for virtual tables).
 type Stats struct {
 	FastPath, MediumPath, SlowPath, Recoveries, Invalidations int64
 	EphemeralReads, RangeReads, SyncPoints, DurabilityRounds  int64
-	Preempted, Stale, Timeouts, EpochSyncs                    int64
+	Preempted, Stale, Timeouts, EpochSyncs, JournalErrors     int64
 	Commands, Keys, Barriers, Redundant                       int
 	Epoch, SyncedEpoch                                        int64
 }
@@ -610,7 +627,7 @@ func (n *Node) Stats() Stats {
 	st := Stats{FastPath: m.fastPath.Load(), MediumPath: m.mediumPath.Load(), SlowPath: m.slowPath.Load(),
 		Recoveries: m.recoveries.Load(), Invalidations: m.invalidations.Load(), EphemeralReads: m.ephemeralReads.Load(),
 		RangeReads: m.rangeReads.Load(), SyncPoints: m.syncPoints.Load(), DurabilityRounds: m.durableRounds.Load(),
-		Preempted: m.preempted.Load(), Stale: m.stale.Load(), Timeouts: m.timeouts.Load(), EpochSyncs: m.epochSyncs.Load(),
+		Preempted: m.preempted.Load(), Stale: m.stale.Load(), Timeouts: m.timeouts.Load(), EpochSyncs: m.epochSyncs.Load(), JournalErrors: m.journalErrors.Load(),
 		Epoch: n.epoch(), SyncedEpoch: n.synced.Load()}
 	n.s.mu.Lock()
 	st.Commands, st.Keys, st.Barriers, st.Redundant = len(n.s.cmds), len(n.s.keys), len(n.s.barriers), len(n.s.redundant)

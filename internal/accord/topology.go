@@ -163,6 +163,16 @@ func (t *tracker) done() bool {
 	return true
 }
 
+// anyDone reports whether some shard has a quorum.
+func (t *tracker) anyDone() bool {
+	for i, s := range t.shards {
+		if len(t.ok[i]) >= t.quorum(s) {
+			return true
+		}
+	}
+	return false
+}
+
 // impossible reports whether some shard can no longer reach a quorum.
 func (t *tracker) impossible() bool {
 	for i, s := range t.shards {

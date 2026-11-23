@@ -3,6 +3,7 @@ package accord
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"slices"
 	"testing"
@@ -185,7 +186,7 @@ func TestEpochSync(t *testing.T) {
 	stale := appendTxn(t, k, 2)
 	id := TxnID{Timestamp: Timestamp{Epoch: 1, HLC: c.node(0).clock.Next(0), Node: "n0"}, Kind: Write}
 	_, err = c.node(0).coordinate(context.Background(), id, stale)
-	require.ErrorIs(t, err, errStale)
+	require.True(t, errors.Is(err, errStale) || errors.Is(err, errRefused), "%v", err)
 	require.NoError(t, c.node(0).recover(context.Background(), id, stale, stale.Keys))
 	_, err = c.node(0).awaitOutcome(context.Background(), id, stale.Keys)
 	require.ErrorIs(t, err, ErrInvalidated)

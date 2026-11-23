@@ -2,6 +2,7 @@ package accord
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"slices"
 	"sort"
@@ -39,11 +40,18 @@ type syncReply struct {
 	Deps    Deps
 }
 
-// syncPropose witnesses a sync point: it records the barrier and returns
-// every transaction on its ranges with a lower id (all kinds).
 func (s *store) syncPropose(r *syncReq) (*syncReply, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	rep, err := s.syncProposeLocked2(r)
+	if uerr := s.unlock(); err == nil {
+		err = uerr
+	}
+	return rep, err
+}
+
+// syncPropose witnesses a sync point: it records the barrier and returns
+// every transaction on its ranges with a lower id (all kinds).
+func (s *store) syncProposeLocked2(r *syncReq) (*syncReply, error) {
 	c := s.get(r.ID)
 	if c.Status != NotDefined {
 		return &syncReply{Outcome: ok, Deps: c.Deps}, nil
@@ -88,11 +96,18 @@ func (s *store) syncOwnedLocked(c *command) {
 	}
 }
 
-// markRedundant records that a sync point is applied at every replica of
-// its ranges (RedundantBefore).
 func (s *store) markRedundant(id TxnID, ranges []Range) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	err := s.markRedundantLocked2(id, ranges)
+	if uerr := s.unlock(); err == nil {
+		err = uerr
+	}
+	return err
+}
+
+// markRedundant records that a sync point is applied at every replica of
+// its ranges (RedundantBefore).
+func (s *store) markRedundantLocked2(id TxnID, ranges []Range) error {
 	for _, r := range ranges {
 		s.redundant = addBound(s.redundant, r, id.Timestamp)
 		s.barriers = addBound(s.barriers, r, id.Timestamp)
@@ -245,10 +260,35 @@ func (n *Node) Bootstrap(ctx context.Context, ranges []Range) error {
 		}
 		at = maxTimestamp(at, id.Timestamp)
 	}
-	if prev := n.bootstrapped.Load(); prev == nil || prev.Less(at) {
-		n.bootstrapped.Store(&at)
+	return n.s.setBootstrapped(at)
+}
+
+var bootstrapRecordID = TxnID{Timestamp: Timestamp{Node: "~bootstrap"}, Kind: SyncPoint}
+
+// setBootstrapped records the bootstrap point, durably.
+func (s *store) setBootstrapped(at Timestamp) error {
+	s.mu.Lock()
+	if prev := s.n.bootstrapped.Load(); prev != nil && !prev.Less(at) {
+		s.mu.Unlock()
+		return nil
 	}
-	return nil
+	s.n.bootstrapped.Store(&at)
+	// One fixed id (no real command has it), so the record replaces any
+	// earlier bootstrap record.
+	rec := &Command{ID: bootstrapRecordID, ExecuteAt: at, Bootstrap: true}
+	s.bootstrapRec = rec
+	if s.gc != nil {
+		b, err := json.Marshal(rec)
+		if err != nil {
+			s.mu.Unlock()
+			return err
+		}
+		s.lastSeq = s.gc.enqueue(Record{ID: rec.ID, Data: b})
+		return s.unlock()
+	}
+	err := s.n.cfg.Journal.Append(rec)
+	s.mu.Unlock()
+	return err
 }
 
 // dirty reports whether a range has had transactions here since its
@@ -264,4 +304,21 @@ func (s *store) dirty(r Range) bool {
 		}
 	}
 	return false
+}
+
+// adoptRedundant records redundancy bounds another replica of the ranges
+// has (a SetShardDurable this replica missed: the sync point applied here
+// too), and wakes the commands waiting on a transaction below them.
+func (s *store) adoptRedundant(id TxnID, bs []bound) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, b := range bs {
+		s.redundant = addBound(s.redundant, b.R, b.TS)
+		s.barriers = addBound(s.barriers, b.R, b.TS)
+	}
+	for _, w := range s.waiters[id] {
+		if wc := s.cmds[w]; wc != nil {
+			s.maybeExecuteLocked(wc)
+		}
+	}
 }
