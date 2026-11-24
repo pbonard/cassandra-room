@@ -278,11 +278,16 @@ func (p *proxy) join() error {
 			next.CMS = slices.Clone(p.initialCMS)
 		}
 		cur := next.Nodes[me.HostID]
-		if cur != nil && cur.Status != cluster.StatusLeft && cur.Addr == me.Addr && cur.NativeAddr == me.NativeAddr && cur.NativePort == me.NativePort {
+		if cur != nil && cur.Status != cluster.StatusLeft && cur.Addr == me.Addr && cur.NativeAddr == me.NativeAddr && cur.NativePort == me.NativePort && cur.Ordinal != 0 {
 			return nil, false, nil
 		}
 		n := *me
 		n.Status = cluster.StatusNormal
+		if cur != nil && cur.Ordinal != 0 {
+			n.Ordinal = cur.Ordinal
+		} else {
+			n.Ordinal = cluster.NextOrdinal(next.Nodes)
+		}
 		for _, o := range next.Nodes {
 			if o.HostID != me.HostID && o.Status == cluster.StatusNormal {
 				n.Status = cluster.StatusJoining // there is data to stream
@@ -346,6 +351,7 @@ func (p *proxy) replace(me *cluster.Node, target string) error {
 		}
 		n := *me
 		n.Tokens, n.Status, n.Replaces = slices.Clone(o.Tokens), cluster.StatusJoining, o.HostID
+		n.Ordinal = cluster.NextOrdinal(next.Nodes)
 		next.Nodes[me.HostID] = &n
 		next.logDetail = fmt.Sprintf("%s %s replaces %s %s", n.HostID, n.Addr, o.HostID, o.Addr)
 		return nil, true, nil
@@ -421,6 +427,9 @@ func (p *proxy) metadataChanged(s *Schema) {
 	p.replaced.Store(&replaced)
 	p.ring.Store(cluster.NewRing(nodeList(s)))
 	p.accordTopology(s)
+	if me := s.Nodes[p.d.local.HostID]; me != nil && me.Ordinal != 0 && p.accord != nil {
+		p.accord.SetTag(me.Ordinal)
+	}
 	p.g.Update(func(st *cluster.EndpointState) { st.Epoch = s.Epoch })
 }
 

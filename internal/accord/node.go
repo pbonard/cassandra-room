@@ -78,6 +78,11 @@ type Config struct {
 	// forgotten after TombstoneRetention.
 	DurabilityRanges   func() []Range
 	DurabilityInterval time.Duration
+	// IsLeader, if set, reports whether this node synchronises epochs (one
+	// node should); EpochRanges are the ranges compared between epochs to
+	// find those that changed (every table's whole range).
+	IsLeader    func() bool
+	EpochRanges func() []Range
 	// Proximity, if set, ranks another node by distance (lower is nearer):
 	// reads go to the nearest replicas first.
 	Proximity func(NodeID) int
@@ -109,12 +114,15 @@ type Node struct {
 	// started before a topology change are witnessed by the replicas of
 	// the new one until none is left (epoch synchronisation).
 	synced      atomic.Int64
-	lastSynced  time.Time
+	syncing     atomic.Bool
 	metrics     metrics
 	lastDurable time.Time
 	// bootstrapped is the sync point this node bootstrapped at: the
 	// transactions before it are reflected in the data it streamed.
 	bootstrapped atomic.Pointer[Timestamp]
+	// persisting bounds the transactions whose outcome is being retried
+	// to replicas that missed it.
+	persisting chan struct{}
 
 	stop    chan struct{}
 	stopped atomic.Bool
@@ -122,6 +130,9 @@ type Node struct {
 	// recovering marks transactions this node is recovering or fetching.
 	recovering sync.Map
 }
+
+// maxPersisting bounds the background apply retries of a node.
+const maxPersisting = 1024
 
 // NewNode creates a node and replays its journal.
 func NewNode(cfg Config) (*Node, error) {
@@ -149,13 +160,21 @@ func NewNode(cfg Config) (*Node, error) {
 	if cfg.Journal == nil {
 		cfg.Journal = &MemJournal{}
 	}
-	n := &Node{cfg: cfg, clock: NewClock(cfg.Tag, cfg.Now), topos: map[int64]*Topology{}, stop: make(chan struct{})}
+	n := &Node{cfg: cfg, clock: NewClock(cfg.Tag, cfg.Now), topos: map[int64]*Topology{}, stop: make(chan struct{}),
+		persisting: make(chan struct{}, maxPersisting)}
 	n.s = newStore(n)
 	if err := n.s.replay(); err != nil {
 		return nil, err
 	}
+	if bj, ok := cfg.Journal.(BatchJournal); ok {
+		n.s.gc = newGroupCommit(bj, func() { n.metrics.journalErrors.Add(1) })
+	}
 	return n, nil
 }
+
+// SetTag sets the tag of the node's clock (a number unique among the
+// cluster's nodes, below 1024): no two nodes then make the same timestamp.
+func (n *Node) SetTag(tag int) { n.clock.SetTag(tag) }
 
 // ID returns the node's id.
 func (n *Node) ID() NodeID { return n.cfg.ID }
@@ -167,8 +186,10 @@ func (n *Node) SetTopology(t *Topology) {
 	n.topoMu.Lock()
 	n.topos[t.Epoch] = t
 	n.latest = max(n.latest, t.Epoch)
+	// Recent epochs are kept, and every epoch from the synchronised one
+	// on: phases still need their quorums.
 	for e := range n.topos {
-		if e < n.latest-64 {
+		if e < n.latest-64 && e < n.synced.Load() {
 			delete(n.topos, e)
 		}
 	}
@@ -191,7 +212,7 @@ func (n *Node) topologies(keys []Key, from, to int64) *Topologies {
 	n.topoMu.RLock()
 	defer n.topoMu.RUnlock()
 	ts := &Topologies{}
-	for e := max(from, n.latest-64); e <= to; e++ {
+	for e := from; e <= to; e++ {
 		if t := n.topos[e]; t != nil {
 			ts.Shards = append(ts.Shards, t.shards(keys)...)
 		}
@@ -252,6 +273,9 @@ func (n *Node) Stop() {
 	n.stopped.Store(true)
 	close(n.stop)
 	n.wg.Wait()
+	if n.s.gc != nil {
+		n.s.gc.close()
+	}
 }
 
 // ---- messages ----
@@ -268,9 +292,10 @@ const (
 	mInformDurable msgType = "InformDurable"
 	mEphemeralDeps msgType = "GetEphemeralReadDeps"
 	mEphemeralRead msgType = "ReadEphemeralTxnData"
-	mEpochStatus   msgType = "EpochStatus"
+	mEpochSynced   msgType = "EpochSynced"
 	mSyncPropose   msgType = "ProposeSyncPoint"
 	mRedundant     msgType = "SetShardDurable"
+	mMajority      msgType = "SetMajorityDurable"
 )
 
 type envelope struct {
@@ -390,6 +415,9 @@ type recoverReply struct {
 
 type checkStatusReq struct {
 	ID TxnID
+	// Keys, if given, let a replica tell an unknown transaction below its
+	// redundancy bound (reported Truncated).
+	Keys []Key `json:",omitempty"`
 }
 
 type ephemeralReq struct {
@@ -403,12 +431,9 @@ type ephemeralReply struct {
 	Outcome outcome
 	Deps    Deps
 	Reads   map[string][]byte
-}
-
-type epochStatus struct {
-	// Active is the oldest epoch of a transaction in progress here (the
-	// latest epoch if there is none); Latest the newest epoch known.
-	Active, Latest int64
+	// Epoch is the replica's newest epoch: a coordinator behind it retries
+	// once it caught up (GetEphemeralReadDeps).
+	Epoch int64 `json:",omitempty"`
 }
 
 type checkStatusReply struct {
@@ -421,6 +446,9 @@ type checkStatusReply struct {
 	Keys      []Key
 	Writes    Writes
 	Result    []byte
+	// Redundant are the replica's redundancy bounds over the keys, with
+	// Status Truncated: the transaction is below one.
+	Redundant []bound `json:",omitempty"`
 }
 
 // Handle answers a request from another node.
@@ -463,7 +491,7 @@ func (n *Node) Handle(ctx context.Context, from NodeID, payload []byte) ([]byte,
 	case mCheckStatus:
 		var r checkStatusReq
 		if err = json.Unmarshal(env.B, &r); err == nil {
-			reply = n.s.checkStatus(r.ID)
+			reply = n.s.checkStatus(r.ID, r.Keys)
 		}
 	case mInformDurable:
 		var r checkStatusReq
@@ -480,8 +508,11 @@ func (n *Node) Handle(ctx context.Context, from NodeID, payload []byte) ([]byte,
 		if err = json.Unmarshal(env.B, &r); err == nil {
 			reply, err = n.s.ephemeralRead(ctx, &r)
 		}
-	case mEpochStatus:
-		reply = n.s.epochStatus()
+	case mEpochSynced:
+		var r epochSynced
+		if err = json.Unmarshal(env.B, &r); err == nil {
+			n.advanceSynced(r.Epoch)
+		}
 	case mSyncPropose:
 		var r syncReq
 		if err = json.Unmarshal(env.B, &r); err == nil {
@@ -491,6 +522,11 @@ func (n *Node) Handle(ctx context.Context, from NodeID, payload []byte) ([]byte,
 		var r syncReq
 		if err = json.Unmarshal(env.B, &r); err == nil {
 			err = n.s.markRedundant(r.ID, r.Txn.Ranges)
+		}
+	case mMajority:
+		var r syncReq
+		if err = json.Unmarshal(env.B, &r); err == nil {
+			n.s.markMajority(r.ID, r.Txn.Ranges)
 		}
 	default:
 		err = fmt.Errorf("accord: unknown message %q", env.T)
@@ -590,14 +626,16 @@ func (n *Node) bootstrappedBefore() Timestamp {
 type metrics struct {
 	fastPath, mediumPath, slowPath, recoveries, invalidations atomic.Int64
 	ephemeralReads, rangeReads, syncPoints, durableRounds     atomic.Int64
-	preempted, stale, timeouts                                atomic.Int64
+	majorityRounds, persistShed                               atomic.Int64
+	preempted, stale, timeouts, epochSyncs, journalErrors     atomic.Int64
 }
 
 // Stats are a node's Accord metrics and state (for virtual tables).
 type Stats struct {
 	FastPath, MediumPath, SlowPath, Recoveries, Invalidations int64
 	EphemeralReads, RangeReads, SyncPoints, DurabilityRounds  int64
-	Preempted, Stale, Timeouts                                int64
+	MajorityRounds, PersistShed                               int64
+	Preempted, Stale, Timeouts, EpochSyncs, JournalErrors     int64
 	Commands, Keys, Barriers, Redundant                       int
 	Epoch, SyncedEpoch                                        int64
 }
@@ -607,8 +645,8 @@ func (n *Node) Stats() Stats {
 	m := &n.metrics
 	st := Stats{FastPath: m.fastPath.Load(), MediumPath: m.mediumPath.Load(), SlowPath: m.slowPath.Load(),
 		Recoveries: m.recoveries.Load(), Invalidations: m.invalidations.Load(), EphemeralReads: m.ephemeralReads.Load(),
-		RangeReads: m.rangeReads.Load(), SyncPoints: m.syncPoints.Load(), DurabilityRounds: m.durableRounds.Load(),
-		Preempted: m.preempted.Load(), Stale: m.stale.Load(), Timeouts: m.timeouts.Load(),
+		RangeReads: m.rangeReads.Load(), SyncPoints: m.syncPoints.Load(), DurabilityRounds: m.durableRounds.Load(), MajorityRounds: m.majorityRounds.Load(), PersistShed: m.persistShed.Load(),
+		Preempted: m.preempted.Load(), Stale: m.stale.Load(), Timeouts: m.timeouts.Load(), EpochSyncs: m.epochSyncs.Load(), JournalErrors: m.journalErrors.Load(),
 		Epoch: n.epoch(), SyncedEpoch: n.synced.Load()}
 	n.s.mu.Lock()
 	st.Commands, st.Keys, st.Barriers, st.Redundant = len(n.s.cmds), len(n.s.keys), len(n.s.barriers), len(n.s.redundant)

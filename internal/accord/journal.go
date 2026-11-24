@@ -30,6 +30,8 @@ type MemJournal struct {
 	mu   sync.Mutex
 	cmds map[TxnID][]byte
 	n    int
+	// Fail, if set, fails every write (for tests).
+	Fail error
 }
 
 func (j *MemJournal) Append(c *Command) error {
@@ -37,13 +39,27 @@ func (j *MemJournal) Append(c *Command) error {
 	if err != nil {
 		return err
 	}
+	return j.AppendBatch([]Record{{ID: c.ID, Data: b}})
+}
+
+// AppendBatch records several commands' states (nil Data forgets one).
+func (j *MemJournal) AppendBatch(recs []Record) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if j.Fail != nil {
+		return j.Fail
+	}
 	if j.cmds == nil {
 		j.cmds = map[TxnID][]byte{}
 	}
-	j.cmds[c.ID] = b
-	j.n++
+	for _, r := range recs {
+		if r.Data == nil {
+			delete(j.cmds, r.ID)
+		} else {
+			j.cmds[r.ID] = r.Data
+		}
+		j.n++
+	}
 	return nil
 }
 
@@ -111,6 +127,30 @@ func (j *FileJournal) Append(c *Command) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if _, err := j.f.Write(b); err != nil {
+		return err
+	}
+	if j.Sync {
+		return j.f.Sync()
+	}
+	return nil
+}
+
+// AppendBatch appends several records with one sync.
+func (j *FileJournal) AppendBatch(recs []Record) error {
+	var buf []byte
+	for _, r := range recs {
+		data := r.Data
+		if data == nil {
+			var err error
+			if data, err = json.Marshal(&Command{ID: r.ID, Status: forgotten}); err != nil {
+				return err
+			}
+		}
+		buf = append(append(buf, data...), '\n')
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if _, err := j.f.Write(buf); err != nil {
 		return err
 	}
 	if j.Sync {

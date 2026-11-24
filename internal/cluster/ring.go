@@ -31,6 +31,34 @@ type Node struct {
 	ReleaseVersion string
 	// Replaces is the host id of the dead node a joining node replaces.
 	Replaces string `json:",omitempty"`
+	// Ordinal is a small number unique among the cluster's nodes (from 1),
+	// assigned when the node registers: it tags the node's transaction
+	// timestamps (Accord's hybrid logical clock).
+	Ordinal int `json:",omitempty"`
+}
+
+// MaxOrdinal bounds node ordinals (Accord's clock tag bits).
+const MaxOrdinal = 1<<10 - 1
+
+// NextOrdinal returns the smallest ordinal no node in the metadata holds
+// (left nodes keep theirs, so their timestamps stay unambiguous, unless
+// every ordinal is taken), or 0 if there is none.
+func NextOrdinal(nodes map[string]*Node) int {
+	used, live := map[int]bool{}, map[int]bool{}
+	for _, n := range nodes {
+		used[n.Ordinal] = true
+		if n.Status != StatusLeft {
+			live[n.Ordinal] = true
+		}
+	}
+	for _, taken := range []map[int]bool{used, live} {
+		for o := 1; o <= MaxOrdinal; o++ {
+			if !taken[o] {
+				return o
+			}
+		}
+	}
+	return 0
 }
 
 // Ring is the token ring (TokenMetadata): each token owns the range

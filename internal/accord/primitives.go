@@ -131,6 +131,13 @@ func (c *Clock) Next(after int64) int64 {
 	return v
 }
 
+// SetTag changes the low bits that tell the node's timestamps apart.
+func (c *Clock) SetTag(tag int) {
+	c.mu.Lock()
+	c.tag = int64(tag) & (1<<tagBits - 1)
+	c.mu.Unlock()
+}
+
 // Observe advances the clock past a timestamp seen from another node.
 func (c *Clock) Observe(hlc int64) {
 	c.mu.Lock()

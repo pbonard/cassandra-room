@@ -1,7 +1,10 @@
 package db
 
 import (
+	"encoding/json"
 	"testing"
+
+	"github.com/pbonard/cassandra-room/internal/accord"
 
 	"github.com/stretchr/testify/require"
 )
@@ -95,4 +98,41 @@ func TestTransactions(t *testing.T) {
 	s.fails("BEGIN TRANSACTION LET a = (SELECT balance FROM ks.acct WHERE id = 1); SELECT a.owner; COMMIT TRANSACTION", "does not select a column owner")
 	s.fails("BEGIN TRANSACTION COMMIT TRANSACTION", "Transaction contains no reads or writes")
 	s.fails("BEGIN TRANSACTION SELECT * FROM ks.acct WHERE id = 1 ORDER BY id; COMMIT TRANSACTION", "")
+}
+
+// TestTransactionSchemaPinned: a transaction carries the schema it was
+// made with; a replica whose table changed since reads nothing, and the
+// transaction ends with a schema change, writing nothing.
+func TestTransactionSchemaPinned(t *testing.T) {
+	s := openTest(t, nil)
+	s.ok("CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+	s.ok("CREATE TABLE ks.acct (id int PRIMARY KEY, balance int) WITH transactional_mode = 'full'")
+	tbl, err := s.d.schema.Load().table("ks", "acct")
+	require.NoError(t, err)
+	u := &accordUpdate{Mode: "write", Stmts: []accordStmt{{Query: "INSERT INTO ks.acct (id, balance) VALUES (1, 5)", Keyspace: "ks"}}}
+	key := accordKey(tbl.Storage, []byte{0, 0, 0, 1})
+	s.d.pinKeys(u, []accord.Key{key})
+	require.NotZero(t, u.SchemaEpoch)
+	require.Len(t, u.Tables, 1)
+	b, err := json.Marshal(u)
+	require.NoError(t, err)
+	txn := &accord.Txn{Kind: accord.Write, Keys: []accord.Key{key}, Update: b}
+	changed, err := s.d.checkPinned(txn)
+	require.NoError(t, err)
+	require.False(t, changed)
+
+	s.ok("ALTER TABLE ks.acct ADD note text")
+	changed, err = s.d.checkPinned(txn)
+	require.NoError(t, err)
+	require.True(t, changed)
+	r, err := accordData{s.d}.Read(key, accord.Timestamp{}, txn)
+	require.NoError(t, err)
+	require.Equal(t, accordSchemaChanged, r)
+	w, res, err := accordAgent{s.d}.Execute(txn, accord.Timestamp{Epoch: 1, HLC: 1}, map[string][]byte{"x": r})
+	require.NoError(t, err)
+	require.Empty(t, w)
+	require.Equal(t, accordSchemaChanged, res)
+	// Statements made after the change run.
+	s.ok("INSERT INTO ks.acct (id, balance, note) VALUES (1, 5, 'n')")
+	require.Equal(t, []string{"5 n"}, s.rows("SELECT balance, note FROM ks.acct WHERE id = 1"))
 }

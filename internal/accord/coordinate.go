@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -14,6 +15,7 @@ import (
 var (
 	errPreempted = errors.New("accord: preempted")
 	errStale     = errors.New("accord: stale epoch")
+	errRefused   = errors.New("accord: refused by a quorum")
 )
 
 // Coordinate runs a transaction and returns its result
@@ -30,6 +32,15 @@ func (n *Node) Coordinate(ctx context.Context, txn *Txn) ([]byte, error) {
 		id := n.newTxnID(txn.Kind, txn.Keys...)
 		res, err := n.coordinate(ctx, id, txn)
 		switch {
+		case errors.Is(err, errRefused):
+			// A quorum of a shard refused it for good: it never commits.
+			n.metrics.stale.Add(1)
+			select {
+			case <-ctx.Done():
+				return nil, ErrTimeout
+			case <-time.After(10 * time.Millisecond):
+			}
+			continue
 		case errors.Is(err, errStale):
 			n.metrics.stale.Add(1)
 			// Make sure the stale attempt never executes, then retry in
@@ -67,6 +78,8 @@ func (n *Node) coordinate(ctx context.Context, id TxnID, txn *Txn) ([]byte, erro
 	medium := newTracker(ts, (*Shard).slowQuorum)
 	noFast := newTracker(ts, func(s *Shard) int { return len(s.Nodes) - fq(s) + 1 })
 	oks := map[NodeID]*preAcceptReply{}
+	refused := newTracker(ts, (*Shard).slowQuorum)
+	sawStale := false
 	targets := ts.nodes()
 	if id.Privileged {
 		// The privileged coordinator votes first, locally.
@@ -106,7 +119,14 @@ func (n *Node) coordinate(ctx context.Context, id TxnID, txn *Txn) ([]byte, erro
 			fast.failure(r.from)
 			noFast.success(r.from)
 		case r.reply.Outcome == stale:
-			return nil, errStale
+			// Refused (a sync point's barrier, or a synchronised epoch). A
+			// quorum of a shard refusing makes it certain the transaction
+			// never commits: it can be retried at once.
+			refused.success(r.from)
+			if refused.anyDone() {
+				return nil, errRefused
+			}
+			sawStale = true
 		case r.reply.Outcome != ok:
 			return nil, errPreempted
 		default:
@@ -133,6 +153,9 @@ func (n *Node) coordinate(ctx context.Context, id TxnID, txn *Txn) ([]byte, erro
 		if slow.done() && grace == nil {
 			grace = time.After(20 * time.Millisecond)
 		}
+	}
+	if sawStale {
+		return nil, errStale
 	}
 	if !slow.done() {
 		return nil, ErrTimeout
@@ -335,7 +358,17 @@ func (n *Node) persist(ctx context.Context, ts *Topologies, id TxnID, txn *Txn, 
 	if !tr.done() {
 		return ErrTimeout
 	}
+	select {
+	case n.persisting <- struct{}{}:
+	default:
+		// Too many transactions are retrying (a replica is down): leave
+		// the rest to the replicas' own progress (fetching what they miss)
+		// and to durability rounds.
+		n.metrics.persistShed.Add(1)
+		return nil
+	}
 	go func() {
+		defer func() { <-n.persisting }()
 		// Every replica must apply it: retry those that failed (a replica
 		// that was down learns the outcome when it is back), then tell
 		// them all it is durable.
@@ -411,7 +444,7 @@ func (n *Node) awaitOutcome(ctx context.Context, id TxnID, keys []Key) ([]byte, 
 		ts := n.topologies(keys, id.Epoch, n.epoch())
 		for _, to := range ts.nodes() {
 			var rep checkStatusReply
-			if err := n.send(ctx, to, mCheckStatus, &checkStatusReq{ID: id}, &rep); err != nil {
+			if err := n.send(ctx, to, mCheckStatus, &checkStatusReq{ID: id, Keys: keys}, &rep); err != nil {
 				continue
 			}
 			switch rep.Status {
@@ -419,6 +452,10 @@ func (n *Node) awaitOutcome(ctx context.Context, id TxnID, keys []Key) ([]byte, 
 				return rep.Result, nil
 			case Invalidated:
 				return nil, ErrInvalidated
+			case Truncated:
+				// Erased: applied everywhere, or below the redundancy bound
+				// (applied, or never committed). The result is gone.
+				return nil, ErrTimeout
 			}
 		}
 		select {
@@ -521,6 +558,12 @@ func (n *Node) recover(ctx context.Context, id TxnID, txn *Txn, keys []Key) erro
 	}
 	fq := n.fastQuorumOf(id)
 	for _, s := range ts.Shards {
+		if s.Epoch > id.Epoch {
+			// Only the epochs it was pre-accepted in decide whether a fast
+			// quorum could have formed: replicas of later epochs never
+			// voted.
+			continue
+		}
 		votesAgainst := 0
 		for _, node := range s.Nodes {
 			if r := oks[node]; r != nil && !r.FastVote {
@@ -698,7 +741,7 @@ func (n *Node) progressLog() {
 				}
 				todo = append(todo, stalled{*c.blockedOn, txn, keys})
 				c.blockedSince = now
-			case now.Sub(c.lastChange) > after<<min(c.recoveries, 4) && (c.Status != NotDefined || !c.Promised.IsZero()) && len(c.Keys) > 0:
+			case now.Sub(c.lastChange) > n.homeDelay(c.Keys, after)<<min(c.recoveries, 4) && (c.Status != NotDefined || !c.Promised.IsZero()) && len(c.Keys) > 0:
 				todo = append(todo, stalled{c.ID, c.Txn, c.Keys})
 				c.lastChange = now
 				c.recoveries++
@@ -714,12 +757,12 @@ func (n *Node) progressLog() {
 				n.durability()
 			}()
 		}
-		if now.Sub(n.lastSynced) > 10*n.cfg.ProgressInterval {
-			n.lastSynced = now
+		if n.synced.Load() < n.epoch() && n.cfg.IsLeader != nil && n.cfg.IsLeader() && n.syncing.CompareAndSwap(false, true) {
+			n.wg.Add(1)
 			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), n.cfg.RequestTimeout)
-				defer cancel()
-				n.syncEpochs(ctx)
+				defer n.wg.Done()
+				defer n.syncing.Store(false)
+				n.syncEpochs()
 			}()
 		}
 		for _, s := range todo {
@@ -743,15 +786,20 @@ func (n *Node) progressLog() {
 // here (FetchData / Propagate); it reports whether one was found.
 func (n *Node) fetch(ctx context.Context, id TxnID, keys []Key) bool {
 	ts := n.topologies(keys, id.Epoch, n.epoch())
+	var truncated []bound
 	for _, to := range ts.nodes() {
 		if to == n.cfg.ID {
 			continue
 		}
 		var rep checkStatusReply
-		if err := n.send(ctx, to, mCheckStatus, &checkStatusReq{ID: id}, &rep); err != nil {
+		if err := n.send(ctx, to, mCheckStatus, &checkStatusReq{ID: id, Keys: keys}, &rep); err != nil {
 			continue
 		}
 		switch {
+		case rep.Status == Truncated && len(rep.Redundant) > 0:
+			// Forgotten there below a universal sync point; another replica
+			// may still have the outcome, so it is only adopted after.
+			truncated = append(truncated, rep.Redundant...)
 		case rep.Status == Invalidated:
 			_, err := n.s.commit(ctx, &commitReq{ID: id, Keys: rep.Keys, Invalidate: true})
 			return err == nil
@@ -770,6 +818,12 @@ func (n *Node) fetch(ctx context.Context, id TxnID, keys []Key) bool {
 			_ = err
 		}
 	}
+	// Nobody has it any more, and it is below a universal sync point,
+	// which applied here too: this replica missed the redundancy bound. A
+	// transaction it knows (beyond a placeholder) still needs recovering.
+	if len(truncated) > 0 && n.s.adoptRedundant(id, truncated) {
+		return true
+	}
 	return false
 }
 
@@ -785,34 +839,67 @@ func (n *Node) String() string { return fmt.Sprintf("accord node %s", n.cfg.ID) 
 // sees it; nothing is journaled.
 func (n *Node) ephemeralRead(ctx context.Context, txn *Txn) ([]byte, error) {
 	n.metrics.ephemeralReads.Add(1)
-	epoch := n.epoch()
+	for {
+		res, newer, err := n.ephemeralReadAt(ctx, txn, n.epoch())
+		if newer == 0 {
+			return res, err
+		}
+		// A replica knows a newer epoch: read again once this node does.
+		if err := n.awaitEpoch(ctx, newer); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// awaitEpoch waits until this node knows an epoch.
+func (n *Node) awaitEpoch(ctx context.Context, e int64) error {
+	for n.epoch() < e {
+		select {
+		case <-ctx.Done():
+			return ErrTimeout
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	return nil
+}
+
+// ephemeralReadAt runs an ephemeral read in an epoch; it returns a newer
+// epoch a replica knows, if any (and then nothing else).
+func (n *Node) ephemeralReadAt(ctx context.Context, txn *Txn, epoch int64) ([]byte, int64, error) {
 	ts := n.phaseTopologies(txn.Keys, epoch, epoch)
 	if len(ts.Shards) == 0 {
-		return nil, errors.New("accord: no topology")
+		return nil, 0, errors.New("accord: no topology")
 	}
 	req := &ephemeralReq{Keys: txn.Keys}
 	ch := broadcast[ephemeralReply](ctx, n, ts.nodes(), mEphemeralDeps, func(NodeID) any { return req })
 	tr := newTracker(ts, (*Shard).slowQuorum)
 	deps := Deps{}
+	newer := int64(0)
 	for i := 0; i < len(ts.nodes()) && !tr.done(); i++ {
 		var r response[ephemeralReply]
 		select {
 		case r = <-ch:
 		case <-ctx.Done():
-			return nil, ErrTimeout
+			return nil, 0, ErrTimeout
 		}
 		if r.err != nil || r.reply.Outcome != ok {
 			tr.failure(r.from)
 		} else {
 			tr.success(r.from)
 			deps = deps.with(r.reply.Deps)
+			if r.reply.Epoch > epoch {
+				newer = max(newer, r.reply.Epoch)
+			}
 		}
 		if tr.impossible() {
-			return nil, ErrTimeout
+			return nil, 0, ErrTimeout
 		}
 	}
 	if !tr.done() {
-		return nil, ErrTimeout
+		return nil, 0, ErrTimeout
+	}
+	if newer > 0 {
+		return nil, newer, nil
 	}
 	reads := map[string][]byte{}
 	for _, s := range ts.latest() {
@@ -822,7 +909,7 @@ func (n *Node) ephemeralRead(ctx context.Context, txn *Txn) ([]byte, error) {
 			var rep ephemeralReply
 			if err := n.send(ctx, to, mEphemeralRead, &ephemeralReq{Keys: s.Keys, Deps: deps, Txn: txn}, &rep); err != nil || rep.Outcome != ok {
 				if ctx.Err() != nil {
-					return nil, ErrTimeout
+					return nil, 0, ErrTimeout
 				}
 				continue
 			}
@@ -833,37 +920,127 @@ func (n *Node) ephemeralRead(ctx context.Context, txn *Txn) ([]byte, error) {
 			break
 		}
 		if !done {
-			return nil, ErrTimeout
+			return nil, 0, ErrTimeout
 		}
 	}
 	_, result, err := n.cfg.Agent.Execute(txn, Timestamp{Epoch: epoch, HLC: n.clock.Next(0), Node: n.cfg.ID}, reads)
-	return result, err
+	return result, 0, err
 }
 
 // ---- epoch synchronisation ----
 
-// syncEpochs advances the synchronised epoch to the oldest epoch any node
-// still has a transaction of in progress (every node must answer).
-func (n *Node) syncEpochs(ctx context.Context) {
-	n.topoMu.RLock()
-	t := n.topos[n.latest]
-	n.topoMu.RUnlock()
-	if t == nil {
-		return
-	}
-	active := n.s.epochStatus().Active
-	for _, node := range t.Nodes {
-		if node == n.cfg.ID {
-			continue
+// syncEpochs synchronises the epochs after the synchronised one, in order
+// (the leader does): for each, a sync point over every range whose
+// replicas changed from the epoch before, with quorums in both. Its
+// barrier refuses any transaction of an earlier epoch it does not follow,
+// so once it is applied no earlier-epoch transaction is in progress on
+// those ranges, and every node is told the epoch is synchronised: phases
+// stop including the earlier epochs.
+func (n *Node) syncEpochs() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-n.stop:
+			cancel()
+		case <-ctx.Done():
 		}
-		var st epochStatus
-		if err := n.send(ctx, node, mEpochStatus, struct{}{}, &st); err != nil {
+	}()
+	for {
+		n.topoMu.RLock()
+		synced, latest := n.synced.Load(), n.latest
+		var prev, cur *Topology
+		e := synced + 1
+		for ; e <= latest && n.topos[e] == nil; e++ {
+		}
+		if e <= latest {
+			cur, prev = n.topos[e], n.topos[e-1]
+		}
+		n.topoMu.RUnlock()
+		if cur == nil {
 			return
 		}
-		active = min(active, st.Active, st.Latest)
+		ranges := n.changedRanges(prev, cur)
+		for _, r := range ranges {
+			sctx, scancel := context.WithTimeout(ctx, 2*n.recoveryTimeout())
+			_, err := n.SyncPoint(sctx, r, false)
+			scancel()
+			if err != nil {
+				return // retried at the next opportunity
+			}
+		}
+		n.metrics.epochSyncs.Add(1)
+		for _, to := range cur.Nodes {
+			_ = n.send(ctx, to, mEpochSynced, &epochSynced{Epoch: e}, nil)
+		}
+		n.advanceSynced(e)
 	}
-	if active > n.synced.Load() {
-		n.synced.Store(active)
+}
+
+// changedRanges returns the parts of the epoch ranges whose replicas
+// differ between two topologies (all of them without the earlier one).
+func (n *Node) changedRanges(prev, cur *Topology) []Range {
+	if n.cfg.EpochRanges == nil || cur.RangeReplicas == nil {
+		return nil
+	}
+	var out []Range
+	for _, r := range n.cfg.EpochRanges() {
+		if prev == nil || prev.RangeReplicas == nil {
+			out = append(out, r)
+			continue
+		}
+		a, b := prev.RangeReplicas(r), cur.RangeReplicas(r)
+		owner := func(shards []RangeShard, tok int64) string {
+			for _, s := range shards {
+				if tok >= s.Lo && tok <= s.Hi {
+					nodes := slices.Clone(s.Nodes)
+					slices.Sort(nodes)
+					return strings.Join(nodes, ",")
+				}
+			}
+			return ""
+		}
+		// The boundaries of either split, walked in order.
+		var starts []int64
+		for _, s := range append(slices.Clone(a), b...) {
+			starts = append(starts, s.Lo)
+			if s.Hi < r.Hi {
+				starts = append(starts, s.Hi+1)
+			}
+		}
+		starts = append(starts, r.Lo)
+		slices.Sort(starts)
+		starts = slices.Compact(starts)
+		for i, lo := range starts {
+			if lo < r.Lo || lo > r.Hi {
+				continue
+			}
+			hi := r.Hi
+			if i+1 < len(starts) {
+				hi = starts[i+1] - 1
+			}
+			if owner(a, lo) == owner(b, lo) {
+				continue
+			}
+			if k := len(out); k > 0 && out[k-1].Prefix == r.Prefix && out[k-1].Hi+1 == lo {
+				out[k-1].Hi = hi // merge adjacent
+				continue
+			}
+			out = append(out, Range{Prefix: r.Prefix, Lo: lo, Hi: hi})
+		}
+	}
+	return out
+}
+
+// epochSynced tells a node an epoch is synchronised.
+type epochSynced struct{ Epoch int64 }
+
+func (n *Node) advanceSynced(e int64) {
+	for {
+		cur := n.synced.Load()
+		if e <= cur || n.synced.CompareAndSwap(cur, e) {
+			return
+		}
 	}
 }
 
@@ -908,7 +1085,20 @@ func (n *Node) RangeShards(r Range) []RangeShard {
 // what the DataStore read, in token order.
 func (n *Node) ReadRange(ctx context.Context, r Range, txn *Txn) ([]RangeShard, map[string][]byte, error) {
 	n.metrics.rangeReads.Add(1)
+	for {
+		shards, reads, newer, err := n.readRangeOnce(ctx, r, txn)
+		if newer == 0 {
+			return shards, reads, err
+		}
+		if err := n.awaitEpoch(ctx, newer); err != nil {
+			return nil, nil, err
+		}
+	}
+}
+
+func (n *Node) readRangeOnce(ctx context.Context, r Range, txn *Txn) ([]RangeShard, map[string][]byte, int64, error) {
 	latest := n.epoch()
+	newer := int64(0)
 	ts := &Topologies{}
 	var readShards []RangeShard
 	n.topoMu.RLock()
@@ -928,7 +1118,7 @@ func (n *Node) ReadRange(ctx context.Context, r Range, txn *Txn) ([]RangeShard, 
 	}
 	n.topoMu.RUnlock()
 	if len(readShards) == 0 {
-		return nil, nil, errors.New("accord: no topology for the range")
+		return nil, nil, 0, errors.New("accord: no topology for the range")
 	}
 	req := &ephemeralReq{Ranges: []Range{r}}
 	nodes := ts.nodes()
@@ -940,20 +1130,24 @@ func (n *Node) ReadRange(ctx context.Context, r Range, txn *Txn) ([]RangeShard, 
 		select {
 		case rep = <-ch:
 		case <-ctx.Done():
-			return nil, nil, ErrTimeout
+			return nil, nil, 0, ErrTimeout
 		}
 		if rep.err != nil || rep.reply.Outcome != ok {
 			tr.failure(rep.from)
 		} else {
 			tr.success(rep.from)
 			deps = deps.with(rep.reply.Deps)
+			newer = max(newer, rep.reply.Epoch)
 		}
 		if tr.impossible() {
-			return nil, nil, ErrTimeout
+			return nil, nil, 0, ErrTimeout
 		}
 	}
 	if !tr.done() {
-		return nil, nil, ErrTimeout
+		return nil, nil, 0, ErrTimeout
+	}
+	if newer > latest {
+		return nil, nil, newer, nil
 	}
 	reads := map[string][]byte{}
 	for _, rs := range readShards {
@@ -969,7 +1163,7 @@ func (n *Node) ReadRange(ctx context.Context, r Range, txn *Txn) ([]RangeShard, 
 			var rep ephemeralReply
 			if err := n.send(ctx, to, mEphemeralRead, &ephemeralReq{Ranges: []Range{rs.Range}, Deps: sub, Txn: txn}, &rep); err != nil || rep.Outcome != ok {
 				if ctx.Err() != nil {
-					return nil, nil, ErrTimeout
+					return nil, nil, 0, ErrTimeout
 				}
 				continue
 			}
@@ -978,10 +1172,10 @@ func (n *Node) ReadRange(ctx context.Context, r Range, txn *Txn) ([]RangeShard, 
 			break
 		}
 		if !done {
-			return nil, nil, ErrTimeout
+			return nil, nil, 0, ErrTimeout
 		}
 	}
-	return readShards, reads, nil
+	return readShards, reads, 0, nil
 }
 
 // readOrder orders replicas to read from: this node first, then the
@@ -1000,4 +1194,14 @@ func (n *Node) readOrder(nodes []NodeID) []NodeID {
 	}
 	slices.SortStableFunc(order, func(a, b NodeID) int { return rank(a) - rank(b) })
 	return order
+}
+
+// homeDelay is how long a stalled transaction waits before this replica
+// recovers it: the replicas of its home key (the first) recover first
+// (accord's home shard progress log); the others only if those fail.
+func (n *Node) homeDelay(keys []Key, after time.Duration) time.Duration {
+	if len(keys) == 0 || len(n.owned(keys[:1], 0)) > 0 {
+		return after
+	}
+	return 3 * after
 }

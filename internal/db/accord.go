@@ -1,6 +1,7 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"hash/fnv"
 	"math"
 	"slices"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -86,6 +88,94 @@ type accordUpdate struct {
 	Paging []byte `json:",omitempty"`
 	// AggPartial asks a range read's sub-ranges for partial aggregates.
 	AggPartial bool `json:",omitempty"`
+	// SchemaEpoch and Tables pin the schema the transaction was made
+	// with: the metadata epoch, and a fingerprint of each table it uses
+	// (by storage id). A replica behind that epoch catches up first; one
+	// whose table differs (changed since) reads nothing, and the
+	// transaction fails with a schema change instead of each replica
+	// interpreting it with its own schema.
+	SchemaEpoch int64             `json:",omitempty"`
+	Tables      map[string]uint64 `json:",omitempty"`
+}
+
+// accordSchemaChanged is what a read returns, and the result a
+// transaction ends with, when its schema changed under it.
+var accordSchemaChanged = []byte(`{"SchemaChanged":true}`)
+
+var errAccordSchemaChanged = invalidf("The schema of a table changed during the transaction; retry it")
+
+// tableFingerprint hashes what a transaction's statements depend on in a
+// table's definition.
+func tableFingerprint(t *Table) uint64 {
+	h := fnv.New64a()
+	fmt.Fprintf(h, "%s.%s/%d/%s", t.Keyspace, t.Name, t.Storage, t.Params.TransactionalMode)
+	for _, c := range t.AllColumns() {
+		fmt.Fprintf(h, "|%s:%s:%d:%d:%d:%t", c.Name, c.Type, c.Kind, c.Position, c.ID, c.Desc)
+	}
+	return h.Sum64()
+}
+
+// pin records the schema a transaction over these tables is made with.
+func (d *DB) pin(u *accordUpdate, storages ...lsm.TableID) {
+	s := d.schema.Load()
+	u.SchemaEpoch = s.Epoch
+	for _, id := range storages {
+		if t := s.byStorage[id]; t != nil {
+			if u.Tables == nil {
+				u.Tables = map[string]uint64{}
+			}
+			u.Tables[strconv.FormatUint(uint64(id), 10)] = tableFingerprint(t)
+		}
+	}
+}
+
+// pinKeys pins the schema of the tables of keys.
+func (d *DB) pinKeys(u *accordUpdate, keys []accord.Key) {
+	var ids []lsm.TableID
+	for _, k := range keys {
+		if id, _, err := splitAccordKey(k); err == nil && !slices.Contains(ids, id) {
+			ids = append(ids, id)
+		}
+	}
+	d.pin(u, ids...)
+}
+
+// checkPinned waits until this node's schema reaches the transaction's
+// epoch (a transient error if it does not in time: the step is retried),
+// then reports whether a table it uses changed since.
+func (d *DB) checkPinned(txn *accord.Txn) (changed bool, err error) {
+	var u struct {
+		SchemaEpoch int64
+		Tables      map[string]uint64
+	}
+	if err := json.Unmarshal(txn.Update, &u); err != nil {
+		return false, err
+	}
+	if u.SchemaEpoch == 0 {
+		return false, nil
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	s := d.schema.Load()
+	if s.Epoch < u.SchemaEpoch && d.proxy != nil {
+		d.proxy.membershipChanged() // fetch the newer metadata
+	}
+	for s.Epoch < u.SchemaEpoch {
+		if time.Now().After(deadline) {
+			return false, fmt.Errorf("db: the schema is behind epoch %d of a transaction", u.SchemaEpoch)
+		}
+		time.Sleep(20 * time.Millisecond)
+		s = d.schema.Load()
+	}
+	for ids, fp := range u.Tables {
+		id, err := strconv.ParseUint(ids, 10, 64)
+		if err != nil {
+			return false, err
+		}
+		if t := s.byStorage[lsm.TableID(id)]; t == nil || tableFingerprint(t) != fp {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // accordRows is a paged read's result.
@@ -134,11 +224,17 @@ func (p *proxy) startAccord() error {
 			return err
 		}
 	}
+	// The clock tag is the node's ordinal in the cluster metadata (unique);
+	// before it has one (metadata from an older version), a hash of its id.
 	h := fnv.New32a()
 	h.Write([]byte(d.local.HostID))
+	tag := int(h.Sum32())
+	if me := d.schema.Load().Nodes[d.local.HostID]; me != nil && me.Ordinal != 0 {
+		tag = me.Ordinal
+	}
 	n, err := accord.NewNode(accord.Config{
 		ID:        p.self,
-		Tag:       int(h.Sum32()),
+		Tag:       tag,
 		Now:       d.opts.Now,
 		Transport: accordTransport{p},
 		Data:      accordData{d},
@@ -146,6 +242,8 @@ func (p *proxy) startAccord() error {
 		Journal:   &accordJournal{d: d},
 		// Durability rounds (RedundantBefore) and nearest-first reads.
 		DurabilityRanges:   p.accordDurabilityRanges,
+		IsLeader:           p.accordLeader,
+		EpochRanges:        p.accordTableRanges,
 		DurabilityInterval: p.opts.AccordDurabilityInterval,
 		Proximity:          p.accordProximity,
 	})
@@ -264,25 +362,52 @@ func journalKey(id accord.TxnID) []byte {
 	return append(b, 0, byte(id.Kind))
 }
 
-func (j *accordJournal) Append(c *accord.Command) error {
-	v, err := json.Marshal(c)
-	if err != nil {
-		return err
-	}
+func (j *accordJournal) nextTS() int64 {
 	ts := j.d.opts.Now().UnixMicro()
 	for {
 		last := j.last.Load()
 		ts = max(ts, last+1)
 		if j.last.CompareAndSwap(last, ts) {
-			break
+			return ts
 		}
 	}
-	r := &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: row.NoTimestamp}, Cells: []row.Cell{liveCell(0, ts, 0, 0, v)}}
-	b := lsm.NewBatch()
-	b.Put(accordStorage, journalKey(c.ID), row.Append(nil, r))
+}
+
+// put adds a record to a batch: the command's state, or (no data) a row
+// deletion newer than its records.
+func (j *accordJournal) put(b *lsm.Batch, id accord.TxnID, data []byte) {
+	ts := j.nextTS()
+	r := &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: ts, LocalDeletionTime: j.d.opts.Now().Unix()}}
+	if data != nil {
+		r = &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: row.NoTimestamp}, Cells: []row.Cell{liveCell(0, ts, 0, 0, data)}}
+	}
+	b.Put(accordStorage, journalKey(id), row.Append(nil, r))
+}
+
+func (j *accordJournal) apply(b *lsm.Batch) error {
 	j.d.tableMu.RLock()
 	defer j.d.tableMu.RUnlock()
 	return j.d.engine.Apply(b, lsm.Sync)
+}
+
+func (j *accordJournal) Append(c *accord.Command) error {
+	v, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	b := lsm.NewBatch()
+	j.put(b, c.ID, v)
+	return j.apply(b)
+}
+
+// AppendBatch writes several records with one synced commit-log write
+// (the node's group commit).
+func (j *accordJournal) AppendBatch(recs []accord.Record) error {
+	b := lsm.NewBatch()
+	for _, r := range recs {
+		j.put(b, r.ID, r.Data)
+	}
+	return j.apply(b)
 }
 
 func (j *accordJournal) Load() ([]*accord.Command, error) {
@@ -318,20 +443,9 @@ func (j *accordJournal) Load() ([]*accord.Command, error) {
 
 // Delete forgets a command (a row deletion newer than its record).
 func (j *accordJournal) Delete(id accord.TxnID) error {
-	ts := j.d.opts.Now().UnixMicro()
-	for {
-		last := j.last.Load()
-		ts = max(ts, last+1)
-		if j.last.CompareAndSwap(last, ts) {
-			break
-		}
-	}
-	r := &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: ts, LocalDeletionTime: j.d.opts.Now().Unix()}}
 	b := lsm.NewBatch()
-	b.Put(accordStorage, journalKey(id), row.Append(nil, r))
-	j.d.tableMu.RLock()
-	defer j.d.tableMu.RUnlock()
-	return j.d.engine.Apply(b, lsm.Sync)
+	j.put(b, id, nil)
+	return j.apply(b)
 }
 
 // Compact is a no-op: each command has one record, replaced in place.
@@ -410,6 +524,9 @@ type accordData struct{ d *DB }
 // Read reads, from this replica's data, the current row of each
 // conditional statement on the partition.
 func (a accordData) Read(k accord.Key, _ accord.Timestamp, txn *accord.Txn) ([]byte, error) {
+	if changed, err := a.d.checkPinned(txn); err != nil || changed {
+		return accordSchemaChanged, err
+	}
 	var mode struct{ Mode string }
 	if err := json.Unmarshal(txn.Update, &mode); err != nil {
 		return nil, err
@@ -473,6 +590,19 @@ type accordAgent struct{ d *DB }
 // Execute checks the conditions against the rows read and computes the
 // writes, timestamped with the execution timestamp.
 func (a accordAgent) Execute(txn *accord.Txn, executeAt accord.Timestamp, reads map[string][]byte) (accord.Writes, []byte, error) {
+	// The outcome is decided from the reads: a replica whose table changed
+	// read nothing, and the transaction writes nothing.
+	for _, r := range reads {
+		if bytes.Equal(r, accordSchemaChanged) {
+			return accord.Writes{}, accordSchemaChanged, nil
+		}
+	}
+	if changed, err := a.d.checkPinned(txn); err != nil || changed {
+		if err != nil {
+			return nil, nil, err
+		}
+		return accord.Writes{}, accordSchemaChanged, nil
+	}
 	var mode struct{ Mode string }
 	if err := json.Unmarshal(txn.Update, &mode); err != nil {
 		return nil, nil, err
@@ -637,6 +767,7 @@ func (p *proxy) accordCoordinate(u *accordUpdate, keys []accord.Key, kind accord
 	if err := p.accordAvailable(keys); err != nil {
 		return nil, err
 	}
+	p.d.pinKeys(u, keys)
 	b, err := json.Marshal(u)
 	if err != nil {
 		return nil, err
@@ -650,6 +781,8 @@ func (p *proxy) accordCoordinate(u *accordUpdate, keys []accord.Key, kind accord
 			return nil, &timeoutError{cl: primitive.ConsistencyLevelSerial}
 		}
 		return nil, &timeoutError{write: true, cas: true, cl: primitive.ConsistencyLevelSerial}
+	case err == nil && bytes.Equal(out, accordSchemaChanged):
+		return nil, errAccordSchemaChanged
 	}
 	return out, err
 }
@@ -715,6 +848,7 @@ func (p *proxy) accordCAS(mods []boundModification, t *Table, pk []byte) (messag
 		}
 		u.Stmts = append(u.Stmts, st)
 	}
+	p.d.pin(&u, t.Storage)
 	b, err := json.Marshal(u)
 	if err != nil {
 		return nil, err
@@ -731,6 +865,8 @@ func (p *proxy) accordCAS(mods []boundModification, t *Table, pk []byte) (messag
 		return nil, &timeoutError{write: true, cas: true, cl: primitive.ConsistencyLevelSerial}
 	case err != nil:
 		return nil, err
+	case bytes.Equal(out, accordSchemaChanged):
+		return nil, errAccordSchemaChanged
 	}
 	var res accordResult
 	if err := json.Unmarshal(out, &res); err != nil {
@@ -753,6 +889,9 @@ func selectRows(s *selectStmt, e *execCtx) ([]byte, error) {
 // ReadRange reads a sub-range of a range read on this replica: the
 // select, restricted to the sub-range's tokens.
 func (a accordData) ReadRange(r accord.Range, txn *accord.Txn) ([]byte, error) {
+	if changed, err := a.d.checkPinned(txn); err != nil || changed {
+		return accordSchemaChanged, err
+	}
 	st, e, _, err := a.d.accordStatement(txn)
 	if err != nil {
 		return nil, err
@@ -846,6 +985,7 @@ func (p *proxy) accordRangeSelect(s *selectStmt, e *execCtx) (message.Message, e
 		if resume != nil && sh.Lo <= resume.Token {
 			u.Paging = resume.Inner
 		}
+		p.d.pin(&u, s.t.Storage)
 		b, err := json.Marshal(u)
 		if err != nil {
 			return nil, err
@@ -855,6 +995,9 @@ func (p *proxy) accordRangeSelect(s *selectStmt, e *execCtx) (message.Message, e
 			return nil, &timeoutError{cl: e.cl}
 		}
 		for _, sub := range subs {
+			if bytes.Equal(reads[sub.Range.String()], accordSchemaChanged) {
+				return nil, errAccordSchemaChanged
+			}
 			var rows accordRows
 			if err := json.Unmarshal(reads[sub.Range.String()], &rows); err != nil {
 				return nil, err
@@ -950,6 +1093,8 @@ func accordStatRows(d *DB) []map[string][]byte {
 		{"recoveries", st.Recoveries}, {"invalidations", st.Invalidations}, {"ephemeral_reads", st.EphemeralReads},
 		{"range_reads", st.RangeReads}, {"sync_points", st.SyncPoints}, {"durability_rounds", st.DurabilityRounds},
 		{"preempted", st.Preempted}, {"stale_epoch_or_barrier", st.Stale}, {"timeouts", st.Timeouts},
+		{"majority_rounds", st.MajorityRounds}, {"journal_errors", st.JournalErrors}, {"persist_shed", st.PersistShed},
+		{"epoch_syncs", st.EpochSyncs},
 		{"commands", int64(st.Commands)}, {"keys", int64(st.Keys)}, {"barriers", int64(st.Barriers)},
 		{"redundant_bounds", int64(st.Redundant)}, {"epoch", st.Epoch}, {"synced_epoch", st.SyncedEpoch},
 	} {
@@ -977,17 +1122,57 @@ func accordTxnRows(d *DB) []map[string][]byte {
 	return out
 }
 
-// accordDurabilityRanges are the ranges this node runs durability rounds
-// over: every table's, on one node (the normal node with the lowest
-// address), so rounds are not repeated.
-func (p *proxy) accordDurabilityRanges() []accord.Range {
-	s := p.d.schema.Load()
-	for _, n := range s.Nodes {
+// accordLeader reports whether this node synchronises Accord's epochs:
+// the live normal node with the lowest address.
+func (p *proxy) accordLeader() bool {
+	for _, n := range p.d.schema.Load().Nodes {
 		if n.Status == cluster.StatusNormal && n.Addr < p.self && p.up(n) {
-			return nil
+			return false
 		}
 	}
-	return p.accordTableRanges()
+	return true
+}
+
+// accordDurabilityRanges are the ranges this node runs durability rounds
+// over: those it is the first replica of, in every table (each node
+// covers its own; ranges without transactions since their last round are
+// skipped).
+func (p *proxy) accordDurabilityRanges() []accord.Range {
+	return p.accordOwnedRanges(p.ring.Load(), true)
+}
+
+// accordOwnedRanges are the accord ranges of every table this node
+// replicates in a ring (only those it is the first replica of, if
+// primary).
+func (p *proxy) accordOwnedRanges(ring *cluster.Ring, primary bool) []accord.Range {
+	s := p.d.schema.Load()
+	if ring.Empty() {
+		return nil
+	}
+	var out []accord.Range
+	for _, t := range p.d.userTables() {
+		k := s.Keyspaces[t.Keyspace]
+		if k == nil {
+			continue
+		}
+		prefix := string(binary.BigEndian.AppendUint64(nil, uint64(t.Storage)))
+		for _, r := range ring.Ranges() {
+			reps := ring.Replicas(k.Replication, r[1])
+			if primary && (len(reps) == 0 || reps[0].Addr != p.self) || !primary && !containsAddr(reps, p.self) {
+				continue
+			}
+			// (start, end]: a range wrapping around the token space is two.
+			if r[0] < r[1] {
+				out = append(out, accord.Range{Prefix: prefix, Lo: r[0] + 1, Hi: r[1]})
+				continue
+			}
+			if r[0] < math.MaxInt64 {
+				out = append(out, accord.Range{Prefix: prefix, Lo: r[0] + 1, Hi: math.MaxInt64})
+			}
+			out = append(out, accord.Range{Prefix: prefix, Lo: math.MinInt64, Hi: r[1]})
+		}
+	}
+	return out
 }
 
 // accordTableRanges are the whole token ranges of the user tables.

@@ -3,6 +3,8 @@ package accord
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"math"
 	"slices"
 	"testing"
 	"time"
@@ -143,28 +145,48 @@ func TestEpochSync(t *testing.T) {
 		return len(c.stores["n3"].data[keyString(k)]) == 1
 	}, 5*time.Second, 10*time.Millisecond, "the pending replica received the write")
 
-	epoch2 := &Topology{Epoch: 2, Replicas: func(Key) []NodeID { return []NodeID{"n1", "n2", "n3"} }, Nodes: c.ids}
-	c.node(1).SetTopology(epoch2)
-	c.node(1).syncEpochs(context.Background())
-	require.Equal(t, int64(1), c.node(1).synced.Load(), "a node still on epoch 1 holds synchronisation back")
+	// Epoch synchronisation by sync points: n1 leads; epoch 2 moves the
+	// key to n1, n2, n3; epoch 3 changes nothing.
+	split := func(nodes ...NodeID) func(Range) []RangeShard {
+		return func(r Range) []RangeShard { return []RangeShard{{Range: r, Nodes: nodes}} }
+	}
+	full := []Range{{Lo: math.MinInt64, Hi: math.MaxInt64}}
+	for i := 0; i < 4; i++ {
+		n := c.node(i)
+		n.cfg.EpochRanges = func() []Range { return full }
+		n.cfg.IsLeader = func() bool { return n.cfg.ID == "n1" }
+		n.SetTopology(&Topology{Epoch: 1, Replicas: c.replicas, Nodes: c.ids, RangeReplicas: split("n0", "n1", "n2"),
+			Pending: func(Key) []NodeID { return []NodeID{"n3"} }})
+	}
+	require.Eventually(t, func() bool { return c.node(3).synced.Load() >= 1 }, 10*time.Second, 20*time.Millisecond)
+	epoch2 := &Topology{Epoch: 2, Replicas: func(Key) []NodeID { return []NodeID{"n1", "n2", "n3"} }, Nodes: c.ids, RangeReplicas: split("n1", "n2", "n3")}
+	require.Len(t, c.node(1).changedRanges(c.node(1).topos[1], epoch2), 1)
 	for i := 0; i < 4; i++ {
 		c.node(i).SetTopology(epoch2)
 	}
 	require.Eventually(t, func() bool {
 		for i := 0; i < 4; i++ {
-			c.node(i).syncEpochs(context.Background())
 			if c.node(i).synced.Load() < 2 {
 				return false
 			}
 		}
 		return true
-	}, 10*time.Second, 50*time.Millisecond, "every node synchronised epoch 2")
+	}, 10*time.Second, 20*time.Millisecond, "every node synchronised epoch 2")
+	syncs := c.node(1).Stats().SyncPoints
+	epoch3 := &Topology{Epoch: 3, Replicas: epoch2.Replicas, Nodes: c.ids, RangeReplicas: split("n3", "n2", "n1")}
+	require.Empty(t, c.node(1).changedRanges(epoch2, epoch3), "the same replicas")
+	for i := 0; i < 4; i++ {
+		c.node(i).SetTopology(epoch3)
+	}
+	require.Eventually(t, func() bool { return c.node(0).synced.Load() >= 3 }, 10*time.Second, 20*time.Millisecond)
+	require.Equal(t, syncs, c.node(1).Stats().SyncPoints, "no sync point for an epoch without changes")
 	// A transaction of epoch 1 (a coordinator that had not learnt epoch
-	// 2) is refused, then recovered and invalidated.
+	// 2) is refused (the sync point's barrier, or the synchronised epoch),
+	// then recovered and invalidated.
 	stale := appendTxn(t, k, 2)
 	id := TxnID{Timestamp: Timestamp{Epoch: 1, HLC: c.node(0).clock.Next(0), Node: "n0"}, Kind: Write}
 	_, err = c.node(0).coordinate(context.Background(), id, stale)
-	require.ErrorIs(t, err, errStale)
+	require.True(t, errors.Is(err, errStale) || errors.Is(err, errRefused), "%v", err)
 	require.NoError(t, c.node(0).recover(context.Background(), id, stale, stale.Keys))
 	_, err = c.node(0).awaitOutcome(context.Background(), id, stale.Keys)
 	require.ErrorIs(t, err, ErrInvalidated)

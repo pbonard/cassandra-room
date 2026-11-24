@@ -2,6 +2,7 @@ package accord
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"slices"
 	"sort"
@@ -39,11 +40,18 @@ type syncReply struct {
 	Deps    Deps
 }
 
-// syncPropose witnesses a sync point: it records the barrier and returns
-// every transaction on its ranges with a lower id (all kinds).
 func (s *store) syncPropose(r *syncReq) (*syncReply, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	rep, err := s.syncProposeLocked2(r)
+	if uerr := s.unlock(); err == nil {
+		err = uerr
+	}
+	return rep, err
+}
+
+// syncPropose witnesses a sync point: it records the barrier and returns
+// every transaction on its ranges with a lower id (all kinds).
+func (s *store) syncProposeLocked2(r *syncReq) (*syncReply, error) {
 	c := s.get(r.ID)
 	if c.Status != NotDefined {
 		return &syncReply{Outcome: ok, Deps: c.Deps}, nil
@@ -88,11 +96,18 @@ func (s *store) syncOwnedLocked(c *command) {
 	}
 }
 
-// markRedundant records that a sync point is applied at every replica of
-// its ranges (RedundantBefore).
 func (s *store) markRedundant(id TxnID, ranges []Range) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	err := s.markRedundantLocked2(id, ranges)
+	if uerr := s.unlock(); err == nil {
+		err = uerr
+	}
+	return err
+}
+
+// markRedundant records that a sync point is applied at every replica of
+// its ranges (RedundantBefore).
+func (s *store) markRedundantLocked2(id TxnID, ranges []Range) error {
 	for _, r := range ranges {
 		s.redundant = addBound(s.redundant, r, id.Timestamp)
 		s.barriers = addBound(s.barriers, r, id.Timestamp)
@@ -106,6 +121,39 @@ func (s *store) markRedundant(id TxnID, ranges []Range) error {
 	}
 	c.Redundant = true
 	return s.saveLocked(c)
+}
+
+// markMajority records that a sync point applied at a majority of every
+// shard of its ranges: the transactions below it need no local dependencies
+// any more (a recovery finds them decided), so their records shrink.
+func (s *store) markMajority(id TxnID, ranges []Range) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range ranges {
+		s.majority = addBound(s.majority, r, id.Timestamp)
+		s.barriers = addBound(s.barriers, r, id.Timestamp)
+	}
+}
+
+// compactMajorityLocked drops the local dependencies of applied commands
+// below a majority bound (TruncatedApplyWithOutcome keeps the outcome).
+func (s *store) compactMajorityLocked() {
+	if len(s.majority) == 0 {
+		return
+	}
+	for id, c := range s.cmds {
+		if c.Status != Applied || c.LocalDeps == nil || len(c.Keys) == 0 {
+			continue
+		}
+		below := true
+		for _, k := range c.Keys {
+			below = below && id.Timestamp.Less(boundFor(s.majority, k))
+		}
+		if below {
+			c.LocalDeps = nil
+			_ = s.saveLocked(c)
+		}
+	}
 }
 
 // rangeTopologies returns the shards of a range in every epoch not yet
@@ -201,6 +249,9 @@ func (n *Node) SyncPoint(ctx context.Context, r Range, universal bool) (TxnID, e
 // replica (CoordinateShardDurable, then SetShardDurable).
 func (n *Node) durability() {
 	for _, r := range n.cfg.DurabilityRanges() {
+		if !n.s.dirty(r) {
+			continue // nothing above its redundancy bound
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*n.recoveryTimeout())
 		go func() {
 			select {
@@ -209,12 +260,25 @@ func (n *Node) durability() {
 			case <-ctx.Done():
 			}
 		}()
-		id, err := n.SyncPoint(ctx, r, true)
+		uctx, ucancel := context.WithTimeout(ctx, n.recoveryTimeout())
+		id, err := n.SyncPoint(uctx, r, true)
+		ucancel()
+		msg := mRedundant
+		if err != nil {
+			// A replica is down or slow: a sync point applied at a majority
+			// still bounds what the others must keep (MajorityDurable).
+			msg = mMajority
+			id, err = n.SyncPoint(ctx, r, false)
+		}
 		if err == nil {
 			for _, to := range n.rangeTopologies(r).nodes() {
-				_ = n.send(ctx, to, mRedundant, &syncReq{ID: id, Txn: &Txn{Kind: SyncPoint, Ranges: []Range{r}}}, nil)
+				_ = n.send(ctx, to, msg, &syncReq{ID: id, Txn: &Txn{Kind: SyncPoint, Ranges: []Range{r}}}, nil)
 			}
-			n.metrics.durableRounds.Add(1)
+			if msg == mRedundant {
+				n.metrics.durableRounds.Add(1)
+			} else {
+				n.metrics.majorityRounds.Add(1)
+			}
 		}
 		cancel()
 	}
@@ -242,8 +306,84 @@ func (n *Node) Bootstrap(ctx context.Context, ranges []Range) error {
 		}
 		at = maxTimestamp(at, id.Timestamp)
 	}
-	if prev := n.bootstrapped.Load(); prev == nil || prev.Less(at) {
-		n.bootstrapped.Store(&at)
+	return n.s.setBootstrapped(at)
+}
+
+var bootstrapRecordID = TxnID{Timestamp: Timestamp{Node: "~bootstrap"}, Kind: SyncPoint}
+
+// setBootstrapped records the bootstrap point, durably.
+func (s *store) setBootstrapped(at Timestamp) error {
+	s.mu.Lock()
+	if prev := s.n.bootstrapped.Load(); prev != nil && !prev.Less(at) {
+		s.mu.Unlock()
+		return nil
 	}
-	return nil
+	s.n.bootstrapped.Store(&at)
+	// One fixed id (no real command has it), so the record replaces any
+	// earlier bootstrap record.
+	rec := &Command{ID: bootstrapRecordID, ExecuteAt: at, Bootstrap: true}
+	s.bootstrapRec = rec
+	if s.gc != nil {
+		b, err := json.Marshal(rec)
+		if err != nil {
+			s.mu.Unlock()
+			return err
+		}
+		s.lastSeq = s.gc.enqueue(Record{ID: rec.ID, Data: b})
+		return s.unlock()
+	}
+	err := s.n.cfg.Journal.Append(rec)
+	s.mu.Unlock()
+	return err
+}
+
+// dirty reports whether a range has had transactions here since its
+// redundancy bound: only those need a durability round.
+func (s *store) dirty(r Range) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := sort.Search(len(s.sorted), func(i int) bool { return s.sorted[i].key.Token >= r.Lo })
+	for ; i < len(s.sorted) && s.sorted[i].key.Token <= r.Hi; i++ {
+		f := s.sorted[i]
+		// Any timestamp above the bound, even with no transaction left in
+		// the index (truncated ones still need a round to be forgotten).
+		if r.contains(f.key) && boundFor(s.redundant, f.key).Less(f.maxTS) {
+			return true
+		}
+	}
+	return false
+}
+
+// adoptRedundant records redundancy bounds another replica of the ranges
+// has (a SetShardDurable this replica missed: the sync point applied here
+// too), and wakes the commands waiting on a transaction below them; only
+// for a transaction this replica has not seen decided (it reports whether).
+func (s *store) adoptRedundant(id TxnID, bs []bound) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// A decided transaction still needs its outcome; an undecided one
+	// below a universal sync point never committed (it would have been a
+	// dependency the sync point applied here first), and is invalidated by
+	// forgetLocked once the bound is known.
+	if c := s.cmds[id]; c != nil && c.Status.decided() {
+		return false
+	}
+	for _, b := range bs {
+		s.redundant = addBound(s.redundant, b.R, b.TS)
+		s.barriers = addBound(s.barriers, b.R, b.TS)
+	}
+	s.forgetLocked()
+	if c := s.cmds[id]; c != nil && !c.Status.decided() && c.Status != Invalidated && c.Status != Truncated && len(s.n.owned(c.Keys, c.ID.Epoch)) == 0 {
+		// Known here without owning its keys (seen as a dependency or
+		// through a recovery): nothing to keep; it either never committed
+		// or is durable at its replicas.
+		c.Status = Truncated
+		_ = s.saveLocked(c)
+	}
+	for _, w := range s.waiters[id] {
+		if wc := s.cmds[w]; wc != nil {
+			s.maybeExecuteLocked(wc)
+		}
+	}
+	return true
 }
