@@ -2,6 +2,7 @@ package accord
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -764,6 +765,15 @@ func (n *Node) progressLog() {
 				defer n.syncing.Store(false)
 				n.syncEpochs()
 			}()
+		} else if e := n.synced.Load(); e > 0 && e == n.epoch() && n.cfg.IsLeader != nil && n.cfg.IsLeader() && now.Sub(n.lastSyncedSent) > jitter(n.cfg.DurabilityInterval) {
+			// Re-sent now and then: a node that restarted without it (or
+			// joined since) learns which epochs it may refuse.
+			n.lastSyncedSent = now
+			n.wg.Add(1)
+			go func() {
+				defer n.wg.Done()
+				n.broadcastSynced(e)
+			}()
 		}
 		for _, s := range todo {
 			if _, busy := n.recovering.LoadOrStore(s.id, true); busy {
@@ -1038,10 +1048,61 @@ type epochSynced struct{ Epoch int64 }
 func (n *Node) advanceSynced(e int64) {
 	for {
 		cur := n.synced.Load()
-		if e <= cur || n.synced.CompareAndSwap(cur, e) {
+		if e <= cur {
 			return
 		}
+		if n.synced.CompareAndSwap(cur, e) {
+			break
+		}
 	}
+	if n.s != nil {
+		_ = n.s.saveSynced()
+	}
+}
+
+// broadcastSynced tells every node of the latest epoch that epoch e is
+// synchronised.
+func (n *Node) broadcastSynced(e int64) {
+	n.topoMu.RLock()
+	var nodes []NodeID
+	if t := n.topos[n.latest]; t != nil {
+		nodes = t.Nodes
+	}
+	n.topoMu.RUnlock()
+	ctx, cancel := context.WithTimeout(context.Background(), n.cfg.RequestTimeout)
+	defer cancel()
+	for _, to := range nodes {
+		if to != n.cfg.ID {
+			_ = n.send(ctx, to, mEpochSynced, &epochSynced{Epoch: e}, nil)
+		}
+	}
+}
+
+var syncedRecordID = TxnID{Timestamp: Timestamp{Node: "~synced"}, Kind: SyncPoint}
+
+// saveSynced journals the node's synced epoch (one record, replaced), so a
+// restarted node keeps refusing transactions of older epochs.
+func (s *store) saveSynced() error {
+	s.mu.Lock()
+	e := s.n.synced.Load()
+	if s.syncedRec != nil && s.syncedRec.SyncedEpoch >= e {
+		s.mu.Unlock()
+		return nil
+	}
+	rec := &Command{ID: syncedRecordID, SyncedEpoch: e}
+	s.syncedRec = rec
+	if s.gc == nil {
+		err := s.n.cfg.Journal.Append(rec)
+		s.mu.Unlock()
+		return err
+	}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	s.lastSeq = s.gc.enqueue(Record{ID: rec.ID, Data: b})
+	return s.unlock()
 }
 
 // fetchOnce fetches a transaction's outcome, or recovers it, unless that

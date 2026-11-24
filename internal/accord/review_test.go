@@ -3,7 +3,9 @@ package accord
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
+	"slices"
 	"testing"
 	"time"
 
@@ -101,4 +103,60 @@ func TestEphemeralReadNewerEpoch(t *testing.T) {
 	require.Equal(t, []int{7}, res.Reads[keyString(k)], "the epoch 2 write is seen")
 	require.Equal(t, int64(2), c.node(0).epoch())
 	_ = math.MaxInt64
+}
+
+// TestJournalFailureBlocks: while the journal fails, a replica answers
+// nothing it has not made durable, not even a retried request whose state
+// is already in memory; once writes succeed, both answer.
+func TestJournalFailureBlocks(t *testing.T) {
+	c := newSimCluster(t, 3, 3, 1)
+	n0 := c.node(0)
+	k := c.keys[0]
+	txn := appendTxn(t, k, 1)
+	id := n0.newTxnID(Write)
+	c.jours["n0"].SetFail(errors.New("disk failed"))
+	done := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, err := n0.s.preAccept(&preAcceptReq{ID: id, Txn: txn})
+			done <- err
+		}()
+		time.Sleep(20 * time.Millisecond)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("answered while the journal fails: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	require.Positive(t, n0.Stats().JournalErrors)
+	c.jours["n0"].SetFail(nil)
+	for range 2 {
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("not answered once the journal works")
+		}
+	}
+	cs, err := c.jours["n0"].Load()
+	require.NoError(t, err)
+	require.True(t, slices.ContainsFunc(cs, func(cmd *Command) bool { return cmd.ID == id && cmd.Status >= PreAccepted }))
+}
+
+// TestAdoptedBoundSurvivesRestart: a redundancy bound learnt from another
+// replica is journaled before the records below it are forgotten.
+func TestAdoptedBoundSurvivesRestart(t *testing.T) {
+	c := newSimCluster(t, 3, 3, 1)
+	n0 := c.node(0)
+	full := Range{Lo: math.MinInt64, Hi: math.MaxInt64}
+	below := n0.newTxnID(Write)
+	at := n0.newTxnID(SyncPoint).Timestamp
+	require.True(t, n0.s.adoptRedundant(below, []bound{{R: full, TS: at}}))
+	require.Equal(t, at, boundFor(n0.s.redundant, c.keys[0]))
+	c.crash(0)
+	c.start(0)
+	n0 = c.node(0)
+	n0.s.mu.Lock()
+	defer n0.s.mu.Unlock()
+	require.Equal(t, at, boundFor(n0.s.redundant, c.keys[0]))
 }

@@ -117,18 +117,40 @@ func TestTransactionSchemaPinned(t *testing.T) {
 	b, err := json.Marshal(u)
 	require.NoError(t, err)
 	txn := &accord.Txn{Kind: accord.Write, Keys: []accord.Key{key}, Update: b}
-	changed, err := s.d.checkPinned(txn)
+	sc, changed, err := s.d.pinnedSchema(txn)
 	require.NoError(t, err)
 	require.False(t, changed)
+	require.Same(t, s.d.schema.Load(), sc)
 
+	// After a change, the transaction still runs against the snapshot it
+	// was made with: every replica and coordinator computes the same
+	// writes, whichever side of the ALTER it is on.
 	s.ok("ALTER TABLE ks.acct ADD note text")
-	changed, err = s.d.checkPinned(txn)
+	sc, changed, err = s.d.pinnedSchema(txn)
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.NotSame(t, s.d.schema.Load(), sc)
+	_, err = sc.table("ks", "acct")
+	require.NoError(t, err)
+	require.Nil(t, sc.byStorage[tbl.Storage].Column("note"))
+	w, res, err := accordAgent{s.d}.Execute(txn, accord.Timestamp{Epoch: 1, HLC: 1}, map[string][]byte{})
+	require.NoError(t, err)
+	require.NotEmpty(t, w)
+	require.NotEqual(t, accordSchemaChanged, res)
+
+	// Once no snapshot with the table as it was is kept (here: dropped
+	// from the history, as after a restart), the transaction reads nothing
+	// and ends with the schema change, writing nothing.
+	s.d.schemas.mu.Lock()
+	s.d.schemas.list = nil
+	s.d.schemas.mu.Unlock()
+	_, changed, err = s.d.pinnedSchema(txn)
 	require.NoError(t, err)
 	require.True(t, changed)
 	r, err := accordData{s.d}.Read(key, accord.Timestamp{}, txn)
 	require.NoError(t, err)
 	require.Equal(t, accordSchemaChanged, r)
-	w, res, err := accordAgent{s.d}.Execute(txn, accord.Timestamp{Epoch: 1, HLC: 1}, map[string][]byte{"x": r})
+	w, res, err = accordAgent{s.d}.Execute(txn, accord.Timestamp{Epoch: 1, HLC: 1}, map[string][]byte{"x": r})
 	require.NoError(t, err)
 	require.Empty(t, w)
 	require.Equal(t, accordSchemaChanged, res)

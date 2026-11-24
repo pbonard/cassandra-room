@@ -127,7 +127,10 @@ names, not its class structure.
      The barrier refuses any earlier-epoch transaction the sync point doesn't
      follow.
   2. Once the sync points apply, no earlier-epoch transaction is in progress
-     there, and every node is told the epoch is synchronised.
+     there, and every node is told the epoch is synchronised. Each node
+     journals its synchronised epoch, and the leader re-sends it every
+     durability interval, for nodes that restarted without it or joined
+     since.
   3. Phases then stop including the earlier epochs. An epoch that changed no
      replicas (a schema change) needs no sync point.
 - **Durability** (`CoordinateShardDurable`, `RedundantBefore`): each node
@@ -143,7 +146,8 @@ names, not its class structure.
   - **Missed bounds:** a replica that missed a bound and waits on a
     transaction the others forgot learns the bound from their status reply
     (`Truncated`, with their bounds) and adopts it: the sync point applied
-    there too.
+    there too. The adopted bound is journaled before anything below it is
+    forgotten.
   - **Majority fallback** (`SetMajorityDurable`): when a replica is down
     the universal sync point times out. The round then settles for one
     applied at a majority: barriers rise everywhere, and applied records
@@ -172,9 +176,12 @@ names, not its class structure.
     one sync, and a handler waits for its records after releasing the lock.
     Replicas also read transaction data outside the lock (a command's own
     writes wait for its reads in progress).
-  - **Errors:** a failed write fails the request it was for; the record of
-    an applied command is retried (the command stays `PreApplied`, its
-    writes being idempotent). Failures are counted (`journal_errors`).
+  - **Errors:** a failed batch is retried until it is written, and nothing
+    queued after it counts as durable before it: the replica stops
+    answering rather than answer with state the journal lacks (its memory
+    already holds that state, so even a retried request would otherwise be
+    answered from it). Failures are counted (`journal_errors`). A journal
+    without batches goes through the same writer, one record at a time.
   - **Truncation:** a transaction applied at every replica is truncated
     after `RetainApplied` to its id, status and timestamp. An erased
     command is only adopted once it is durably decided everywhere
@@ -274,11 +281,15 @@ names, not its class structure.
   List element paths are deterministic, so every coordinator computes the
   same writes.
 - **Schema pinning:** a transaction carries the metadata epoch it was made
-  at and a fingerprint of each table it uses. A replica behind that epoch
-  catches up before reading; one whose table changed since reads nothing,
-  and the transaction then writes nothing and fails with "the schema of a
-  table changed during the transaction; retry it". So no replica runs the
-  statements against a different table definition.
+  at and a fingerprint of each table it uses (columns, types and options).
+  Replicas and coordinators prepare its statements against a metadata
+  snapshot whose tables have those fingerprints: the current one, or one of
+  the last 64 kept. So every one of them, on either side of an `ALTER`,
+  computes the same reads and writes. A node behind the transaction's epoch
+  catches up first. Only when no kept snapshot matches (a change long ago,
+  or before the node restarted) does the replica read nothing; the
+  transaction then writes nothing and fails with "the schema of a table
+  changed during the transaction; retry it".
 - **Storage:** the journal is an engine table (one row per command); each
   group-committed batch is one synced write. Messages use `VerbAccord` on their own stage.
 

@@ -30,8 +30,15 @@ type MemJournal struct {
 	mu   sync.Mutex
 	cmds map[TxnID][]byte
 	n    int
-	// Fail, if set, fails every write (for tests).
-	Fail error
+	// fail, if set, fails every write (for tests).
+	fail error
+}
+
+// SetFail makes every later write fail with err (nil: succeed again).
+func (j *MemJournal) SetFail(err error) {
+	j.mu.Lock()
+	j.fail = err
+	j.mu.Unlock()
 }
 
 func (j *MemJournal) Append(c *Command) error {
@@ -46,8 +53,8 @@ func (j *MemJournal) Append(c *Command) error {
 func (j *MemJournal) AppendBatch(recs []Record) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if j.Fail != nil {
-		return j.Fail
+	if j.fail != nil {
+		return j.fail
 	}
 	if j.cmds == nil {
 		j.cmds = map[TxnID][]byte{}

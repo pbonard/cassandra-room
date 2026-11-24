@@ -67,6 +67,9 @@ type DB struct {
 	ddlMu   sync.Mutex
 	tableMu sync.RWMutex
 	schema  atomic.Pointer[Schema]
+	// schemas are recent metadata snapshots, for transactions made at an
+	// earlier one (see pinnedSchema).
+	schemas schemaHistory
 	local   localState
 
 	lastTS atomic.Int64
@@ -258,7 +261,7 @@ func (d *DB) loadSchema() error {
 		if s.NextStorageID == 0 { // an older schema file
 			s.NextStorageID = max(1, sf.Local.NextStorageID)
 		}
-		d.schema.Store(s)
+		d.setSchema(s)
 		return nil
 	case oserrorIsNotExist(err):
 		var id [16]byte
@@ -269,7 +272,7 @@ func (d *DB) loadSchema() error {
 		s := &Schema{Keyspaces: map[string]*Keyspace{}, NextStorageID: 1, Roles: map[string]*Role{}, Nodes: map[string]*cluster.Node{}}
 		addSystemKeyspaces(s)
 		s.finish()
-		d.schema.Store(s)
+		d.setSchema(s)
 		return nil
 	}
 	return err

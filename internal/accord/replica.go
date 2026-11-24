@@ -78,6 +78,9 @@ type Command struct {
 	// Bootstrap: not a command, but the sync point this node bootstrapped
 	// at (its ID), kept across restarts.
 	Bootstrap bool `json:",omitempty"`
+	// SyncedEpoch: not a command, but the oldest epoch any node still has
+	// transactions of (the node's synced epoch), kept across restarts.
+	SyncedEpoch int64 `json:",omitempty"`
 }
 
 // command is a Command with its runtime state.
@@ -137,8 +140,9 @@ type store struct {
 	lastSeq uint64
 	waiters map[TxnID][]TxnID
 	appends int
-	// bootstrapRec is the journal record of the bootstrap point.
-	bootstrapRec *Command
+	// bootstrapRec and syncedRec are the journal records of the bootstrap
+	// point and of the synced epoch.
+	bootstrapRec, syncedRec *Command
 }
 
 func newStore(n *Node) *store {
@@ -625,30 +629,20 @@ func (s *store) applyWrites(id TxnID, txn *Txn, executeAt Timestamp, owned []Key
 	if s.n.stopped.Load() {
 		return
 	}
-	// Record it applied; if the journal fails, it stays PreApplied (its
-	// writes are idempotent) and the record is retried.
-	for !s.n.stopped.Load() {
-		s.mu.Lock()
-		c := s.cmds[id]
-		if c == nil || c.Status != PreApplied {
-			if c != nil {
-				c.executing = false
-			}
-			s.mu.Unlock()
-			return
-		}
-		c.Status, c.appliedAt = Applied, s.n.cfg.Now()
-		if err := s.saveLocked(c); err != nil {
-			c.Status = PreApplied
-			s.mu.Unlock()
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-		c.executing = false
-		delete(s.waiters, id)
-		_ = s.unlock() // a failed group write is replayed as PreApplied
+	// Record it applied (the group commit writes it, retrying failures).
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := s.cmds[id]
+	if c == nil {
 		return
 	}
+	c.executing = false
+	if c.Status != PreApplied {
+		return
+	}
+	c.Status, c.appliedAt = Applied, s.n.cfg.Now()
+	_ = s.saveLocked(c)
+	delete(s.waiters, id)
 }
 
 func (s *store) beginRecovery(r *recoverReq) (*recoverReply, error) {
@@ -789,11 +783,13 @@ func (s *store) truncateLocked() {
 		for _, c := range s.cmds {
 			all = append(all, &c.Command)
 		}
-		if s.bootstrapRec != nil {
-			all = append(all, s.bootstrapRec)
+		for _, rec := range []*Command{s.bootstrapRec, s.syncedRec} {
+			if rec != nil {
+				all = append(all, rec)
+			}
 		}
-		if s.gc != nil && s.gc.wait(s.lastSeq) != nil {
-			return
+		if s.gc != nil && !s.gc.isDurable(s.lastSeq) {
+			return // compacted at a later tick, once the queue is written
 		}
 		if s.n.cfg.Journal.Compact(all) == nil {
 			s.appends = len(all)
@@ -815,6 +811,11 @@ func (s *store) replay() error {
 			s.bootstrapRec = saved
 			at := saved.ExecuteAt
 			s.n.bootstrapped.Store(&at)
+			continue
+		}
+		if saved.SyncedEpoch > 0 {
+			s.syncedRec = saved
+			s.n.synced.Store(max(s.n.synced.Load(), saved.SyncedEpoch))
 			continue
 		}
 		c := &command{Command: *saved, changed: make(chan struct{}), lastChange: now, appliedAt: now}
