@@ -52,7 +52,7 @@ func TestTruncatedOutcome(t *testing.T) {
 	k := c.keys[0]
 	_, err := c.node(0).Coordinate(context.Background(), appendTxn(t, k, 1))
 	require.NoError(t, err)
-	require.Eventually(t, func() bool { return c.node(1).Stats().Redundant > 0 }, 10*time.Second, 20*time.Millisecond)
+	require.Eventually(t, func() bool { return c.node(1).Stats().Redundant > 0 && c.node(2).Stats().Redundant > 0 }, 10*time.Second, 20*time.Millisecond)
 	old := TxnID{Timestamp: Timestamp{Epoch: 1, HLC: 1, Node: "n0"}, Kind: Write}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -69,10 +69,11 @@ func TestTruncatedOutcome(t *testing.T) {
 	n2.s.registerLocked(cmd, cmd.Txn.Keys)
 	cmd.Status, cmd.ExecuteAt = PreAccepted, old.Timestamp
 	n2.s.forgetLocked()
-	require.Equal(t, Invalidated, cmd.Status)
+	status := cmd.Status
 	n2.s.forgetLocked()
 	_, present := n2.s.cmds[old]
 	n2.s.mu.Unlock()
+	require.Equal(t, Invalidated, status)
 	require.False(t, present, "forgotten once invalidated")
 }
 
