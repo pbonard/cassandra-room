@@ -186,12 +186,19 @@ func (s *store) registerLocked(c *command, keys []Key) {
 	if c.Txn != nil {
 		keys = append(slices.Clone(keys), c.Txn.Keys...)
 	}
+	// Copy on write: replies built from the command are encoded after the
+	// store lock is released.
+	var add []Key
 	for _, k := range keys {
-		if !slices.Contains(c.Keys, k) {
-			c.Keys = append(c.Keys, k)
+		if !slices.Contains(c.Keys, k) && !slices.Contains(add, k) {
+			add = append(add, k)
 		}
 	}
-	slices.SortFunc(c.Keys, Key.Compare)
+	if len(add) > 0 {
+		nk := append(slices.Clone(c.Keys), add...)
+		slices.SortFunc(nk, Key.Compare)
+		c.Keys = nk
+	}
 	if len(c.Keys) == 0 {
 		return
 	}
@@ -389,6 +396,11 @@ func (s *store) acceptLocked2(r *acceptReq) (*acceptReply, error) {
 // with its reads once the command can execute (StableThenRead).
 func (s *store) commit(ctx context.Context, r *commitReq) (*commitReply, error) {
 	s.mu.Lock()
+	if s.forgottenLocked(r.ID, r.Keys) {
+		// A late message about a transaction forgotten below the
+		// redundancy bound: recreating it would leave it waiting forever.
+		return &commitReply{Outcome: redundant}, s.unlock()
+	}
 	c := s.get(r.ID)
 	if r.Invalidate {
 		err := s.invalidateLocked(c, r.Keys)
@@ -507,6 +519,11 @@ func (s *store) invalidateLocked(c *command, keys []Key) error {
 // they are applied.
 func (s *store) apply(ctx context.Context, r *applyReq) (*applyReply, error) {
 	s.mu.Lock()
+	if r.Txn != nil && s.forgottenLocked(r.ID, r.Txn.Keys) {
+		// Forgotten below the redundancy bound: the universal sync point
+		// that set it applied here after this transaction.
+		return &applyReply{Outcome: ok}, s.unlock()
+	}
 	c := s.get(r.ID)
 	if c.Status == Invalidated {
 		return &applyReply{Outcome: redundant}, s.unlock()
@@ -1099,6 +1116,15 @@ func (s *store) belowBarrierLocked(id TxnID, keys []Key) bool {
 
 // belowRedundantLocked reports whether a transaction's id is below the
 // redundancy bound on all of its keys here.
+// forgottenLocked reports whether a transaction this replica does not
+// know is below its redundancy bound (so it was forgotten here).
+func (s *store) forgottenLocked(id TxnID, keys []Key) bool {
+	if c := s.cmds[id]; c != nil && c.Status != NotDefined {
+		return false
+	}
+	return id.Kind != SyncPoint && len(keys) > 0 && s.belowRedundantLocked(id, keys)
+}
+
 func (s *store) belowRedundantLocked(id TxnID, keys []Key) bool {
 	owned := s.n.owned(keys, id.Epoch)
 	if len(s.redundant) == 0 || len(owned) == 0 {

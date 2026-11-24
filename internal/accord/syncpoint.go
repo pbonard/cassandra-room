@@ -345,7 +345,9 @@ func (s *store) dirty(r Range) bool {
 	i := sort.Search(len(s.sorted), func(i int) bool { return s.sorted[i].key.Token >= r.Lo })
 	for ; i < len(s.sorted) && s.sorted[i].key.Token <= r.Hi; i++ {
 		f := s.sorted[i]
-		if r.contains(f.key) && len(f.ids) > 0 && boundFor(s.redundant, f.key).Less(f.maxTS) {
+		// Any timestamp above the bound, even with no transaction left in
+		// the index (truncated ones still need a round to be forgotten).
+		if r.contains(f.key) && boundFor(s.redundant, f.key).Less(f.maxTS) {
 			return true
 		}
 	}
@@ -355,16 +357,28 @@ func (s *store) dirty(r Range) bool {
 // adoptRedundant records redundancy bounds another replica of the ranges
 // has (a SetShardDurable this replica missed: the sync point applied here
 // too), and wakes the commands waiting on a transaction below them; only
-// for a transaction this replica does not know (it reports whether).
+// for a transaction this replica has not seen decided (it reports whether).
 func (s *store) adoptRedundant(id TxnID, bs []bound) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if c := s.cmds[id]; c != nil && c.Status != NotDefined {
+	// A decided transaction still needs its outcome; an undecided one
+	// below a universal sync point never committed (it would have been a
+	// dependency the sync point applied here first), and is invalidated by
+	// forgetLocked once the bound is known.
+	if c := s.cmds[id]; c != nil && c.Status.decided() {
 		return false
 	}
 	for _, b := range bs {
 		s.redundant = addBound(s.redundant, b.R, b.TS)
 		s.barriers = addBound(s.barriers, b.R, b.TS)
+	}
+	s.forgetLocked()
+	if c := s.cmds[id]; c != nil && !c.Status.decided() && c.Status != Invalidated && c.Status != Truncated && len(s.n.owned(c.Keys, c.ID.Epoch)) == 0 {
+		// Known here without owning its keys (seen as a dependency or
+		// through a recovery): nothing to keep; it either never committed
+		// or is durable at its replicas.
+		c.Status = Truncated
+		_ = s.saveLocked(c)
 	}
 	for _, w := range s.waiters[id] {
 		if wc := s.cmds[w]; wc != nil {

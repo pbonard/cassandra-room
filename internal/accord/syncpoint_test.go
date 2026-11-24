@@ -3,10 +3,12 @@ package accord
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -78,16 +80,21 @@ func TestDurability(t *testing.T) {
 	records := c.run(6, 200, nil)
 	c.settle()
 	c.check(records)
-	require.Eventually(t, func() bool {
+	var last string
+	ok := assert.Eventually(t, func() bool {
 		for _, id := range c.ids {
 			n := c.net.nodes[id]
 			st := n.Stats()
 			if st.Redundant == 0 || st.Commands > 20 || st.Keys > 0 {
+				last = fmt.Sprintf("%s: %d bounds, %d commands, %d keys; %d rounds, %d majority", id, st.Redundant, st.Commands, st.Keys, st.DurabilityRounds, st.MajorityRounds)
 				return false
 			}
 		}
 		return true
 	}, 30*time.Second, 50*time.Millisecond, "records and keys below the redundancy bound forgotten")
+	if !ok {
+		t.Fatal(last)
+	}
 	var first *opRecord
 	for _, r := range records {
 		if r.err == nil && len(r.appends) > 0 {
