@@ -180,6 +180,23 @@ func TestEpochSync(t *testing.T) {
 	}
 	require.Eventually(t, func() bool { return c.node(0).synced.Load() >= 3 }, 10*time.Second, 20*time.Millisecond)
 	require.Equal(t, syncs, c.node(1).Stats().SyncPoints, "no sync point for an epoch without changes")
+	// The synced epoch survives a restart.
+	c.crash(0)
+	c.start(0)
+	require.GreaterOrEqual(t, c.node(0).synced.Load(), int64(3))
+	for _, e := range []*Topology{epoch2, epoch3} {
+		c.node(0).SetTopology(e)
+	}
+	// A node that lost it (a new node) learns it from the leader.
+	c.crash(3)
+	c.jours["n3"] = &MemJournal{}
+	c.start(3)
+	for _, e := range []*Topology{epoch2, epoch3} {
+		c.node(3).SetTopology(e)
+	}
+	require.Zero(t, c.node(3).synced.Load())
+	c.node(1).broadcastSynced(3)
+	require.Equal(t, int64(3), c.node(3).synced.Load())
 	// A transaction of epoch 1 (a coordinator that had not learnt epoch
 	// 2) is refused (the sync point's barrier, or the synchronised epoch),
 	// then recovered and invalidated.

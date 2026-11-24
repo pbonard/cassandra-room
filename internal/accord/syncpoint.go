@@ -368,9 +368,15 @@ func (s *store) adoptRedundant(id TxnID, bs []bound) bool {
 	if c := s.cmds[id]; c != nil && c.Status.decided() {
 		return false
 	}
+	// Journaled as markRedundant does (the bound's sync point, applied and
+	// redundant), ahead of the deletions forgetLocked queues: a restart
+	// restores the bound before anything below it is gone.
 	for _, b := range bs {
-		s.redundant = addBound(s.redundant, b.R, b.TS)
-		s.barriers = addBound(s.barriers, b.R, b.TS)
+		if !slices.ContainsFunc(s.redundant, func(o bound) bool { return o.R == b.R && !o.TS.Less(b.TS) }) {
+			if err := s.markRedundantLocked2(TxnID{Timestamp: b.TS, Kind: SyncPoint}, []Range{b.R}); err != nil {
+				return false
+			}
+		}
 	}
 	s.forgetLocked()
 	if c := s.cmds[id]; c != nil && !c.Status.decided() && c.Status != Invalidated && c.Status != Truncated && len(s.n.owned(c.Keys, c.ID.Epoch)) == 0 {

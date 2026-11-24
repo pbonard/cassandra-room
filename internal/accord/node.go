@@ -117,6 +117,8 @@ type Node struct {
 	syncing     atomic.Bool
 	metrics     metrics
 	lastDurable time.Time
+	// lastSyncedSent is when the leader last re-sent the synced epoch.
+	lastSyncedSent time.Time
 	// bootstrapped is the sync point this node bootstrapped at: the
 	// transactions before it are reflected in the data it streamed.
 	bootstrapped atomic.Pointer[Timestamp]
@@ -166,9 +168,11 @@ func NewNode(cfg Config) (*Node, error) {
 	if err := n.s.replay(); err != nil {
 		return nil, err
 	}
-	if bj, ok := cfg.Journal.(BatchJournal); ok {
-		n.s.gc = newGroupCommit(bj, func() { n.metrics.journalErrors.Add(1) })
+	bj, ok := cfg.Journal.(BatchJournal)
+	if !ok {
+		bj = batchAdapter{cfg.Journal}
 	}
+	n.s.gc = newGroupCommit(bj, func() { n.metrics.journalErrors.Add(1) })
 	return n, nil
 }
 

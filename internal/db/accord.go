@@ -11,6 +11,7 @@ import (
 	"math"
 	"slices"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -108,7 +109,7 @@ var errAccordSchemaChanged = invalidf("The schema of a table changed during the 
 // table's definition.
 func tableFingerprint(t *Table) uint64 {
 	h := fnv.New64a()
-	fmt.Fprintf(h, "%s.%s/%d/%s", t.Keyspace, t.Name, t.Storage, t.Params.TransactionalMode)
+	fmt.Fprintf(h, "%s.%s/%d/%+v", t.Keyspace, t.Name, t.Storage, t.Params)
 	for _, c := range t.AllColumns() {
 		fmt.Fprintf(h, "|%s:%s:%d:%d:%d:%t", c.Name, c.Type, c.Kind, c.Position, c.ID, c.Desc)
 	}
@@ -140,42 +141,90 @@ func (d *DB) pinKeys(u *accordUpdate, keys []accord.Key) {
 	d.pin(u, ids...)
 }
 
-// checkPinned waits until this node's schema reaches the transaction's
-// epoch (a transient error if it does not in time: the step is retried),
-// then reports whether a table it uses changed since.
-func (d *DB) checkPinned(txn *accord.Txn) (changed bool, err error) {
+// schemaHistory keeps the latest metadata snapshots.
+type schemaHistory struct {
+	mu   sync.Mutex
+	list []*Schema // oldest first
+}
+
+const schemaHistoryLen = 64
+
+// setSchema installs a metadata snapshot, keeping it in the history.
+func (d *DB) setSchema(s *Schema) {
+	d.schema.Store(s)
+	h := &d.schemas
+	h.mu.Lock()
+	h.list = append(h.list, s)
+	if len(h.list) > schemaHistoryLen {
+		h.list = slices.Delete(h.list, 0, len(h.list)-schemaHistoryLen)
+	}
+	h.mu.Unlock()
+}
+
+// pinnedSchema returns a metadata snapshot whose tables are those the
+// transaction was made with (the same fingerprints): executing against it
+// gives the same result on every replica and every coordinator, whatever
+// changed since. A node behind the transaction's epoch catches up first (a
+// transient error if it does not in time: the step is retried). changed
+// means no snapshot kept here matches (the table changed long ago, or
+// before this node restarted): the transaction then fails.
+func (d *DB) pinnedSchema(txn *accord.Txn) (s *Schema, changed bool, err error) {
 	var u struct {
 		SchemaEpoch int64
 		Tables      map[string]uint64
 	}
 	if err := json.Unmarshal(txn.Update, &u); err != nil {
-		return false, err
+		return nil, false, err
 	}
+	cur := d.schema.Load()
 	if u.SchemaEpoch == 0 {
-		return false, nil
+		return cur, false, nil
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	s := d.schema.Load()
-	if s.Epoch < u.SchemaEpoch && d.proxy != nil {
+	matches := func(s *Schema) bool {
+		for ids, fp := range u.Tables {
+			id, err := strconv.ParseUint(ids, 10, 64)
+			if err != nil {
+				return false
+			}
+			if t := s.byStorage[lsm.TableID(id)]; t == nil || tableFingerprint(t) != fp {
+				return false
+			}
+		}
+		return true
+	}
+	find := func() *Schema {
+		if s := d.schema.Load(); matches(s) {
+			return s
+		}
+		d.schemas.mu.Lock()
+		defer d.schemas.mu.Unlock()
+		for i := len(d.schemas.list) - 1; i >= 0; i-- {
+			if s := d.schemas.list[i]; matches(s) {
+				return s
+			}
+		}
+		return nil
+	}
+	if s := find(); s != nil {
+		return s, false, nil
+	}
+	if cur.Epoch >= u.SchemaEpoch {
+		return nil, true, nil
+	}
+	if d.proxy != nil {
 		d.proxy.membershipChanged() // fetch the newer metadata
 	}
-	for s.Epoch < u.SchemaEpoch {
+	deadline := time.Now().Add(2 * time.Second)
+	for d.schema.Load().Epoch < u.SchemaEpoch {
 		if time.Now().After(deadline) {
-			return false, fmt.Errorf("db: the schema is behind epoch %d of a transaction", u.SchemaEpoch)
+			return nil, false, fmt.Errorf("db: the schema is behind epoch %d of a transaction", u.SchemaEpoch)
 		}
 		time.Sleep(20 * time.Millisecond)
-		s = d.schema.Load()
 	}
-	for ids, fp := range u.Tables {
-		id, err := strconv.ParseUint(ids, 10, 64)
-		if err != nil {
-			return false, err
-		}
-		if t := s.byStorage[lsm.TableID(id)]; t == nil || tableFingerprint(t) != fp {
-			return true, nil
-		}
+	if s := find(); s != nil {
+		return s, false, nil
 	}
-	return false, nil
+	return nil, true, nil
 }
 
 // accordRows is a paged read's result.
@@ -455,7 +504,7 @@ func (j *accordJournal) Compact([]*accord.Command) error { return nil }
 
 // accordStatement rebuilds a "txn" or "read" transaction's statement and
 // its context.
-func (d *DB) accordStatement(txn *accord.Txn) (statement, *execCtx, *accordUpdate, error) {
+func (d *DB) accordStatement(sc *Schema, txn *accord.Txn) (statement, *execCtx, *accordUpdate, error) {
 	var u accordUpdate
 	if err := json.Unmarshal(txn.Update, &u); err != nil {
 		return nil, nil, nil, err
@@ -464,11 +513,7 @@ func (d *DB) accordStatement(txn *accord.Txn) (statement, *execCtx, *accordUpdat
 		return nil, nil, &u, nil
 	}
 	st := u.Stmts[0]
-	p, err := d.Prepare(st.Keyspace, st.Query)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	ps, err := d.current(p)
+	ps, err := d.prepareIn(sc, st.Keyspace, st.Query)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -482,7 +527,7 @@ func (d *DB) accordStatement(txn *accord.Txn) (statement, *execCtx, *accordUpdat
 }
 
 // accordMods rebuilds a transaction's statements.
-func (d *DB) accordMods(txn *accord.Txn) ([]boundModification, *accordUpdate, error) {
+func (d *DB) accordMods(sc *Schema, txn *accord.Txn) ([]boundModification, *accordUpdate, error) {
 	var u accordUpdate
 	if err := json.Unmarshal(txn.Update, &u); err != nil {
 		return nil, nil, err
@@ -491,11 +536,7 @@ func (d *DB) accordMods(txn *accord.Txn) ([]boundModification, *accordUpdate, er
 	var mods []boundModification
 	seq := new(uint32)
 	for _, st := range u.Stmts {
-		p, err := d.Prepare(st.Keyspace, st.Query)
-		if err != nil {
-			return nil, nil, err
-		}
-		ps, err := d.current(p)
+		ps, err := d.prepareIn(sc, st.Keyspace, st.Query)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -524,7 +565,8 @@ type accordData struct{ d *DB }
 // Read reads, from this replica's data, the current row of each
 // conditional statement on the partition.
 func (a accordData) Read(k accord.Key, _ accord.Timestamp, txn *accord.Txn) ([]byte, error) {
-	if changed, err := a.d.checkPinned(txn); err != nil || changed {
+	sc, changed, err := a.d.pinnedSchema(txn)
+	if err != nil || changed {
 		return accordSchemaChanged, err
 	}
 	var mode struct{ Mode string }
@@ -535,7 +577,7 @@ func (a accordData) Read(k accord.Key, _ accord.Timestamp, txn *accord.Txn) ([]b
 	case "write":
 		return nil, nil
 	case "txn", "read":
-		st, e, _, err := a.d.accordStatement(txn)
+		st, e, _, err := a.d.accordStatement(sc, txn)
 		if err != nil {
 			return nil, err
 		}
@@ -548,7 +590,7 @@ func (a accordData) Read(k accord.Key, _ accord.Timestamp, txn *accord.Txn) ([]b
 		}
 		return selectRows(st.(*selectStmt), e)
 	}
-	mods, _, err := a.d.accordMods(txn)
+	mods, _, err := a.d.accordMods(sc, txn)
 	if err != nil {
 		return nil, err
 	}
@@ -597,10 +639,11 @@ func (a accordAgent) Execute(txn *accord.Txn, executeAt accord.Timestamp, reads 
 			return accord.Writes{}, accordSchemaChanged, nil
 		}
 	}
-	if changed, err := a.d.checkPinned(txn); err != nil || changed {
-		if err != nil {
-			return nil, nil, err
-		}
+	sc, changed, err := a.d.pinnedSchema(txn)
+	if err != nil {
+		return nil, nil, err
+	}
+	if changed {
 		return accord.Writes{}, accordSchemaChanged, nil
 	}
 	var mode struct{ Mode string }
@@ -611,7 +654,7 @@ func (a accordAgent) Execute(txn *accord.Txn, executeAt accord.Timestamp, reads 
 	case "read":
 		return accord.Writes{}, reads[accordKeyString(txn.Keys[0])], nil
 	case "write":
-		mods, _, err := a.d.accordMods(txn)
+		mods, _, err := a.d.accordMods(sc, txn)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -624,7 +667,7 @@ func (a accordAgent) Execute(txn *accord.Txn, executeAt accord.Timestamp, reads 
 		}
 		return groupWrites(txn.Keys, mu.writes), []byte("null"), nil
 	case "txn":
-		st, e, _, err := a.d.accordStatement(txn)
+		st, e, _, err := a.d.accordStatement(sc, txn)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -652,7 +695,7 @@ func (a accordAgent) Execute(txn *accord.Txn, executeAt accord.Timestamp, reads 
 		out, err := json.Marshal(rows)
 		return groupWrites(txn.Keys, mu.writes), out, err
 	}
-	mods, _, err := a.d.accordMods(txn)
+	mods, _, err := a.d.accordMods(sc, txn)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -889,10 +932,11 @@ func selectRows(s *selectStmt, e *execCtx) ([]byte, error) {
 // ReadRange reads a sub-range of a range read on this replica: the
 // select, restricted to the sub-range's tokens.
 func (a accordData) ReadRange(r accord.Range, txn *accord.Txn) ([]byte, error) {
-	if changed, err := a.d.checkPinned(txn); err != nil || changed {
+	sc, changed, err := a.d.pinnedSchema(txn)
+	if err != nil || changed {
 		return accordSchemaChanged, err
 	}
-	st, e, _, err := a.d.accordStatement(txn)
+	st, e, _, err := a.d.accordStatement(sc, txn)
 	if err != nil {
 		return nil, err
 	}

@@ -69,11 +69,15 @@ func (p *Prepared) Metadata() (*message.VariablesMetadata, *message.RowsMetadata
 }
 
 func (d *DB) prepare(keyspace, query string) (*prepState, error) {
+	return d.prepareIn(d.schema.Load(), keyspace, query)
+}
+
+// prepareIn prepares a query against a schema snapshot.
+func (d *DB) prepareIn(s *Schema, keyspace, query string) (*prepState, error) {
 	parsed, err := cql.Parse(query)
 	if err != nil {
 		return nil, err
 	}
-	s := d.schema.Load()
 	vs := newVars(parsed.Markers)
 	ps := &prepState{version: s.Version}
 	switch st := parsed.Statement.(type) {
