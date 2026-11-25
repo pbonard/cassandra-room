@@ -508,3 +508,40 @@ func TestCMSLaggingAcceptor(t *testing.T) {
 	e, _ := stores[1].items()
 	require.EqualValues(t, 4, e, "caught up past a member as far behind")
 }
+
+// TestMergeDeadAndStaleState: a member another node reports dead, unknown
+// here, is not taken for up; and a dead member's newer state, relayed late,
+// does not bring it back (only a newer generation or incarnation does).
+func TestMergeDeadAndStaleState(t *testing.T) {
+	m, err := NewMessaging("127.0.0.1:0")
+	require.NoError(t, err)
+	defer m.Close()
+	g := NewGossiper(m, EndpointState{}, nil)
+	dead := EndpointState{Addr: "10.0.0.9:7000", Generation: 5, Epoch: 1}
+	b, _ := json.Marshal([]pushPullState{{State: dead, Liveness: stateDead, Incarnation: 2}})
+	g.mergeState(b)
+	require.False(t, g.IsAlive(dead.Addr), "reported dead")
+
+	later := dead
+	later.Epoch = 2
+	g.alive(message{Kind: kindState, Node: dead.Addr, Gen: later.Generation, Inc: 2, State: &later})
+	require.False(t, g.IsAlive(dead.Addr), "a newer state of the same life does not revive it")
+
+	g.alive(message{Kind: stateAlive, Node: dead.Addr, Gen: dead.Generation, Inc: 3})
+	require.True(t, g.IsAlive(dead.Addr), "it refuted with a higher incarnation")
+}
+
+// TestNetworkTopologyStrategyIdleRack: a rack whose only node owns no
+// tokens does not keep the skipped nodes of the other racks out: every
+// token still gets its data center's replication factor.
+func TestNetworkTopologyStrategyIdleRack(t *testing.T) {
+	r := NewRing([]Node{
+		{Addr: "a", DataCenter: "dc1", Rack: "r1", Tokens: RandomTokens(8), Status: StatusNormal},
+		{Addr: "b", DataCenter: "dc1", Rack: "r1", Tokens: RandomTokens(8), Status: StatusNormal},
+		{Addr: "c", DataCenter: "dc1", Rack: "r2", Status: StatusNormal},
+	})
+	repl := map[string]string{"class": "NetworkTopologyStrategy", "dc1": "2"}
+	for i := 0; i < 50; i++ {
+		require.Len(t, r.Replicas(repl, int64(i)*7919*1e12), 2)
+	}
+}

@@ -522,7 +522,9 @@ func (g *Gossiper) alive(msg message) {
 	}
 	var up []string
 	newer := gen > m.State.Generation || gen == m.State.Generation && msg.Inc > m.Incarnation
-	if newer || gen == m.State.Generation && msg.Inc == m.Incarnation && msg.State != nil && m.Liveness == stateDead && changed {
+	// Only a newer generation or incarnation brings a member back: a newer
+	// state relayed late (the member's last before it died) does not.
+	if newer {
 		if m.Liveness == stateDead {
 			up = append(up, msg.Node)
 		}
@@ -803,6 +805,23 @@ func (g *Gossiper) handlePushPull(ctx context.Context, _ string, payload []byte)
 
 // mergeState applies a remote view (mergeState): states as state messages;
 // a remote suspicion or death is only a suspicion here, as in memberlist.
+// addDead adds a member another node reports dead, if this one does not
+// know it (it would otherwise be added alive, then only suspected, and
+// count as up until the suspicion times out). A member that is in fact
+// alive refutes with a higher incarnation.
+func (g *Gossiper) addDead(r pushPullState) bool {
+	if r.State.Addr == g.self {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.members[r.State.Addr] != nil {
+		return false
+	}
+	g.members[r.State.Addr] = &member{State: r.State, Liveness: stateDead, Incarnation: r.Incarnation, changed: time.Now()}
+	return true
+}
+
 func (g *Gossiper) mergeState(payload []byte) {
 	var remote []pushPullState
 	if json.Unmarshal(payload, &remote) != nil {
@@ -810,6 +829,9 @@ func (g *Gossiper) mergeState(payload []byte) {
 	}
 	for _, r := range remote {
 		st := r.State
+		if r.Liveness == stateDead && g.addDead(r) {
+			continue // a member this node did not know, dead: not up
+		}
 		g.alive(message{Kind: kindState, Node: st.Addr, Gen: st.Generation, Inc: r.Incarnation, State: &st})
 		if r.Liveness == stateAlive {
 			g.alive(message{Kind: stateAlive, Node: st.Addr, Gen: st.Generation, Inc: r.Incarnation})
