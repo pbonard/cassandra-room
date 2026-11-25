@@ -32,6 +32,22 @@ func TestClusterManagement(t *testing.T) {
 	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}")
 	c.ok(0, quorum, "CREATE TABLE ks.kv (k int PRIMARY KEY, v text)")
 
+	// Metrics of the cluster.
+	mfs, err := c.nodes[0].Registry().Gather()
+	require.NoError(t, err)
+	got := map[string]float64{}
+	for _, mf := range mfs {
+		for _, m := range mf.GetMetric() {
+			v := m.GetGauge().GetValue() + m.GetCounter().GetValue()
+			got[mf.GetName()] += v
+		}
+	}
+	require.Equal(t, 3.0, got["cassandra_room_cluster_nodes"])
+	require.Positive(t, got["cassandra_room_cluster_metadata_epoch"])
+	require.Contains(t, got, "cassandra_room_accord_fast_path_total")
+	require.Contains(t, got, "cassandra_room_accord_commands")
+	require.Contains(t, got, "cassandra_room_thread_pool_max_tasks")
+
 	nodes := c.nodes[0].Nodes()
 	require.Len(t, nodes, 3)
 	self := 0

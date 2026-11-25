@@ -3,6 +3,7 @@ package manage
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -87,6 +88,24 @@ func TestManagementAPI(t *testing.T) {
 	require.Len(t, rows.Data, 1)
 	require.Equal(t, http.StatusOK, call(t, srv, "DELETE", "/api/v1/snapshots/s1", nil, nil))
 	require.Equal(t, http.StatusInternalServerError, call(t, srv, "POST", "/api/v1/import", ImportRequest{Keyspace: "ks", Table: "kv", Files: tables[0].Files}, &e), "the snapshot is gone")
+
+	// Prometheus metrics.
+	resp, err := http.Get(srv.URL + "/metrics")
+	require.NoError(t, err)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	m := string(body)
+	for _, want := range []string{
+		`cassandra_room_client_request_duration_seconds_count{consistency="any",request="write"}`,
+		`cassandra_room_client_request_duration_seconds_count{consistency="any",request="read"}`,
+		`cassandra_room_client_request_duration_seconds_count{consistency="any",request="schema"}`,
+		`cassandra_room_table_live_bytes{keyspace="ks",table="kv"}`,
+		`cassandra_room_table_sstables{keyspace="ks",table="kv"}`,
+		`cassandra_room_flushes_total`,
+		`go_goroutines`,
+	} {
+		require.Contains(t, m, want)
+	}
 
 	// A repair needs a cluster.
 	require.Equal(t, http.StatusInternalServerError, call(t, srv, "POST", "/api/v1/repair", RepairRequest{Keyspace: "ks", Start: "0", End: "10"}, &e))

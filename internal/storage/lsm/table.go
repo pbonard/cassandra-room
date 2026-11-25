@@ -386,6 +386,9 @@ func (t *Table) Options() TableOptions { return *t.o() }
 // sstable).
 type Size struct {
 	Bytes, Rows int64
+	// SSTables and MemtableBytes break Bytes down.
+	SSTables      int
+	MemtableBytes int64
 }
 
 // Size returns the table's approximate size.
@@ -397,9 +400,11 @@ func (t *Table) Size() Size {
 		out.Bytes += int64(f.size)
 		out.Rows += int64(f.stats.entries)
 	}
+	out.SSTables = len(s.files)
 	for _, m := range s.mems {
-		out.Bytes += m.approximateSize()
+		out.MemtableBytes += m.approximateSize()
 		out.Rows += m.count.Load()
 	}
+	out.Bytes += out.MemtableBytes
 	return out
 }

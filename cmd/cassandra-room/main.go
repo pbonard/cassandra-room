@@ -19,6 +19,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/pbonard/cassandra-room/internal/cluster"
 	"github.com/pbonard/cassandra-room/internal/db"
 	"github.com/pbonard/cassandra-room/internal/manage"
@@ -134,6 +136,9 @@ func main() {
 	}()
 
 	srv := server.New(database)
+	database.Registry().MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: "cassandra_room",
+		Name: "native_connections", Help: "Client connections open (native transport)."},
+		func() float64 { return float64(srv.Connections()) }))
 	if *maxConcurrentRequests > 0 {
 		srv.SetMaxConcurrentRequests(*maxConcurrentRequests)
 	}

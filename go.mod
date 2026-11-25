@@ -8,6 +8,7 @@ require (
 	github.com/datastax/go-cassandra-native-protocol v0.0.0-20260130100129-9d5b43677a33
 	github.com/gocql/gocql v1.7.0
 	github.com/pierrec/lz4/v4 v4.1.33
+	github.com/prometheus/client_golang v1.16.0
 	github.com/stretchr/testify v1.9.0
 	golang.org/x/crypto v0.58.0
 	gopkg.in/inf.v0 v0.9.1
@@ -41,7 +42,6 @@ require (
 	github.com/minio/minlz v1.0.2-0.20260119185444-845e64f85661 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/prometheus/client_golang v1.16.0 // indirect
 	github.com/prometheus/client_model v0.3.0 // indirect
 	github.com/prometheus/common v0.42.0 // indirect
 	github.com/prometheus/procfs v0.10.1 // indirect
