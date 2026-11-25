@@ -3,6 +3,7 @@ package lsm
 import (
 	"bytes"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,7 +16,7 @@ import (
 
 // partitionFilter mimics the database's deletion filter on keys
 // "<partition>/h" (a partition deletion, as a live cell of column 99 whose
-// timestamp is the deletion's) and "<partition>/r<n>" (rows): rows the
+// timestamp is the deletion's and value its local deletion time) and "<partition>/r<n>" (rows): rows the
 // deletion shadows are dropped, and the deletion itself once purgeable.
 type partitionFilter struct {
 	prefix []byte
@@ -36,7 +37,12 @@ func (f *partitionFilter) Filter(key, value []byte, env *FilterEnv) ([]byte, boo
 		return nil, false, err
 	}
 	if rest[0] == 'h' {
+		// The deletion's local deletion time is the cell's value.
 		f.del = r.Cells[0].Timestamp
+		ldt, err := strconv.ParseInt(string(r.Cells[0].Value), 10, 64)
+		if err != nil || ldt >= env.GCBefore {
+			return nil, false, err
+		}
 		limit, err := env.MaxPurgeable(prefix, append(bytes.Clone(prefix), 0xff), f.del, f.del)
 		return nil, f.del < limit, err
 	}
@@ -69,7 +75,7 @@ func TestIncrementalReleasePartitionDeletion(t *testing.T) {
 		}
 	}
 	require.NoError(t, tbl.Flush()) // B
-	put("p000/h", row.Cell{Column: 99, Timestamp: 2, LocalDeletionTime: row.NoDeletionTime, Value: []byte("deleted")})
+	put("p000/h", row.Cell{Column: 99, Timestamp: 2, LocalDeletionTime: row.NoDeletionTime, Value: []byte(strconv.FormatInt(clock.Load()-10, 10))})
 	require.NoError(t, tbl.Flush()) // A
 	require.Len(t, tableFileList(e, tbl), 2)
 	require.NoError(t, e.Close())
@@ -94,4 +100,38 @@ func TestIncrementalReleasePartitionDeletion(t *testing.T) {
 	require.Len(t, keys, 900, "the deletion and the rows it shadows are purged")
 	require.False(t, strings.HasPrefix(keys[0], "p000/"))
 	t.Logf("%d early releases", releases)
+}
+
+// TestMerkleTreeAfterCompaction: a replica that compacted away the rows a
+// partition deletion shadows hashes the same as one that did not (the
+// validation applies the table's row filter, as compaction does).
+func TestMerkleTreeAfterCompaction(t *testing.T) {
+	var clock atomic.Int64
+	clock.Store(1_000_000)
+	opts := TableOptions{GCGraceSeconds: 1 << 30, RowFilter: func() RowFilter { return &partitionFilter{} }}
+	var tables []*Table
+	for r := 0; r < 2; r++ {
+		e, tbl := purgeEngine(t, vfs.NewMem(), &clock, opts)
+		defer e.Close()
+		for p := 0; p < 3; p++ {
+			for i := 0; i < 20; i++ {
+				putCell(t, e, fmt.Sprintf("p%03d/r%04d", p, i), liveCell(1, "old"))
+			}
+		}
+		require.NoError(t, tbl.Flush())
+		putCell(t, e, "p001/h", row.Cell{Column: 99, Timestamp: 2, LocalDeletionTime: row.NoDeletionTime, Value: []byte(strconv.FormatInt(clock.Load()-10, 10))})
+		require.NoError(t, tbl.Flush())
+		if r == 0 {
+			compactAll(t, e, tbl, tableFileList(e, tbl)) // drops p001's rows
+			require.Len(t, rawRows(t, tbl), 41)
+		}
+		tables = append(tables, tbl)
+	}
+	a, err := tables[0].MerkleTree(FullRing, 4)
+	require.NoError(t, err)
+	b, err := tables[1].MerkleTree(FullRing, 4)
+	require.NoError(t, err)
+	diff, err := a.Diff(b)
+	require.NoError(t, err)
+	require.Empty(t, diff, "the same data, compacted or not")
 }
