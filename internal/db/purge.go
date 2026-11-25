@@ -52,6 +52,9 @@ func (f *deletionFilter) Filter(key, value []byte, env *lsm.FilterEnv) ([]byte, 
 	if !bytes.Equal(prefix, f.prefix) {
 		f.prefix = append(f.prefix[:0], prefix...)
 		f.partition, f.ranges = row.NoTimestamp, f.ranges[:0]
+		if env.Group != nil {
+			env.Group() // a partition's deletions shadow its rows
+		}
 	}
 	// purgeable reports whether a deletion at ts, deleted at ldt, of the
 	// keys in [lo, hi) may be dropped.

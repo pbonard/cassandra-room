@@ -259,12 +259,19 @@ func ReplicationFactor(replication map[string]string) (total int, perDC map[stri
 	return total, perDC
 }
 
-// RandomTokens picks n random tokens (num_tokens without token
-// allocation).
+// RandomTokens picks n distinct random tokens (num_tokens without token
+// allocation), uniformly over the ring: Murmur3Partitioner's tokens are
+// above math.MinInt64, its minimum token, which no node takes.
 func RandomTokens(n int) []int64 {
-	out := make([]int64, n)
-	for i := range out {
-		out[i] = rand.Int63() - rand.Int63()
+	out := make([]int64, 0, n)
+	seen := make(map[int64]bool, n)
+	for len(out) < n {
+		t := int64(rand.Uint64())
+		if t == math.MinInt64 || seen[t] {
+			continue
+		}
+		seen[t] = true
+		out = append(out, t)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out

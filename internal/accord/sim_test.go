@@ -193,7 +193,7 @@ func (c *simCluster) start(i int) {
 	if running {
 		return
 	}
-	n, err := NewNode(Config{ID: id, Tag: i, Transport: &simTransport{net: c.net, from: id}, Data: c.stores[id], Agent: listAgent{},
+	n, err := NewNode(Config{ID: id, Transport: &simTransport{net: c.net, from: id}, Data: c.stores[id], Agent: listAgent{},
 		Journal: c.jours[id], ProgressInterval: 20 * time.Millisecond, RecoverAfter: 500 * time.Millisecond,
 		RequestTimeout: time.Second, RetainApplied: time.Hour})
 	require.NoError(c.t, err)

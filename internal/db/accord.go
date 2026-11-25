@@ -273,17 +273,8 @@ func (p *proxy) startAccord() error {
 			return err
 		}
 	}
-	// The clock tag is the node's ordinal in the cluster metadata (unique);
-	// before it has one (metadata from an older version), a hash of its id.
-	h := fnv.New32a()
-	h.Write([]byte(d.local.HostID))
-	tag := int(h.Sum32())
-	if me := d.schema.Load().Nodes[d.local.HostID]; me != nil && me.Ordinal != 0 {
-		tag = me.Ordinal
-	}
 	n, err := accord.NewNode(accord.Config{
 		ID:        p.self,
-		Tag:       tag,
 		Now:       d.opts.Now,
 		Transport: accordTransport{p},
 		Data:      accordData{d},

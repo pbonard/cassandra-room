@@ -1773,6 +1773,33 @@ func (c *compaction) compactShard(s int) error {
 	}
 	var purged []byte
 	var contrib []int
+	// The inputs that hold entries of the filter's current group (a
+	// partition): the filter may drop an entry because of another one of
+	// the group, held by another input (a row shadowed by a partition or
+	// range deletion), and if that deletion is purged, the two inputs must
+	// be released together, or the row would come back while the other
+	// input stays live.
+	var group []int
+	grouping := false // the filter calls Group
+	inGroup := make([]bool, len(c.inputs))
+	addToGroup := func() {
+		for _, ent := range mi.cur {
+			if i := srcInput[ent.src]; !inGroup[i] {
+				inGroup[i] = true
+				group = append(group, i)
+			}
+		}
+	}
+	if filterEnv != nil && incremental {
+		filterEnv.Group = func() {
+			grouping = true
+			for _, i := range group {
+				inGroup[i] = false
+			}
+			group = group[:0]
+			addToGroup()
+		}
+	}
 	var hist ldtHistogram // deletion times of the current row, if not split
 	ok := false
 	if lower == nil {
@@ -1789,6 +1816,9 @@ func (c *compaction) compactShard(s int) error {
 		}
 		value := mi.value
 		var rs *row.Stats
+		if filter != nil && incremental {
+			addToGroup()
+		}
 		if purge {
 			// One decoding purges the row and yields its statistics.
 			key := mi.key
@@ -1822,14 +1852,17 @@ func (c *compaction) compactShard(s int) error {
 			if err != nil {
 				return fail(err)
 			}
-			if drop || out != nil {
-				if incremental && len(mi.cur) > 1 {
-					contrib = contrib[:0]
-					for _, ent := range mi.cur {
-						contrib = append(contrib, srcInput[ent.src])
-					}
-					c.tie(contrib)
+			if (drop || out != nil) && incremental {
+				// The entry's own inputs and, if the filter groups
+				// entries, the group's.
+				contrib = contrib[:0]
+				for _, ent := range mi.cur {
+					contrib = append(contrib, srcInput[ent.src])
 				}
+				if grouping {
+					contrib = append(contrib, group...)
+				}
+				c.tie(contrib)
 			}
 			if drop {
 				continue
@@ -1911,6 +1944,13 @@ type FilterEnv struct {
 	// outside the compaction: a deletion of that range older than it
 	// shadows nothing that survives the compaction.
 	MaxPurgeable func(lo, hi []byte, minTS, maxTS int64) (int64, error)
+	// Group, when not nil, is for a filter whose decisions depend on
+	// earlier entries (a partition's deletions): it calls it at the first
+	// entry of each group of entries that depend on each other. Dropping
+	// or changing an entry then keeps every sstable holding entries of its
+	// group until all of them are compacted (when a large compaction
+	// releases its inputs as it goes).
+	Group func()
 }
 
 // maxPurgeable returns the smallest timestamp of key's data outside a

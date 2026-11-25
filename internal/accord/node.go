@@ -41,10 +41,7 @@ type Agent interface {
 
 // Config configures a node.
 type Config struct {
-	ID NodeID
-	// Tag distinguishes the node's clock values (see Clock); nodes should
-	// have different tags.
-	Tag       int
+	ID        NodeID
 	Now       func() time.Time
 	Transport Transport
 	Data      DataStore
@@ -162,7 +159,7 @@ func NewNode(cfg Config) (*Node, error) {
 	if cfg.Journal == nil {
 		cfg.Journal = &MemJournal{}
 	}
-	n := &Node{cfg: cfg, clock: NewClock(cfg.Tag, cfg.Now), topos: map[int64]*Topology{}, stop: make(chan struct{}),
+	n := &Node{cfg: cfg, clock: NewClock(cfg.Now), topos: map[int64]*Topology{}, stop: make(chan struct{}),
 		persisting: make(chan struct{}, maxPersisting)}
 	n.s = newStore(n)
 	if err := n.s.replay(); err != nil {
@@ -175,10 +172,6 @@ func NewNode(cfg Config) (*Node, error) {
 	n.s.gc = newGroupCommit(bj, func() { n.metrics.journalErrors.Add(1) })
 	return n, nil
 }
-
-// SetTag sets the tag of the node's clock (a number unique among the
-// cluster's nodes, below 1024): no two nodes then make the same timestamp.
-func (n *Node) SetTag(tag int) { n.clock.SetTag(tag) }
 
 // ID returns the node's id.
 func (n *Node) ID() NodeID { return n.cfg.ID }

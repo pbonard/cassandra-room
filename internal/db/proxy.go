@@ -463,9 +463,6 @@ func (p *proxy) metadataChanged(s *Schema) {
 	p.replaced.Store(&replaced)
 	p.ring.Store(cluster.NewRing(nodeList(s)))
 	p.accordTopology(s)
-	if me := s.Nodes[p.d.local.HostID]; me != nil && me.Ordinal != 0 && p.accord != nil {
-		p.accord.SetTag(me.Ordinal)
-	}
 	p.g.Update(func(st *cluster.EndpointState) { st.Epoch = s.Epoch })
 }
 
@@ -1049,12 +1046,22 @@ func (p *proxy) replayHints() {
 		if len(live) == 0 {
 			continue // expired (purged by compaction)
 		}
-		payload := live[0].Value
+		payload, stale := p.liveHint(live[0].Value)
+		if stale {
+			// Its table was dropped or truncated since: nobody can take
+			// it, and keeping it would hold up the host's later hints.
+			tombstone(k)
+			continue
+		}
 		start := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), p.opts.WriteTimeout)
 		_, err = p.m.Request(ctx, n.Addr, cluster.VerbMutation, payload)
 		cancel()
 		if err != nil {
+			if strings.Contains(err.Error(), "was dropped while it was written") {
+				tombstone(k) // dropped meanwhile, as above
+				continue
+			}
 			failed[host] = true
 			continue
 		}
@@ -1074,6 +1081,30 @@ func (p *proxy) replayHints() {
 		}
 	}
 	_ = p.d.applyLocal(done)
+}
+
+// liveHint drops from a hint's writes those to tables that no longer exist
+// (dropped, or truncated: a truncate gives the table new storage), and
+// reports whether nothing is left to deliver.
+func (p *proxy) liveHint(payload []byte) ([]byte, bool) {
+	ws, err := decodeWrites(payload)
+	if err != nil {
+		return payload, false // let the replica judge it
+	}
+	keep := ws[:0]
+	for _, w := range ws {
+		if _, err := p.d.engine.Table(w.table); errors.Is(err, lsm.ErrUnknownTable) {
+			continue
+		}
+		keep = append(keep, w)
+	}
+	switch {
+	case len(keep) == 0:
+		return nil, true
+	case len(keep) < len(ws):
+		return encodeWrites(keep), false
+	}
+	return payload, false
 }
 
 // ---- reads ----
