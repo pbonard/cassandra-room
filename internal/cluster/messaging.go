@@ -143,9 +143,9 @@ const (
 	// sent to the node it was relayed for under its request id.
 	kindRelayedResponse = 6
 	kindRelayedError    = 7
-	compressedFlag = 0x80
-	compressMin    = 512
-	maxFrame       = 256 << 20
+	compressedFlag      = 0x80
+	compressMin         = 512
+	maxFrame            = 256 << 20
 	// largeMessage is the size above which a message goes on the large
 	// connection (OTCP_LARGE_MESSAGE_THRESHOLD).
 	largeMessage = 64 << 10
