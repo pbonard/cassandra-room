@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math"
 	"math/rand"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -186,6 +187,18 @@ func (g *Gossiper) IsAlive(addr string) bool {
 	defer g.mu.Unlock()
 	m := g.members[addr]
 	return m != nil && m.Liveness != stateDead
+}
+
+// AddSeeds adds addresses to contact at start and when no member is known
+// (a restarted node's last known peers, as Cassandra's system.peers).
+func (g *Gossiper) AddSeeds(addrs ...string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, a := range addrs {
+		if a != g.self && !slices.Contains(g.seeds, a) {
+			g.seeds = append(g.seeds, a)
+		}
+	}
 }
 
 // Start joins through the seeds and starts probing and gossiping.

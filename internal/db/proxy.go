@@ -237,8 +237,17 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	d.store = p
 	p.ring.Store(cluster.NewRing(nodeList(d.schema.Load())))
 	m.Start()
+	// A restarted node also contacts the peers it knew: seeds' addresses
+	// may have changed (pods), or be down.
+	known := slices.Clone(o.Seeds)
+	for _, n := range d.schema.Load().Nodes {
+		if n.Status != cluster.StatusLeft && n.Addr != p.self && !slices.Contains(known, n.Addr) {
+			known = append(known, n.Addr)
+		}
+	}
+	p.g.AddSeeds(known...)
 	p.g.Start()
-	for _, s := range o.Seeds {
+	for _, s := range known {
 		if s != p.self && p.cms.CatchUp(s) == nil {
 			break
 		}
@@ -268,10 +277,18 @@ func (p *proxy) up(n *cluster.Node) bool {
 
 // cmsMembers returns the metadata service's members.
 func (p *proxy) cmsMembers() []string {
-	if m := p.d.schema.Load().CMS; len(m) > 0 {
-		return m
+	s := p.d.schema.Load()
+	m := s.CMS
+	if len(m) == 0 {
+		return p.initialCMS
 	}
-	return p.initialCMS
+	// A member restarted at a new address (a pod's IP changes) is still
+	// listed at its old one until its REGISTER commits: it is this node.
+	if me := s.Nodes[p.d.local.HostID]; me != nil && me.Addr != p.self && slices.Contains(m, me.Addr) {
+		m = slices.Clone(m)
+		m[slices.Index(m, me.Addr)] = p.self
+	}
+	return m
 }
 
 // join registers this node in the cluster metadata and, if it joins a
@@ -311,6 +328,10 @@ func (p *proxy) join() error {
 		}
 		if cur != nil && cur.Status != cluster.StatusLeft {
 			n.Status = cur.Status // an address change
+			if i := slices.Index(next.CMS, cur.Addr); i >= 0 && cur.Addr != n.Addr {
+				next.CMS = slices.Clone(next.CMS)
+				next.CMS[i] = n.Addr // still a member of the metadata service
+			}
 		}
 		next.Nodes[me.HostID] = &n
 		next.logDetail = fmt.Sprintf("%s %s as %s", n.HostID, n.Addr, n.Status)

@@ -12,13 +12,16 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/pbonard/cassandra-room/internal/cluster"
 	"github.com/pbonard/cassandra-room/internal/db"
+	"github.com/pbonard/cassandra-room/internal/manage"
 	"github.com/pbonard/cassandra-room/internal/server"
 )
 
@@ -55,9 +58,18 @@ func main() {
 		clientKey             = flag.String("client-key", "", "PEM private key for client TLS")
 		clientCA              = flag.String("client-ca", "", "PEM CA client certificates must chain to; set, clients must present one (require_client_auth)")
 		clientTLSOptional     = flag.Bool("client-tls-optional", false, "Also accept unencrypted client connections on the same port (optional: true)")
+		adminCert             = flag.String("admin-cert", "", "PEM certificate for TLS on the management API (with -admin-key)")
+		adminKey              = flag.String("admin-key", "", "PEM private key for the management API")
+		adminCA               = flag.String("admin-ca", "", "PEM CA the management API's clients must present a certificate from")
+		_                     = flag.String("flags-file", "", "File of further flags, one per line (\"-name=value\"); the command line overrides them")
 		adminAddress          = flag.String("admin-address", "", "HTTP address for nodetool-style operations: GET /status, POST /repair?keyspace=, POST /cleanup?keyspace=, POST /removenode?node=, POST /cms/reconfigure?members=, POST /decommission")
 	)
-	flag.Parse()
+	if err := flag.CommandLine.Parse(withFlagsFile(os.Args[1:])); err != nil {
+		os.Exit(2)
+	}
+	if abs, err := filepath.Abs(*dataDir); err == nil {
+		*dataDir = abs // snapshots name their files by absolute path
+	}
 
 	if *commitlogSync != "periodic" && *commitlogSync != "batch" {
 		log.Fatalf("-commitlog-sync must be periodic or batch, got %q", *commitlogSync)
@@ -121,10 +133,6 @@ func main() {
 		}
 	}()
 
-	if *adminAddress != "" {
-		go serveAdmin(*adminAddress, database)
-	}
-
 	srv := server.New(database)
 	if *maxConcurrentRequests > 0 {
 		srv.SetMaxConcurrentRequests(*maxConcurrentRequests)
@@ -148,6 +156,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to listen on %s: %v", *addr, err)
 	}
+	var serving atomic.Bool
+	if *adminAddress != "" {
+		var cfg *tls.Config
+		if *adminCert != "" {
+			if cfg, err = clientTLS(*adminCert, *adminKey, *adminCA); err != nil {
+				log.Fatal(err)
+			}
+		}
+		go serveAdmin(*adminAddress, manage.Handler(database, serving.Load), cfg)
+	}
+	serving.Store(true)
 	log.Printf("cassandra-room listening for CQL v3/v4/v5 connections on %s", ln.Addr())
 
 	sigCh := make(chan os.Signal, 1)
@@ -178,58 +197,6 @@ func main() {
 //reviewed
 
 // serveAdmin serves the operations nodetool provides over JMX.
-func serveAdmin(addr string, d *db.DB) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, d.Status())
-	})
-	mux.HandleFunc("POST /repair", func(w http.ResponseWriter, r *http.Request) {
-		st, err := d.Repair(r.URL.Query().Get("keyspace"))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintf(w, "repaired %d ranges: %d mismatching, %d bytes streamed\n", st.Ranges, st.Mismatches, st.Streamed)
-	})
-	mux.HandleFunc("POST /cleanup", func(w http.ResponseWriter, r *http.Request) {
-		n, err := d.Cleanup(r.URL.Query().Get("keyspace"))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintf(w, "cleaned %d tables\n", n)
-	})
-	mux.HandleFunc("POST /removenode", func(w http.ResponseWriter, r *http.Request) {
-		if err := d.RemoveNode(r.URL.Query().Get("node")); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintln(w, "removed")
-	})
-	mux.HandleFunc("POST /cms/reconfigure", func(w http.ResponseWriter, r *http.Request) {
-		var members []string
-		for _, m := range strings.Split(r.URL.Query().Get("members"), ",") {
-			if m = strings.TrimSpace(m); m != "" {
-				members = append(members, m)
-			}
-		}
-		if err := d.ReconfigureCMS(members); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintln(w, "the metadata service is now", strings.Join(members, ", "))
-	})
-	mux.HandleFunc("POST /decommission", func(w http.ResponseWriter, _ *http.Request) {
-		if err := d.Decommission(); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintln(w, "decommissioned: the node has left the ring and can be stopped")
-	})
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Printf("admin endpoint: %v", err)
-	}
-}
 
 // clientTLS is the TLS configuration of the native port: the node's
 // certificate and, with a CA, required client certificates.
@@ -282,4 +249,47 @@ func resolveHostPort(addr string) string {
 		host = resolve(host).String()
 	}
 	return net.JoinHostPort(host, port)
+}
+
+// serveAdmin serves the management API, with TLS if cfg is set.
+func serveAdmin(addr string, h http.Handler, cfg *tls.Config) {
+	srv := &http.Server{Addr: addr, Handler: h, TLSConfig: cfg, ReadHeaderTimeout: 10 * time.Second}
+	var err error
+	if cfg != nil {
+		err = srv.ListenAndServeTLS("", "")
+	} else {
+		err = srv.ListenAndServe()
+	}
+	log.Printf("management API: %v", err)
+}
+
+// withFlagsFile puts the flags of the -flags-file named in args (one per
+// line, blank lines and # comments ignored) before args, so that flags on
+// the command line override them.
+func withFlagsFile(args []string) []string {
+	var path string
+	for i, a := range args {
+		name, val, hasVal := strings.Cut(strings.TrimLeft(a, "-"), "=")
+		if !strings.HasPrefix(a, "-") || name != "flags-file" {
+			continue
+		}
+		if !hasVal && i+1 < len(args) {
+			val = args[i+1]
+		}
+		path = val
+	}
+	if path == "" {
+		return args
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatalf("reading -flags-file: %v", err)
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
+			out = append(out, line)
+		}
+	}
+	return append(out, args...)
 }

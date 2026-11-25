@@ -202,11 +202,7 @@ type metaStore struct{ p *proxy }
 
 func (m metaStore) Current() (int64, []byte, []string) {
 	s := m.p.d.schema.Load()
-	members := s.CMS
-	if len(members) == 0 {
-		members = m.p.initialCMS
-	}
-	return s.Epoch, metadataBytes(s), members
+	return s.Epoch, metadataBytes(s), m.p.cmsMembers()
 }
 
 func (m metaStore) Contains(meta []byte, id string) (bool, error) {

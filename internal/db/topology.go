@@ -271,8 +271,9 @@ func (p *proxy) handleRepair(ctx context.Context, _ string, payload []byte) ([]b
 
 // RepairStats summarise a repair.
 type RepairStats struct {
-	Ranges, Mismatches int
-	Streamed           int64 // bytes
+	Ranges     int   `json:"ranges"`
+	Mismatches int   `json:"mismatches"`
+	Streamed   int64 `json:"streamed"` // bytes
 }
 
 // Repair synchronizes this node's ranges of a keyspace's tables (all user
@@ -280,16 +281,36 @@ type RepairStats struct {
 // tree of every range, and the leaves that differ are streamed both ways
 // (nodetool repair).
 func (d *DB) Repair(keyspace string) (RepairStats, error) {
+	return d.repair(keyspace, "", nil)
+}
+
+// RepairRange repairs the part of the token range (start, end] this node
+// replicates, for one table of a keyspace (or all its tables if table is
+// empty): a segment of a scheduled repair (Reaper's subrange repair). start
+// may be greater than end (a range wrapping around the ring).
+func (d *DB) RepairRange(keyspace, table string, start, end int64) (RepairStats, error) {
+	if keyspace == "" {
+		return RepairStats{}, errors.New("db: a range repair needs a keyspace")
+	}
+	segment := tokenRangesOf(start, end)
+	return d.repair(keyspace, table, segment)
+}
+
+// repair synchronizes this node's ranges of the tables, restricted to the
+// token ranges of segment (all of them if nil).
+func (d *DB) repair(keyspace, table string, segment []lsm.TokenRange) (RepairStats, error) {
 	var st RepairStats
 	p := d.proxy
 	if p == nil {
 		return st, errors.New("db: not a cluster node")
 	}
 	ring := p.ring.Load()
+	found := false
 	for _, t := range d.userTables() {
-		if keyspace != "" && t.Keyspace != keyspace {
+		if keyspace != "" && t.Keyspace != keyspace || table != "" && t.Name != table {
 			continue
 		}
+		found = true
 		k := d.schema.Load().Keyspaces[t.Keyspace]
 		lt, err := d.engine.Table(t.Storage)
 		if err != nil {
@@ -300,7 +321,7 @@ func (d *DB) Repair(keyspace string) (RepairStats, error) {
 			if !containsAddr(reps, p.self) {
 				continue
 			}
-			for _, tr := range tokenRangesOf(r[0], r[1]) {
+			for _, tr := range intersectTokenRanges(tokenRangesOf(r[0], r[1]), segment) {
 				st.Ranges++
 				mine, err := lt.MerkleTree(tr, repairDepth)
 				if err != nil {
@@ -342,7 +363,27 @@ func (d *DB) Repair(keyspace string) (RepairStats, error) {
 			}
 		}
 	}
+	if !found && (keyspace != "" || table != "") {
+		return st, fmt.Errorf("db: no table %s.%s to repair", keyspace, table)
+	}
 	return st, nil
+}
+
+// intersectTokenRanges returns the parts of ranges within segment (all of
+// ranges if segment is nil).
+func intersectTokenRanges(ranges, segment []lsm.TokenRange) []lsm.TokenRange {
+	if segment == nil {
+		return ranges
+	}
+	var out []lsm.TokenRange
+	for _, r := range ranges {
+		for _, s := range segment {
+			if first, last := max(r.First, s.First), min(r.Last, s.Last); first <= last {
+				out = append(out, lsm.TokenRange{First: first, Last: last})
+			}
+		}
+	}
+	return out
 }
 
 // tokenRangesOf converts a ring range (start, end] to the engine's token
