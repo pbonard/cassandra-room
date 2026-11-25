@@ -196,6 +196,7 @@ client certificates (`-admin-ca`):
 | `GET /api/v1/health`, `/api/v1/ready` | liveness; readiness (in the ring and serving clients) |
 | `GET /api/v1/node`, `/api/v1/nodes` | this node; every node (address, host id, data center, rack, status, up, tokens, metadata service membership) |
 | `GET /api/v1/ring?keyspace=` | ranges and their replicas (`describering`) |
+| `GET /api/v1/keyspaces` | the user keyspaces |
 | `POST /api/v1/flush` | flush every memtable |
 | `POST /api/v1/decommission` | leave the ring, in the background (`/node` shows LEAVING, then LEFT) |
 | `POST /api/v1/cleanup?keyspace=`, `/removenode?node=`, `/cms?members=` | as nodetool |

@@ -63,6 +63,9 @@ func TestManagementAPI(t *testing.T) {
 	exec(t, d, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
 	exec(t, d, "CREATE TABLE ks.kv (k int PRIMARY KEY, v text)")
 	exec(t, d, "INSERT INTO ks.kv (k, v) VALUES (1, 'a')")
+	var keyspaces []string
+	require.Equal(t, http.StatusOK, call(t, srv, "GET", "/api/v1/keyspaces", nil, &keyspaces))
+	require.Equal(t, []string{"ks"}, keyspaces)
 	var ring []db.RangeInfo
 	require.Equal(t, http.StatusOK, call(t, srv, "GET", "/api/v1/ring?keyspace=ks", nil, &ring))
 	require.Len(t, ring, 1)

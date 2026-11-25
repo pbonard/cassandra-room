@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 
 	"github.com/pbonard/cassandra-room/internal/cluster"
 	"github.com/pbonard/cassandra-room/internal/storage/lsm"
@@ -105,6 +106,25 @@ func (d *DB) Ring(keyspace string) ([]RangeInfo, error) {
 }
 
 const minToken = -1 << 63
+
+// Keyspaces returns the names of the user keyspaces, sorted.
+func (d *DB) Keyspaces() []string {
+	seen := map[string]bool{}
+	for _, t := range d.userTables() {
+		seen[t.Keyspace] = true
+	}
+	for name, k := range d.schema.Load().Keyspaces {
+		if !k.virtual && !strings.HasPrefix(name, "system") {
+			seen[name] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // Flush writes every table's memtable to sstables (nodetool flush).
 func (d *DB) Flush() error {

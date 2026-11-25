@@ -7,6 +7,7 @@
 //	GET    /api/v1/node            this node (db.NodeInfo)
 //	GET    /api/v1/nodes           every node of the cluster
 //	GET    /api/v1/ring?keyspace=  ranges with their replicas (describering)
+//	GET    /api/v1/keyspaces       the user keyspaces
 //	POST   /api/v1/flush           flush every memtable
 //	POST   /api/v1/decommission    leave the ring (asynchronous: see /node)
 //	POST   /api/v1/cleanup?keyspace=
@@ -46,6 +47,7 @@ func Handler(d *db.DB, serving func() bool) http.Handler {
 	mux.HandleFunc("GET /api/v1/node", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, d.LocalNode()) })
 	mux.HandleFunc("GET /api/v1/nodes", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, d.Nodes()) })
 	mux.HandleFunc("GET /api/v1/ring", h.ring)
+	mux.HandleFunc("GET /api/v1/keyspaces", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, d.Keyspaces()) })
 	mux.HandleFunc("POST /api/v1/flush", func(w http.ResponseWriter, _ *http.Request) { h.done(w, d.Flush()) })
 	mux.HandleFunc("POST /api/v1/decommission", h.decommission)
 	mux.HandleFunc("POST /api/v1/cleanup", func(w http.ResponseWriter, r *http.Request) {
