@@ -101,41 +101,35 @@ func (id TxnID) conflicts(o TxnID) bool { return id.Kind != Read || o.Kind != Re
 // Ballot orders recovery attempts; zero is the original coordinator's.
 type Ballot = Timestamp
 
-// Clock issues a node's unique timestamps (accord's hybrid logical clock).
+// Clock issues a node's timestamps (accord's hybrid logical clock), in
+// microseconds: an executeAt's HLC is also the timestamp of the cells the
+// transaction writes, so it must keep pace with the wall clock that
+// ordinary writes use. Nodes' clocks may issue the same value; Timestamp
+// breaks such ties by node, and replicas never let a transaction execute
+// at the HLC of one it conflicts with (preAcceptLocked), so the cells of
+// conflicting transactions never share a timestamp.
 type Clock struct {
 	mu   sync.Mutex
 	last int64
-	tag  int64
 	now  func() time.Time
 }
 
-// tagBits is how many low bits of an hlc carry the node's tag.
-const tagBits = 10
-
-// NewClock creates a clock whose values carry tag (taken modulo 1024).
-func NewClock(tag int, now func() time.Time) *Clock {
+// NewClock creates a clock.
+func NewClock(now func() time.Time) *Clock {
 	if now == nil {
 		now = time.Now
 	}
-	return &Clock{tag: int64(tag) & (1<<tagBits - 1), now: now}
+	return &Clock{now: now}
 }
 
-// Next returns a new hlc above both the clock's previous values and after.
+// Next returns a new hlc above both the clock's previous values and after:
+// the wall clock's microseconds unless the clock is already ahead.
 func (c *Clock) Next(after int64) int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	v := max(c.now().UnixMicro(), c.last+1, after+1)
-	// Round up to the next value carrying the tag.
-	v = (v-c.tag+(1<<tagBits)-1)>>tagBits<<tagBits + c.tag
 	c.last = v
 	return v
-}
-
-// SetTag changes the low bits that tell the node's timestamps apart.
-func (c *Clock) SetTag(tag int) {
-	c.mu.Lock()
-	c.tag = int64(tag) & (1<<tagBits - 1)
-	c.mu.Unlock()
 }
 
 // Observe advances the clock past a timestamp seen from another node.

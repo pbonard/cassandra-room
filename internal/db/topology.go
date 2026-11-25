@@ -168,6 +168,35 @@ func (p *proxy) pendingReplicas(k *Keyspace, token int64, current []*cluster.Nod
 	return out
 }
 
+// leaveTargetsDown lists the nodes that would take over this node's ranges
+// in future and are down.
+func (p *proxy) leaveTargetsDown(future *cluster.Ring) []string {
+	cur := p.ring.Load()
+	down := map[string]bool{}
+	for _, t := range p.d.userTables() {
+		k := p.d.schema.Load().Keyspaces[t.Keyspace]
+		if k == nil {
+			continue
+		}
+		for _, r := range cur.Ranges() {
+			if !containsAddr(cur.Replicas(k.Replication, r[1]), p.self) {
+				continue
+			}
+			for _, n := range future.Replicas(k.Replication, r[1]) {
+				if n.Addr != p.self && !containsAddr(cur.Replicas(k.Replication, r[1]), n.Addr) && !p.g.IsAlive(n.Addr) {
+					down[n.Addr] = true
+				}
+			}
+		}
+	}
+	out := make([]string, 0, len(down))
+	for a := range down {
+		out = append(out, a)
+	}
+	slices.Sort(out)
+	return out
+}
+
 // Decommission streams this node's data to the nodes that take over its
 // ranges and leaves the ring.
 func (d *DB) Decommission() error {
@@ -204,6 +233,19 @@ func (d *DB) Decommission() error {
 			}
 		}
 	}
+	// Every node taking over a range must be up to receive it: leaving
+	// without streaming to one would leave it without the range's data
+	// (and, with one replica, lose it). StorageService.unbootstrap fails
+	// the same way.
+	states := nodeList(d.schema.Load())
+	for i := range states {
+		if states[i].Addr == p.self {
+			states[i].Status = cluster.StatusLeaving
+		}
+	}
+	if down := p.leaveTargetsDown(cluster.NewFutureRing(states)); len(down) > 0 {
+		return fmt.Errorf("db: nodes taking over this node's ranges are down: %s; bring them up (or remove them) first", strings.Join(down, ", "))
+	}
 	// PrepareLeave: once committed (and pushed to the live nodes), writes
 	// also go to the nodes taking over this node's ranges.
 	if err := p.setStatus("PREPARE_LEAVE", cluster.StatusLeaving); err != nil {
@@ -218,8 +260,12 @@ func (d *DB) Decommission() error {
 				continue
 			}
 			for _, n := range future.Replicas(k.Replication, r[1]) {
-				if containsAddr(cur.Replicas(k.Replication, r[1]), n.Addr) || !p.g.IsAlive(n.Addr) {
+				if containsAddr(cur.Replicas(k.Replication, r[1]), n.Addr) {
 					continue
+				}
+				if !p.g.IsAlive(n.Addr) {
+					// Still leaving: a retry resumes where this stopped.
+					return fmt.Errorf("db: decommission: %s, which takes over a range, is down; retry once it is up", n.Addr)
 				}
 				for _, kr := range keyRangesOf(r[0], r[1]) {
 					unit := n.HostID + "/" + progressUnit(t.Storage, kr[0], kr[1])

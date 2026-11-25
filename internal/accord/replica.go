@@ -341,7 +341,10 @@ func (s *store) preAcceptLocked(c *command, txn *Txn, recovering bool) error {
 	s.registerLocked(c, txn.Keys)
 	// The fast path also needs the transaction's epoch to be current here:
 	// otherwise it executes in the newer topology.
-	if maxC := s.maxConflictLocked(c); !recovering && maxC.Less(c.ID.Timestamp) && c.ID.Epoch >= s.n.epoch() {
+	// The fast path needs a strictly higher HLC than every conflict, not
+	// just a higher timestamp: the HLC is the written cells' timestamp, and
+	// two conflicting transactions writing at the same one would tie.
+	if maxC := s.maxConflictLocked(c); !recovering && maxC.Less(c.ID.Timestamp) && maxC.HLC < c.ID.HLC && c.ID.Epoch >= s.n.epoch() {
 		c.ExecuteAt, c.FastVote = c.ID.Timestamp, true
 	} else {
 		c.ExecuteAt = Timestamp{Epoch: max(c.ID.Epoch, s.n.epoch(), maxC.Epoch), HLC: s.n.clock.Next(maxC.HLC), Node: s.n.cfg.ID}
