@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand/v2"
 	"net"
 	"slices"
 	"sort"
@@ -32,8 +33,17 @@ import (
 
 // ClusterOptions make a DB a node of a cluster.
 type ClusterOptions struct {
-	// ListenAddress is the internode address, "host:port" (storage_port).
+	// ListenAddress is the internode address, "host:port" (storage_port),
+	// the node listens on.
 	ListenAddress string
+	// BroadcastAddress is the internode address the node is known by and
+	// other nodes connect to (broadcast_address), when it differs from
+	// ListenAddress (NAT, another network); it is the node's identity.
+	BroadcastAddress string
+	// PreferLocal makes nodes of the same data center connect to each
+	// other at their listen addresses (prefer_local), keeping broadcast
+	// addresses for other data centers.
+	PreferLocal bool
 	// ReplaceAddress makes a new node take the place of a dead one, given
 	// by address or host id (replace_address_first_boot).
 	ReplaceAddress string
@@ -168,11 +178,16 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 			return err
 		}
 	}
-	m, err := cluster.NewMessagingWith(o.ListenAddress, o.Messaging)
+	mo := o.Messaging
+	mo.Broadcast = o.BroadcastAddress
+	m, err := cluster.NewMessagingWith(o.ListenAddress, mo)
 	if err != nil {
 		return err
 	}
 	p := &proxy{d: d, m: m, opts: *o, self: m.Addr(), stopCh: make(chan struct{}), started: time.Now()}
+	if o.PreferLocal {
+		m.SetDialAddress(p.dialAddress)
+	}
 	m.Handle(cluster.VerbMutation, p.handleMutation)
 	m.Handle(cluster.VerbReadRow, p.handleReadRow)
 	m.Handle(cluster.VerbReadDigest, p.handleReadDigest)
@@ -265,7 +280,7 @@ func (p *proxy) cmsMembers() []string {
 // (PrepareReplace, streaming, FinishReplace).
 func (p *proxy) join() error {
 	d := p.d
-	me := &cluster.Node{Addr: p.self, HostID: d.local.HostID, NativeAddr: d.opts.Address.String(), NativePort: d.opts.Port,
+	me := &cluster.Node{Addr: p.self, InternalAddr: p.internalAddr(), HostID: d.local.HostID, NativeAddr: d.opts.Address.String(), NativePort: d.opts.Port,
 		DataCenter: d.opts.DataCenter, Rack: d.opts.Rack, Tokens: d.local.Tokens, ReleaseVersion: ReleaseVersion}
 	if r := p.opts.ReplaceAddress; r != "" {
 		if cur := d.schema.Load().Nodes[me.HostID]; cur == nil || cur.Status == cluster.StatusJoining {
@@ -278,7 +293,7 @@ func (p *proxy) join() error {
 			next.CMS = slices.Clone(p.initialCMS)
 		}
 		cur := next.Nodes[me.HostID]
-		if cur != nil && cur.Status != cluster.StatusLeft && cur.Addr == me.Addr && cur.NativeAddr == me.NativeAddr && cur.NativePort == me.NativePort && cur.Ordinal != 0 {
+		if cur != nil && cur.Status != cluster.StatusLeft && cur.Addr == me.Addr && cur.InternalAddr == me.InternalAddr && cur.NativeAddr == me.NativeAddr && cur.NativePort == me.NativePort && cur.Ordinal != 0 {
 			return nil, false, nil
 		}
 		n := *me
@@ -567,12 +582,22 @@ func (p *proxy) need(cl primitive.ConsistencyLevel, k *Keyspace, pending []*clus
 		}
 		return n
 	}
-	n := ackNeed{total: blockFor(cl, k, p.d.opts.DataCenter)}
-	for _, r := range pending {
-		local := cl == primitive.ConsistencyLevelLocalQuorum || cl == primitive.ConsistencyLevelLocalOne || cl == primitive.ConsistencyLevelLocalSerial
-		if cl != primitive.ConsistencyLevelAny && (!local || r.DataCenter == p.d.opts.DataCenter) {
-			n.total++
+	local := cl == primitive.ConsistencyLevelLocalQuorum || cl == primitive.ConsistencyLevelLocalOne || cl == primitive.ConsistencyLevelLocalSerial
+	if local {
+		// Only this data center's acknowledgements count
+		// (DatacenterWriteResponseHandler); the others still get the write.
+		dc := p.d.opts.DataCenter
+		n := ackNeed{perDC: map[string]int{dc: blockFor(cl, k, dc)}}
+		for _, r := range pending {
+			if r.DataCenter == dc {
+				n.perDC[dc]++
+			}
 		}
+		return n
+	}
+	n := ackNeed{total: blockFor(cl, k, p.d.opts.DataCenter)}
+	if cl != primitive.ConsistencyLevelAny {
+		n.total += len(pending)
 	}
 	return n
 }
@@ -712,7 +737,9 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 		gk := k.Name + "/" + strconv.FormatInt(w.token, 10)
 		g := groups[gk]
 		if g == nil {
-			reps, _ := p.replicas(k, w.token, cl)
+			// Every replica gets the write, in every data center; cl only
+			// decides whose acknowledgements are awaited (need).
+			reps, _ := p.replicas(k, w.token, primitive.ConsistencyLevelAll)
 			// Nodes joining or taking over the range get the write too, and
 			// must acknowledge it on top of the consistency level.
 			pending := p.pendingReplicas(k, w.token, reps)
@@ -736,24 +763,36 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 			}
 		}
 	}
+	// Replicas still working when the consistency level is met keep the
+	// write timeout to finish (and are hinted if they fail).
 	ctx, cancel := context.WithTimeout(context.Background(), p.opts.WriteTimeout)
-	defer cancel()
 	type ack struct {
 		addr string
 		err  error
 	}
 	acks := make(chan ack, len(perNode))
 	m.trace.event("Writing %d partitions at %s to %d replicas", len(groups), clName(cl), len(perNode))
-	for addr, ws := range perNode {
-		m.trace.event("Sending MUTATION (%d writes) to %s", len(ws), addr)
+	for _, sg := range p.sendGroups(perNode, nodes) {
+		if len(sg.forward) > 0 {
+			m.trace.event("Sending MUTATION (%d writes) to %s, to forward to %s", len(sg.ws), sg.via, strings.Join(sg.forward, ", "))
+			go func() {
+				ch := p.m.RequestForward(ctx, sg.via, sg.forward, cluster.VerbMutation, sg.enc)
+				for range len(sg.forward) + 1 {
+					r := <-ch
+					acks <- ack{r.From, r.Err}
+				}
+			}()
+			continue
+		}
+		m.trace.event("Sending MUTATION (%d writes) to %s", len(sg.ws), sg.via)
 		go func() {
 			var err error
-			if addr == p.self {
-				err = p.d.applyLocal(ws)
+			if sg.via == p.self {
+				err = p.d.applyLocal(sg.ws)
 			} else {
-				_, err = p.m.Request(ctx, addr, cluster.VerbMutation, encodeWrites(ws))
+				_, err = p.m.Request(ctx, sg.via, cluster.VerbMutation, encodeWrites(sg.ws))
 			}
-			acks <- ack{addr, err}
+			acks <- ack{sg.via, err}
 		}()
 	}
 	satisfied := func() bool {
@@ -768,6 +807,7 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 	for a := range perNode {
 		pending[a] = true
 	}
+wait:
 	for len(pending) > 0 && !satisfied() {
 		select {
 		case a := <-acks:
@@ -787,13 +827,14 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 				g.acks.add(nodes[a.addr])
 			}
 		case <-ctx.Done():
-			pending = nil
+			break wait // the rest time out and are hinted below
 		}
 	}
 	// Replicas that have not answered yet get hints only if they fail;
 	// let them finish in the background.
 	if n := len(pending); n > 0 {
 		go func() {
+			defer cancel()
 			for i := 0; i < n; i++ {
 				a := <-acks
 				if a.err != nil {
@@ -805,6 +846,8 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 				}
 			}
 		}()
+	} else {
+		cancel()
 	}
 	p.storeHints(hints)
 	if !satisfied() {
@@ -820,6 +863,48 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 		return &timeoutError{write: true, cl: cl, received: minAcks, blockFor: need, batch: len(groups) > 1}
 	}
 	return nil
+}
+
+// sendGroup is one message of a write: to via, which forwards it to the
+// others in its data center.
+type sendGroup struct {
+	via     string
+	forward []string
+	ws      []write
+	enc     []byte // ws encoded, for a forwarded message
+}
+
+// sendGroups plans the messages of a write (sendToHintedReplicas): one per
+// replica in this data center; in each other data center, one per set of
+// replicas receiving the same writes, sent to a random one of them, which
+// forwards it to the others (sendMessagesToNonlocalDC), so the write
+// crosses to each data center once.
+func (p *proxy) sendGroups(perNode map[string][]write, nodes map[string]*cluster.Node) []sendGroup {
+	var out []sendGroup
+	remote := map[string][]string{} // by data center and writes
+	encs := map[string][]byte{}
+	var keys []string
+	for addr, ws := range perNode {
+		n := nodes[addr]
+		if addr == p.self || n.DataCenter == p.d.opts.DataCenter {
+			out = append(out, sendGroup{via: addr, ws: ws})
+			continue
+		}
+		enc := encodeWrites(ws)
+		key := n.DataCenter + "\x00" + string(enc)
+		if remote[key] == nil {
+			keys = append(keys, key)
+			encs[key] = enc
+		}
+		remote[key] = append(remote[key], addr)
+	}
+	for _, key := range keys {
+		addrs := remote[key]
+		i := rand.IntN(len(addrs))
+		addrs[0], addrs[i] = addrs[i], addrs[0]
+		out = append(out, sendGroup{via: addrs[0], forward: addrs[1:], ws: perNode[addrs[0]], enc: encs[key]})
+	}
+	return out
 }
 
 // ---- hints (HintsService) ----
@@ -1856,4 +1941,32 @@ func (p *proxy) tokenSegments() [][2]int64 {
 		out = [][2]int64{{math.MinInt64, math.MaxInt64}}
 	}
 	return out
+}
+
+// internalAddr is the address recorded for nodes of this data center to
+// connect to (prefer_local): the listen address, when it differs from the
+// broadcast address and names a host.
+func (p *proxy) internalAddr() string {
+	l := p.opts.ListenAddress
+	if l == p.self {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(l); err != nil || host == "" || net.ParseIP(host) != nil && net.ParseIP(host).IsUnspecified() {
+		return ""
+	}
+	return l
+}
+
+// dialAddress is where to connect to a node known by addr: its internal
+// address if it is in this data center and has one (prefer_local).
+func (p *proxy) dialAddress(addr string) string {
+	for _, n := range p.d.schema.Load().Nodes {
+		if n.Addr == addr {
+			if n.InternalAddr != "" && n.DataCenter == p.d.opts.DataCenter {
+				return n.InternalAddr
+			}
+			break
+		}
+	}
+	return addr
 }

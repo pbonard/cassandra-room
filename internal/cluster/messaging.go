@@ -87,7 +87,16 @@ type Messaging struct {
 	nextID atomic.Uint64
 	wg     sync.WaitGroup
 
+	// relays are the requests this node sent through another one, by
+	// request id, awaiting their responses (RequestCallbacks).
+	relayMu sync.Mutex
+	relays  map[uint64]relayWait
+
 	stages [numStages]chan struct{}
+
+	// dialAddr, if set, gives the address to connect to a node at (its
+	// private address in this data center: prefer_local).
+	dialAddr atomic.Pointer[func(string) string]
 
 	// Limits, in bytes (internode_application_*_queue_*).
 	outEndpoint map[string]*budget
@@ -97,6 +106,8 @@ type Messaging struct {
 
 	dropped    [numVerbs]atomic.Uint64
 	overloaded atomic.Uint64
+	forwards   atomic.Uint64 // requests sent with others to forward to
+	relayed    atomic.Uint64 // requests relayed for another node
 }
 
 // MessagingOptions configure internode connections
@@ -112,20 +123,37 @@ type MessagingOptions struct {
 	// endpoint, then one shared by all (Cassandra: 4 MiB, 128 MiB,
 	// 512 MiB, both for sending and receiving). Zero uses the defaults.
 	QueueCapacity, EndpointReserve, GlobalReserve int64
+	// Broadcast is the address this node is known by, which other nodes
+	// connect to (broadcast_address), when it differs from the address it
+	// listens on (listen_address: behind NAT, or in another network).
+	Broadcast string
 }
 
 const (
 	// ProtocolVersion is this node's messaging version; MinProtocolVersion
 	// the oldest it can talk to.
-	ProtocolVersion    = 4
+	// Version 5 adds forwarding (kindForward and after); a node uses it
+	// only towards peers that speak it.
+	ProtocolVersion    = 5
 	MinProtocolVersion = 4
 
-	kindRequest    = 1
-	kindResponse   = 2
-	kindError      = 3
-	compressedFlag = 0x80
-	compressMin    = 512
-	maxFrame       = 256 << 20
+	kindRequest  = 1
+	kindResponse = 2
+	kindError    = 3
+	// kindForward is a request its receiver also delivers to other nodes
+	// (Cassandra's FORWARD_TO): the payload starts with their addresses
+	// and the request ids the coordinator expects their responses under.
+	kindForward = 4
+	// kindRelayed is a request delivered on behalf of another node, which
+	// gets the response (RESPOND_TO): the payload starts with its address.
+	kindRelayed = 5
+	// kindRelayedResponse and kindRelayedError answer a relayed request,
+	// sent to the node it was relayed for under its request id.
+	kindRelayedResponse = 6
+	kindRelayedError    = 7
+	compressedFlag      = 0x80
+	compressMin         = 512
+	maxFrame            = 256 << 20
 	// largeMessage is the size above which a message goes on the large
 	// connection (OTCP_LARGE_MESSAGE_THRESHOLD).
 	largeMessage = 64 << 10
@@ -274,9 +302,13 @@ func NewMessagingWith(addr string, o MessagingOptions) (*Messaging, error) {
 	if err != nil {
 		return nil, err
 	}
-	m := &Messaging{addr: ln.Addr().String(), ln: ln, opts: o,
+	self := ln.Addr().String()
+	if o.Broadcast != "" {
+		self = o.Broadcast
+	}
+	m := &Messaging{addr: self, ln: ln, opts: o,
 		conns: map[outKey]*outConn{}, inbound: map[net.Conn]struct{}{}, peerVer: map[string]uint16{},
-		outEndpoint: map[string]*budget{}, inEndpoint: map[string]*budget{}}
+		outEndpoint: map[string]*budget{}, inEndpoint: map[string]*budget{}, relays: map[uint64]relayWait{}}
 	m.outGlobal.cap, m.inGlobal.cap = o.GlobalReserve, o.GlobalReserve
 	m.inGlobal.free = sync.NewCond(&m.inGlobal.mu)
 	for i := range m.stages {
@@ -288,8 +320,19 @@ func NewMessagingWith(addr string, o MessagingOptions) (*Messaging, error) {
 	return m, nil
 }
 
-// Addr returns the address the node listens on.
+// Addr returns the address the node is known by (its broadcast address,
+// else the one it listens on).
 func (m *Messaging) Addr() string { return m.addr }
+
+// SetDialAddress sets how to find the address to connect to a node at,
+// given the address it is known by (prefer_local); nil connects to that.
+func (m *Messaging) SetDialAddress(f func(string) string) {
+	if f == nil {
+		m.dialAddr.Store(nil)
+		return
+	}
+	m.dialAddr.Store(&f)
+}
 
 // Handle registers the handler of a verb. Call before Start.
 func (m *Messaging) Handle(v Verb, h Handler) { m.handlers[v] = h }
@@ -309,6 +352,9 @@ type Stats struct {
 	Dropped map[Verb]uint64
 	// Overloaded counts requests refused for exceeding the queue limits.
 	Overloaded uint64
+	// Forwards counts requests sent for their receiver to forward to
+	// other nodes; Relayed the requests this node delivered for another.
+	Forwards, Relayed uint64
 }
 
 // StageStat is a stage's activity (system_views.thread_pools).
@@ -334,7 +380,7 @@ func (m *Messaging) Stages() []StageStat {
 
 // Stats returns the counters.
 func (m *Messaging) Stats() Stats {
-	s := Stats{Dropped: map[Verb]uint64{}, Overloaded: m.overloaded.Load()}
+	s := Stats{Dropped: map[Verb]uint64{}, Overloaded: m.overloaded.Load(), Forwards: m.forwards.Load(), Relayed: m.relayed.Load()}
 	for v := range m.dropped {
 		if n := m.dropped[v].Load(); n > 0 {
 			s.Dropped[Verb(v)] = n
@@ -551,12 +597,49 @@ func (m *Messaging) serve(c net.Conn) {
 		if err != nil {
 			return // a corrupt frame closes the connection, as Cassandra does
 		}
-		if f.kind != kindRequest {
+		switch f.kind {
+		case kindRelayedResponse, kindRelayedError:
+			// The response to a request this node sent through another.
+			m.deliverRelayed(f, from)
+			continue
+		case kindRequest, kindForward, kindRelayed:
+		default:
 			continue
 		}
 		if f.deadline != 0 && time.Now().UnixNano() > f.deadline {
 			m.dropped[f.verb%numVerbs].Add(1)
 			continue
+		}
+		reply := func(kind byte, resp []byte) {
+			flag, resp := m.pack(resp)
+			wmu.Lock()
+			_ = writeFrame(c, kind|flag, f.verb, f.id, 0, resp)
+			wmu.Unlock()
+		}
+		handlerFrom := from
+		switch f.kind {
+		case kindForward:
+			targets, ids, body, err := decodeForward(f.payload)
+			if err != nil {
+				return
+			}
+			for i, to := range targets {
+				go m.relay(to, from, ids[i], f.verb, f.deadline, body, reply)
+			}
+			f.payload = body
+		case kindRelayed:
+			respondTo, body, err := decodeRespondTo(f.payload)
+			if err != nil {
+				return
+			}
+			f.payload, handlerFrom = body, respondTo
+			reply = func(kind byte, resp []byte) {
+				k := byte(kindRelayedResponse)
+				if kind == kindError {
+					k = kindRelayedError
+				}
+				_ = m.send(respondTo, k, f.verb, f.id, 0, resp)
+			}
 		}
 		// Hold the request's bytes while it is processed; past the limits,
 		// stop reading until some are released (backpressure).
@@ -564,7 +647,7 @@ func (m *Messaging) serve(c net.Conn) {
 		if release == nil {
 			return // closing
 		}
-		go m.dispatch(c, &wmu, from, f, release)
+		go m.dispatch(handlerFrom, f, release, reply)
 	}
 }
 
@@ -594,7 +677,8 @@ func waitTimeout(c *sync.Cond, d time.Duration) {
 	t.Stop()
 }
 
-func (m *Messaging) dispatch(c net.Conn, wmu *sync.Mutex, from string, f frame, release func()) {
+// dispatch runs a request's handler and answers through reply.
+func (m *Messaging) dispatch(from string, f frame, release func(), reply func(kind byte, resp []byte)) {
 	defer release()
 	ctx := context.Background()
 	cancel := func() {}
@@ -627,10 +711,7 @@ func (m *Messaging) dispatch(c net.Conn, wmu *sync.Mutex, from string, f frame, 
 	if herr != nil {
 		k, resp = kindError, []byte(herr.Error())
 	}
-	flag, resp := m.pack(resp)
-	wmu.Lock()
-	_ = writeFrame(c, k|flag, f.verb, f.id, 0, resp)
-	wmu.Unlock()
+	reply(k, resp)
 }
 
 // ---- outbound ----
@@ -707,6 +788,10 @@ func (m *Messaging) conn(to string, class int) (*outConn, error) {
 				oc.close(fmt.Errorf("cluster: connection to %s lost: %w", to, err))
 				return
 			}
+			if f.kind == kindRelayedResponse || f.kind == kindRelayedError {
+				m.deliverRelayed(f, to)
+				continue
+			}
 			oc.mu.Lock()
 			ch := oc.pending[f.id]
 			delete(oc.pending, f.id)
@@ -727,7 +812,11 @@ func (m *Messaging) conn(to string, class int) (*outConn, error) {
 // dial connects and performs the handshake.
 func (m *Messaging) dial(to string, class int) (net.Conn, error) {
 	const timeout = 2 * time.Second
-	c, err := net.DialTimeout("tcp", to, timeout)
+	addr := to
+	if f := m.dialAddr.Load(); f != nil {
+		addr = (*f)(to)
+	}
+	c, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -737,7 +826,7 @@ func (m *Messaging) dial(to string, class int) (net.Conn, error) {
 	if m.opts.TLS != nil {
 		cfg := m.opts.TLS.Clone()
 		if cfg.ServerName == "" {
-			cfg.ServerName, _, _ = net.SplitHostPort(to)
+			cfg.ServerName, _, _ = net.SplitHostPort(addr)
 		}
 		c = tls.Client(c, cfg)
 	}
@@ -769,6 +858,16 @@ func (m *Messaging) dial(to string, class int) (net.Conn, error) {
 
 // Request sends a request to node to and waits for its response.
 func (m *Messaging) Request(ctx context.Context, to string, verb Verb, payload []byte) ([]byte, error) {
+	return m.request(ctx, to, verb, kindRequest, payload)
+}
+
+// errNotSent wraps the failure of a request that never left this node.
+type errNotSent struct{ err error }
+
+func (e errNotSent) Error() string { return e.err.Error() }
+func (e errNotSent) Unwrap() error { return e.err }
+
+func (m *Messaging) request(ctx context.Context, to string, verb Verb, kind byte, payload []byte) ([]byte, error) {
 	if to == m.addr {
 		h := m.handlers[verb%numVerbs]
 		if h == nil {
@@ -779,14 +878,14 @@ func (m *Messaging) Request(ctx context.Context, to string, verb Verb, payload [
 	class := classOf(verb, len(payload))
 	oc, err := m.conn(to, class)
 	if err != nil {
-		return nil, err
+		return nil, errNotSent{err}
 	}
 	flag, packed := m.pack(payload)
 	size := int64(headerLen + len(packed))
 	release := reserve(size, oc.own, m.endpointBudget(m.outEndpoint, to, false), &m.outGlobal)
 	if release == nil {
 		m.overloaded.Add(1)
-		return nil, ErrOverloaded
+		return nil, errNotSent{ErrOverloaded}
 	}
 	defer release()
 	var deadline int64
@@ -798,12 +897,12 @@ func (m *Messaging) Request(ctx context.Context, to string, verb Verb, payload [
 	oc.mu.Lock()
 	if oc.err != nil {
 		oc.mu.Unlock()
-		return nil, oc.err
+		return nil, errNotSent{oc.err}
 	}
 	oc.pending[id] = ch
 	oc.mu.Unlock()
 	oc.wmu.Lock()
-	err = writeFrame(oc.c, kindRequest|flag, verb, id, deadline, packed)
+	err = writeFrame(oc.c, kind|flag, verb, id, deadline, packed)
 	oc.wmu.Unlock()
 	if err != nil {
 		oc.close(err)

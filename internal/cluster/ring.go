@@ -31,6 +31,10 @@ type Node struct {
 	ReleaseVersion string
 	// Replaces is the host id of the dead node a joining node replaces.
 	Replaces string `json:",omitempty"`
+	// InternalAddr is the internode address the node listens on, when it
+	// differs from Addr (the one it is known by): nodes of its data center
+	// connect to it there (prefer_local).
+	InternalAddr string `json:",omitempty"`
 	// Ordinal is a small number unique among the cluster's nodes (from 1),
 	// assigned when the node registers: it tags the node's transaction
 	// timestamps (Accord's hybrid logical clock).

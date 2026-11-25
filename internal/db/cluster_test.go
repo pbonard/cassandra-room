@@ -548,6 +548,60 @@ func TestClusterEachQuorum(t *testing.T) {
 	c.ok(1, primitive.ConsistencyLevelLocalQuorum, "INSERT INTO ks.kv (k, v) VALUES (2, 'y')")
 }
 
+// TestClusterForwarding: a write reaches each other data center's replicas
+// with one message across, forwarded there (FORWARD_TO), and a replica the
+// forwarding node cannot reach is hinted.
+func TestClusterForwarding(t *testing.T) {
+	c := newTestCluster(t, 6, "dc1", "dc1", "dc1", "dc2", "dc2", "dc2")
+	all := primitive.ConsistencyLevelAll
+	c.ok(0, all, "CREATE KEYSPACE ks WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': 3, 'dc2': 3}")
+	c.ok(0, all, "CREATE TABLE ks.kv (k int PRIMARY KEY, v text)")
+	stats := func(i int) cluster.Stats { return c.nodes[i].proxy.m.Stats() }
+	relayed := func() (n uint64) {
+		for i := 3; i < 6; i++ {
+			n += stats(i).Relayed
+		}
+		return n
+	}
+	forwards, before := stats(0).Forwards, relayed()
+	const writes = 20
+	for i := 0; i < writes; i++ {
+		c.ok(0, all, "INSERT INTO ks.kv (k, v) VALUES (?, 'x')", i)
+	}
+	c.checkReplicas(writes)
+	require.EqualValues(t, writes, stats(0).Forwards-forwards, "one message to dc2 per write")
+	require.EqualValues(t, 2*writes, relayed()-before, "forwarded to the two other replicas there")
+	// A batch of two partitions: every node replicates both (RF 3 per data
+	// center of 3 nodes), so dc2's replicas receive the same writes, in
+	// one message across.
+	forwards = stats(0).Forwards
+	c.ok(0, all, "BEGIN UNLOGGED BATCH INSERT INTO ks.kv (k, v) VALUES (100, 'b'); INSERT INTO ks.kv (k, v) VALUES (101, 'b') APPLY BATCH")
+	require.EqualValues(t, 1, stats(0).Forwards-forwards)
+	require.Equal(t, []string{"b"}, c.values(5, all, "SELECT v FROM ks.kv WHERE k = 101"))
+	// LOCAL_QUORUM: dc2 still gets the write, forwarded, without waiting.
+	c.ok(0, primitive.ConsistencyLevelLocalQuorum, "INSERT INTO ks.kv (k, v) VALUES (200, 'l')")
+	require.Eventually(t, func() bool {
+		for i := 3; i < 6; i++ {
+			res := c.nodes[i].Execute(mustPrepare(t, c.nodes[i], "SELECT v FROM ks.kv WHERE k = 200"), &RequestOptions{Consistency: one, local: true})
+			if len(res.(*message.RowsResult).Data) != 1 {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, 20*time.Millisecond)
+	// A dc2 replica down during a LOCAL_ONE write is hinted, and gets the
+	// write once it is back.
+	c.stop(5)
+	require.Eventually(t, func() bool { return !c.nodes[0].proxy.g.IsAlive(c.addrs[5]) }, 5*time.Second, 10*time.Millisecond)
+	c.ok(0, primitive.ConsistencyLevelLocalOne, "INSERT INTO ks.kv (k, v) VALUES (300, 'h')")
+	c.start(5)
+	c.waitConverged()
+	require.Eventually(t, func() bool {
+		res := c.nodes[5].Execute(mustPrepare(t, c.nodes[5], "SELECT v FROM ks.kv WHERE k = 300"), &RequestOptions{Consistency: one, local: true})
+		return len(res.(*message.RowsResult).Data) == 1
+	}, 20*time.Second, 50*time.Millisecond, "hint replayed")
+}
+
 // TestClusterCounters updates counters of many partitions per statement
 // (IN, counter batches) from every coordinator concurrently.
 func TestClusterCounters(t *testing.T) {

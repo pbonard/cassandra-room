@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -46,6 +48,13 @@ func main() {
 		numTokens             = flag.Int("num-tokens", 16, "Number of tokens (vnodes) of this node")
 		dataCenter            = flag.String("dc", "datacenter1", "Data center of this node")
 		rack                  = flag.String("rack", "rack1", "Rack of this node")
+		broadcastAddress      = flag.String("broadcast-address", "", "Internode address host:port other nodes connect to and know this node by (broadcast_address), if not -listen-address (NAT, another network)")
+		broadcastRPCAddress   = flag.String("broadcast-rpc-address", "", "Address clients are told to connect to (broadcast_rpc_address, in system.local and system.peers); required when -addr listens on all interfaces in a cluster")
+		preferLocal           = flag.Bool("prefer-local", false, "Nodes of the same data center connect to each other at their -listen-address (prefer_local)")
+		clientCert            = flag.String("client-cert", "", "PEM certificate for client (native protocol) TLS, with -client-key (client_encryption_options)")
+		clientKey             = flag.String("client-key", "", "PEM private key for client TLS")
+		clientCA              = flag.String("client-ca", "", "PEM CA client certificates must chain to; set, clients must present one (require_client_auth)")
+		clientTLSOptional     = flag.Bool("client-tls-optional", false, "Also accept unencrypted client connections on the same port (optional: true)")
 		adminAddress          = flag.String("admin-address", "", "HTTP address for nodetool-style operations: GET /status, POST /repair?keyspace=, POST /cleanup?keyspace=, POST /removenode?node=, POST /cms/reconfigure?members=, POST /decommission")
 	)
 	flag.Parse()
@@ -58,15 +67,34 @@ func main() {
 		log.Fatalf("invalid -addr %q: %v", *addr, err)
 	}
 	port, _ := strconv.Atoi(portStr)
+	// The address clients are told to connect to: -broadcast-rpc-address,
+	// else the one listened on (which must then name an address).
 	ip := net.ParseIP(host)
-	if ip == nil || ip.IsUnspecified() {
-		ip = net.IPv4(127, 0, 0, 1)
+	if host != "" && ip == nil {
+		ip = resolve(host)
+	}
+	if *broadcastRPCAddress != "" {
+		ip = net.ParseIP(*broadcastRPCAddress)
+		if ip == nil {
+			ip = resolve(*broadcastRPCAddress)
+		}
+	} else if ip == nil || ip.IsUnspecified() {
+		if *listenAddress != "" {
+			log.Fatalf("-addr %q listens on every interface: set -broadcast-rpc-address to the address clients reach this node at", *addr)
+		}
+		ip = net.IPv4(127, 0, 0, 1) // a single node, for local use
 	}
 	opts := db.Options{SyncWrites: *commitlogSync == "batch", ClusterName: *clusterName, Address: ip, Port: port,
 		Authenticator: *authenticator == "PasswordAuthenticator", Authorizer: *authorizer == "CassandraAuthorizer"}
 	opts.DataCenter, opts.Rack = *dataCenter, *rack
 	if *listenAddress != "" {
-		opts.Cluster = &db.ClusterOptions{ListenAddress: *listenAddress, NumTokens: *numTokens, ReplaceAddress: *replaceAddress}
+		opts.Cluster = &db.ClusterOptions{ListenAddress: *listenAddress, NumTokens: *numTokens, ReplaceAddress: *replaceAddress,
+			BroadcastAddress: resolveHostPort(*broadcastAddress), PreferLocal: *preferLocal}
+		if lh, _, err := net.SplitHostPort(*listenAddress); err != nil {
+			log.Fatalf("invalid -listen-address %q: %v", *listenAddress, err)
+		} else if lip := net.ParseIP(lh); (lh == "" || lip != nil && lip.IsUnspecified()) && *broadcastAddress == "" {
+			log.Fatalf("-listen-address %q listens on every interface: set -broadcast-address to the address other nodes reach this node at", *listenAddress)
+		}
 		opts.Cluster.Messaging.Compress = *internodeCompression
 		if *internodeCert != "" {
 			cfg, err := cluster.TLSConfig(*internodeCert, *internodeKey, *internodeCA, *internodeVerifyHost)
@@ -108,6 +136,13 @@ func main() {
 		srv.SetMaxFrameSize(*maxFrameSize)
 	}
 	srv.SetWriteTimeout(*writeTimeout)
+	if *clientCert != "" {
+		cfg, err := clientTLS(*clientCert, *clientKey, *clientCA)
+		if err != nil {
+			log.Fatal(err)
+		}
+		srv.SetTLS(cfg, *clientTLSOptional)
+	}
 
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
@@ -194,4 +229,57 @@ func serveAdmin(addr string, d *db.DB) {
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Printf("admin endpoint: %v", err)
 	}
+}
+
+// clientTLS is the TLS configuration of the native port: the node's
+// certificate and, with a CA, required client certificates.
+func clientTLS(certFile, keyFile, caFile string) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("client TLS: %w", err)
+	}
+	cfg := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	if caFile != "" {
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("client TLS: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("client TLS: no certificate in %s", caFile)
+		}
+		cfg.ClientCAs, cfg.ClientAuth = pool, tls.RequireAndVerifyClientCert
+	}
+	return cfg, nil
+}
+
+// resolve looks up a host name's address, as Cassandra resolves its
+// configured addresses at startup.
+func resolve(host string) net.IP {
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		log.Fatalf("cannot resolve %q: %v", host, err)
+	}
+	for _, ip := range ips {
+		if v4 := ip.To4(); v4 != nil {
+			return v4
+		}
+	}
+	return ips[0]
+}
+
+// resolveHostPort resolves the host of a "host:port" address to an IP
+// (nodes are known by IP, as in system.peers).
+func resolveHostPort(addr string) string {
+	if addr == "" {
+		return ""
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		log.Fatalf("invalid address %q: %v", addr, err)
+	}
+	if net.ParseIP(host) == nil {
+		host = resolve(host).String()
+	}
+	return net.JoinHostPort(host, port)
 }

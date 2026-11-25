@@ -9,6 +9,40 @@ levels and the same failure behaviour seen from drivers. Everything is in
 cassandra-room -addr 10.0.0.1:9042 -listen-address 10.0.0.1:7000 -seeds 10.0.0.1:7000 -admin-address 10.0.0.1:7199
 ```
 
+## Addresses
+
+As Cassandra's, each node has an address it listens on and an address it is
+known by, for other nodes and for clients:
+
+| | Listens on | Known by |
+|---|---|---|
+| Internode | `-listen-address` (`listen_address`) | `-broadcast-address` (`broadcast_address`), default the listen address |
+| Clients | `-addr` (`rpc_address`) | `-broadcast-rpc-address` (`broadcast_rpc_address`), default the `-addr` host |
+
+The broadcast address is the node's identity: other nodes connect to it, the
+cluster metadata and seeds name it, and `system.peers` lists it. It is for
+nodes that cannot be reached at the address they listen on: behind NAT, in
+another network or Kubernetes cluster (`-listen-address 0.0.0.0:7000` needs
+one). The client broadcast address is what drivers find in `system.local`
+and `system.peers` and connect to (`-addr :9042` in a cluster needs one).
+Host names are resolved at startup.
+
+With `-prefer-local` (`prefer_local`), nodes of the same data center connect
+to each other at their listen addresses, recorded in the cluster metadata,
+and use broadcast addresses only across data centers; `system.peers` shows
+the listen address as `preferred_ip`. With internode TLS and
+`-internode-verify-hostname`, a certificate is checked against the address
+connected to, so it names both.
+
+## Client encryption
+
+`-client-cert` and `-client-key` encrypt the native port
+(`client_encryption_options`); with `-client-ca`, clients must also present
+a certificate signed by that CA (`require_client_auth`), and with
+`-client-tls-optional` the port also accepts unencrypted connections
+(`optional: true`, told apart by the first byte of a TLS handshake). The
+handshake must complete within 10 seconds.
+
 ## Membership and ring
 
 Cassandra's legacy design gossips everything (tokens, status, schema
@@ -96,8 +130,22 @@ is a linearized log of epochs**.
 Statements run through a storage interface: the local engine on a single
 node, the coordinator in a cluster.
 
-- **Writes** go to every replica of each partition; the coordinator waits
-  for the consistency level's blockFor acks per partition. Too few live
+- **Writes** go to every replica of each partition, in every data center;
+  the coordinator waits for the consistency level's blockFor acks per
+  partition (for `LOCAL_ONE`, `LOCAL_QUORUM` and `LOCAL_SERIAL`, acks from
+  this data center only: the others still get the write).
+- **Forwarding** (`FORWARD_TO`, `sendMessagesToNonlocalDC`): replicas in
+  this data center are sent the write directly. In each other data center,
+  replicas receiving the same writes are sent one message, to a random one
+  of them, which delivers it to the others over its own connections; each
+  answers the coordinator directly (`RESPOND_TO`). So a write crosses to
+  each data center once instead of once per replica. A replica the
+  forwarding node cannot reach is reported to the coordinator as failed
+  (and hinted); if the forwarding node itself cannot be sent the message,
+  the others are sent it directly. Forwarding needs messaging version 5,
+  so a node still on version 4 is always sent its writes directly. A replica
+  that does not answer within the write timeout is hinted, as one that
+  fails. Too few live
   replicas: `Unavailable`; no answer in time: `WriteTimeout`. Down or
   failing replicas get **hints**, stored locally and replayed when they come
   back (and every 5 s), as Cassandra's hinted handoff: no hints for a node
