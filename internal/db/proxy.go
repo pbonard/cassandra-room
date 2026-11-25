@@ -80,10 +80,10 @@ type ClusterOptions struct {
 type proxy struct {
 	// testRefuseMutations makes the node refuse MUTATION messages (tests).
 	testRefuseMutations atomic.Pointer[bool]
-	d   *DB
-	m   *cluster.Messaging
-	g   *cluster.Gossiper
-	cms *cluster.CMS
+	d                   *DB
+	m                   *cluster.Messaging
+	g                   *cluster.Gossiper
+	cms                 *cluster.CMS
 	// accord runs Accord transactions (transactional_mode tables).
 	accord *accord.Node
 	lats   sync.Map // lsm.TableID -> *readLatency, for speculative retry

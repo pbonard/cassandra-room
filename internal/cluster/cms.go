@@ -134,7 +134,12 @@ type paxosResp struct {
 	OK bool
 	// Behind is set when the acceptor already has this epoch committed:
 	// the proposer must catch up first.
-	Behind   bool
+	Behind bool
+	// Lagging is set when the acceptor misses epochs before this one: it
+	// does not vote until it has caught up (it does so in the background),
+	// so that every member counted in a quorum knows the log, and the
+	// members, that the epoch builds on.
+	Lagging  bool
 	Accepted ballot
 	Value    []byte
 	Promised ballot
@@ -181,13 +186,17 @@ func (c *CMS) acceptorLocked(epoch int64) *acceptor {
 	return a
 }
 
-func (c *CMS) handlePrepare(ctx context.Context, _ string, payload []byte) ([]byte, error) {
+func (c *CMS) handlePrepare(ctx context.Context, from string, payload []byte) ([]byte, error) {
 	var r paxosReq
 	if err := json.Unmarshal(payload, &r); err != nil {
 		return nil, err
 	}
 	if c.epoch() >= r.Epoch {
 		return json.Marshal(paxosResp{Behind: true})
+	}
+	if c.epoch() < r.Epoch-1 {
+		go func() { _ = c.CatchUp(from) }()
+		return json.Marshal(paxosResp{Lagging: true})
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -196,15 +205,17 @@ func (c *CMS) handlePrepare(ctx context.Context, _ string, payload []byte) ([]by
 		return json.Marshal(paxosResp{Promised: a.Promised})
 	}
 	if a.Promised.less(r.Ballot) {
+		old := *a
 		a.Promised = r.Ballot
 		if err := c.persistLocked(); err != nil {
+			*a = old // not promised: nothing durable says so
 			return nil, err
 		}
 	}
 	return json.Marshal(paxosResp{OK: true, Accepted: a.Accepted, Value: a.Value})
 }
 
-func (c *CMS) handleAccept(ctx context.Context, _ string, payload []byte) ([]byte, error) {
+func (c *CMS) handleAccept(ctx context.Context, from string, payload []byte) ([]byte, error) {
 	var r paxosReq
 	if err := json.Unmarshal(payload, &r); err != nil {
 		return nil, err
@@ -212,14 +223,20 @@ func (c *CMS) handleAccept(ctx context.Context, _ string, payload []byte) ([]byt
 	if c.epoch() >= r.Epoch {
 		return json.Marshal(paxosResp{Behind: true})
 	}
+	if c.epoch() < r.Epoch-1 {
+		go func() { _ = c.CatchUp(from) }()
+		return json.Marshal(paxosResp{Lagging: true})
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	a := c.acceptorLocked(r.Epoch)
 	if r.Ballot.less(a.Promised) {
 		return json.Marshal(paxosResp{Promised: a.Promised})
 	}
+	old := *a
 	a.Promised, a.Accepted, a.Value = r.Ballot, r.Ballot, r.Value
 	if err := c.persistLocked(); err != nil {
+		*a = old // not accepted: nothing durable says so
 		return nil, err
 	}
 	return json.Marshal(paxosResp{OK: true})
@@ -457,10 +474,24 @@ func (c *CMS) Commit(ctx context.Context, plan func(meta []byte, id string) ([]b
 	}
 }
 
+// catchUpFromMembers catches up from the members, asking each in turn until
+// this node's epoch advances (one that answers may be no further ahead).
 func (c *CMS) catchUpFromMembers(members []string) {
+	start := c.epoch()
 	for _, mb := range members {
-		if mb != c.self && c.CatchUp(mb) == nil {
+		if mb != c.self && c.CatchUp(mb) == nil && c.epoch() > start {
 			return
+		}
+	}
+}
+
+// CatchUpFromMembers brings this node up to date from the metadata
+// service's members.
+func (c *CMS) CatchUpFromMembers() {
+	_, _, members := c.store.Current()
+	for _, mb := range members {
+		if mb != c.self {
+			_ = c.CatchUp(mb)
 		}
 	}
 }
