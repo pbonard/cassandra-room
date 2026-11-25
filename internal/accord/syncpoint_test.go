@@ -129,17 +129,25 @@ func TestBootstrapSyncPoint(t *testing.T) {
 	c.setRanges(false, 0)
 	_, err := c.node(0).Coordinate(context.Background(), appendTxn(t, c.keys[0], 1))
 	require.NoError(t, err)
-	require.NoError(t, c.node(2).Bootstrap(context.Background(), []Range{{Lo: math.MinInt64, Hi: math.MaxInt64}}))
-	at := c.node(2).bootstrappedBefore()
+	k := c.keys[0]
+	half := Range{Lo: math.MinInt64, Hi: -1}
+	if k.Token >= 0 {
+		half = Range{Lo: 0, Hi: math.MaxInt64}
+	}
+	require.NoError(t, c.node(2).Bootstrap(context.Background(), []Range{half}))
+	at := c.node(2).bootstrappedBefore(k)
 	require.False(t, at.IsZero())
+	other := Key{Token: -1 - k.Token, ID: k.ID} // in the other half
+	require.True(t, c.node(2).bootstrappedBefore(other).IsZero(), "only the bootstrapped range")
 	// Every replica applied the transaction before the sync point.
 	for _, id := range c.ids {
-		require.Len(t, c.stores[id].data[keyString(c.keys[0])], 1)
+		require.Len(t, c.stores[id].data[keyString(k)], 1)
 	}
-	// The bootstrap point survives a restart.
+	// The bootstrap points survive a restart.
 	c.crash(2)
 	c.start(2)
-	require.Equal(t, at, c.node(2).bootstrappedBefore())
+	require.Equal(t, at, c.node(2).bootstrappedBefore(k))
+	require.True(t, c.node(2).bootstrappedBefore(other).IsZero())
 }
 
 // TestMajorityDurability: with a replica down, durability rounds fall back

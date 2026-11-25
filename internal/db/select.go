@@ -573,10 +573,11 @@ func (s *selectStmt) execute(e *execCtx) (message.Message, error) {
 				}
 				return res, nil
 			}
-			for _, k := range keys {
-				if err := d.proxy.accordBarrierKey(k); err != nil {
-					return nil, err
-				}
+			// One read-only transaction over every partition (not one
+			// each): every transaction decided before it is applied on all
+			// of them before the read.
+			if err := d.proxy.accordBarrierKeys(keys); err != nil {
+				return nil, err
 			}
 		} else if serial && d.proxy != nil && !e.local {
 			// A SERIAL read first runs an Accord read-only transaction on the
