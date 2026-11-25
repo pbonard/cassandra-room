@@ -2,8 +2,8 @@ package manage
 
 import (
 	"bytes"
-	"io"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
