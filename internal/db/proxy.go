@@ -1505,30 +1505,54 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 			stale = append(stale, r.node.Addr)
 		}
 	}
-	if len(stale) > 0 {
+	if len(stale) > 0 && s.readRepair() {
+		// Blocking: the read returns once the replicas it read agree, or
+		// times out (BlockingReadRepair), so a later read at the same
+		// consistency sees at least as much.
 		s.trace.event("Read repair of %v", stale)
-		s.p.repair(stale, []write{{table: s.id, key: key, value: merged, token: tokenOf(key)}})
+		if err := s.p.repair(stale, []write{{table: s.id, key: key, value: merged, token: tokenOf(key)}}); err != nil {
+			s.trace.event("Read repair failed: %v", err)
+			return nil, timeout()
+		}
 	}
 	return merged, nil
 }
 
 // repair writes merged rows to replicas that were behind (ReadRepair).
-func (p *proxy) repair(addrs []string, ws []write) {
+func (p *proxy) repair(addrs []string, ws []write) error {
 	ctx, cancel := context.WithTimeout(context.Background(), p.opts.WriteTimeout)
 	defer cancel()
 	var wg sync.WaitGroup
+	errs := make(chan error, len(addrs))
 	for _, a := range addrs {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			if a == p.self {
-				_ = p.d.applyLocal(ws)
+				errs <- p.d.applyLocal(ws)
 				return
 			}
-			_, _ = p.m.Request(ctx, a, cluster.VerbMutation, encodeWrites(ws))
+			_, err := p.m.Request(ctx, a, cluster.VerbMutation, encodeWrites(ws))
+			errs <- err
 		}()
 	}
 	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readRepair reports whether reads of the table repair the replicas they
+// read (read_repair 'BLOCKING', the default) or not ('NONE').
+func (s *distSource) readRepair() bool {
+	if t := s.p.d.schema.Load().byStorage[s.id]; t != nil {
+		return t.Params.ReadRepair != "NONE"
+	}
+	return true
 }
 
 const rangePage = 512
@@ -1763,7 +1787,7 @@ func (it *distIter) fetch(reps []*cluster.Node, need ackNeed, from, to []byte) (
 	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i].k, out[j].k) < 0 })
 	// Blocking read repair: replicas that returned less get the merged rows
 	// (DataResolver).
-	if len(got) > 1 {
+	if len(got) > 1 && it.s.readRepair() {
 		for _, r := range got {
 			have := make(map[string][]byte, len(r.kvs))
 			for _, e := range r.kvs {
@@ -1776,7 +1800,10 @@ func (it *distIter) fetch(reps []*cluster.Node, need ackNeed, from, to []byte) (
 				}
 			}
 			if len(ws) > 0 {
-				p.repair([]string{r.node.Addr}, ws)
+				if err := p.repair([]string{r.node.Addr}, ws); err != nil {
+					it.s.trace.event("Read repair of %s failed: %v", r.node.Addr, err)
+					return nil, nil, timeout()
+				}
 			}
 		}
 	}
