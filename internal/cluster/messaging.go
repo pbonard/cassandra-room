@@ -47,6 +47,18 @@ const (
 	numVerbs
 )
 
+var verbNames = [numVerbs]string{"", "GOSSIP", "MUTATION", "READ_ROW", "READ_RANGE", "REPAIR", "PING", "PING_REQ", "BROADCAST",
+	"PAXOS_PREPARE", "PAXOS_ACCEPT", "METADATA_FETCH", "METADATA_PUSH", "STREAM_PUSH", "READ_DIGEST", "COUNTER_MUTATION",
+	"STREAM_FILE", "METADATA_SYNC", "ACCORD"}
+
+// String names a verb.
+func (v Verb) String() string {
+	if int(v) < len(verbNames) && verbNames[v] != "" {
+		return verbNames[v]
+	}
+	return fmt.Sprintf("VERB_%d", uint8(v))
+}
+
 // Handler handles a request and returns the response payload. ctx
 // carries the request's deadline: work the requester has given up on can
 // stop.

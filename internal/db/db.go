@@ -55,11 +55,13 @@ type Options struct {
 
 // DB is a single-node Cassandra database.
 type DB struct {
-	opts   Options
-	fs     vfs.FS
-	dir    string
-	engine *lsm.Engine
-	wo     *lsm.WriteOptions
+	opts Options
+	fs   vfs.FS
+	// metrics are the node's Prometheus metrics.
+	metrics *dbMetrics
+	dir     string
+	engine  *lsm.Engine
+	wo      *lsm.WriteOptions
 
 	// ddlMu serializes schema changes; tableMu is held shared by every
 	// statement touching storage and exclusively by DROP and TRUNCATE,
@@ -152,6 +154,7 @@ func Open(dir string, opts Options) (*DB, error) {
 		opts.Port = 9042
 	}
 	d := &DB{opts: opts, fs: opts.FS, dir: dir, wo: lsm.NoSync, streamHook: opts.StreamHook}
+	d.metrics = newMetrics(d)
 	d.store = localStorage{d}
 	if opts.SyncWrites {
 		d.wo = lsm.Sync

@@ -293,10 +293,17 @@ func (d *DB) current(p *Prepared) (*prepState, error) {
 // Execute executes a prepared statement and returns the response message
 // (a result or an error).
 func (d *DB) Execute(p *Prepared, o *RequestOptions) message.Message {
+	start := time.Now()
 	st, err := d.current(p)
 	if err != nil {
 		return ErrorMessage(err)
 	}
+	res := d.execute(p, st, o)
+	d.metrics.observe(requestKind(st.stmt), o.Consistency, res, time.Since(start))
+	return res
+}
+
+func (d *DB) execute(p *Prepared, st *prepState, o *RequestOptions) message.Message {
 	e, err := d.newCtx(o, st)
 	if e != nil && e.trace != nil {
 		e.trace.event("Executing %s at %s", statementKind(st.stmt), clName(o.Consistency))
@@ -338,6 +345,13 @@ type BatchChild struct {
 // ExecuteBatch executes a protocol BATCH message (BatchStatement): every
 // child's mutations are applied atomically, with the batch's timestamp.
 func (d *DB) ExecuteBatch(typ primitive.BatchType, children []BatchChild, o *RequestOptions) message.Message {
+	start := time.Now()
+	res := d.executeBatch(typ, children, o)
+	d.metrics.observe("write", o.Consistency, res, time.Since(start))
+	return res
+}
+
+func (d *DB) executeBatch(typ primitive.BatchType, children []BatchChild, o *RequestOptions) message.Message {
 	if len(children) == 0 {
 		return &message.VoidResult{}
 	}

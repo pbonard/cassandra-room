@@ -389,6 +389,13 @@ func (s *Server) serveConn(conn net.Conn) error {
 
 // SetMaxConcurrentRequests configures the global request concurrency limit across
 // all connections on this server. Safe to call before or during Serve.
+// Connections is the number of client connections open.
+func (s *Server) Connections() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.conns)
+}
+
 func (s *Server) SetMaxConcurrentRequests(limit int) {
 	s.admission.setMaxRequests(limit)
 }

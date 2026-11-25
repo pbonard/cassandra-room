@@ -203,6 +203,7 @@ client certificates (`-admin-ca`):
 | `POST /api/v1/repair` | `{"keyspace","table","start","end"}`: a token range (start, end], wrapping allowed, or the whole keyspace |
 | `POST /api/v1/snapshots`, `DELETE /api/v1/snapshots/{name}` | snapshot user keyspaces (returns each table's files), clear |
 | `POST /api/v1/import` | `{"keyspace","table","files"}`: load sstables into a table on this node |
+| `GET /metrics` | Prometheus metrics: client requests' latency (by kind and consistency level) and errors (timeouts, unavailables...), each table's size, sstables and memtables, flushes and compactions, hints, nodes up and down by data center, dropped and forwarded messages, thread pools, Accord's paths, recoveries and queues, native connections, the Go runtime and process |
 
 A restore is a truncate (new, empty storage on every node) followed by each
 node importing its own snapshot files. `-flags-file` reads further flags

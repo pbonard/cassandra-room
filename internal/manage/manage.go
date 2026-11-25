@@ -18,6 +18,7 @@
 //	POST   /api/v1/snapshots       {"name","keyspaces"}: the snapshot's files
 //	DELETE /api/v1/snapshots/{name}
 //	POST   /api/v1/import          {"keyspace","table","files"}
+//	GET    /metrics                Prometheus metrics
 //
 // Errors are {"error": "..."} with a 4xx or 5xx status. The text endpoints
 // of earlier versions (GET /status, POST /repair, /cleanup, /removenode,
@@ -33,6 +34,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/pbonard/cassandra-room/internal/db"
 )
@@ -66,6 +69,7 @@ func Handler(d *db.DB, serving func() bool) http.Handler {
 		h.done(w, d.ClearSnapshot(r.PathValue("name")))
 	})
 	mux.HandleFunc("POST /api/v1/import", h.importFiles)
+	mux.Handle("GET /metrics", promhttp.HandlerFor(d.Registry(), promhttp.HandlerOpts{}))
 	legacy(mux, d)
 	return mux
 }
