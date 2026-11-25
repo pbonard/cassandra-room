@@ -184,6 +184,30 @@ node, the coordinator in a cluster.
 - Drivers see the cluster through `system.peers`/`peers_v2` and route
   token-aware.
 
+## Management API
+
+`-admin-address` serves the management API (`internal/manage`), what an
+operator needs of a node (Cassandra's Management API and nodetool), as JSON
+over HTTP, optionally with TLS (`-admin-cert`, `-admin-key`) and required
+client certificates (`-admin-ca`):
+
+| | |
+|---|---|
+| `GET /api/v1/health`, `/api/v1/ready` | liveness; readiness (in the ring and serving clients) |
+| `GET /api/v1/node`, `/api/v1/nodes` | this node; every node (address, host id, data center, rack, status, up, tokens, metadata service membership) |
+| `GET /api/v1/ring?keyspace=` | ranges and their replicas (`describering`) |
+| `POST /api/v1/flush` | flush every memtable |
+| `POST /api/v1/decommission` | leave the ring, in the background (`/node` shows LEAVING, then LEFT) |
+| `POST /api/v1/cleanup?keyspace=`, `/removenode?node=`, `/cms?members=` | as nodetool |
+| `POST /api/v1/repair` | `{"keyspace","table","start","end"}`: a token range (start, end], wrapping allowed, or the whole keyspace |
+| `POST /api/v1/snapshots`, `DELETE /api/v1/snapshots/{name}` | snapshot user keyspaces (returns each table's files), clear |
+| `POST /api/v1/import` | `{"keyspace","table","files"}`: load sstables into a table on this node |
+
+A restore is a truncate (new, empty storage on every node) followed by each
+node importing its own snapshot files. `-flags-file` reads further flags
+from a file, one per line (the command line overrides them), for an init
+container to set per-pod flags.
+
 ## Topology (admin endpoint)
 
 - **Streaming** (`internal/db/stream.go`) moves ranges as sstable files,
