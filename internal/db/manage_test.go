@@ -2,6 +2,7 @@ package db
 
 import (
 	"math"
+	"slices"
 	"testing"
 	"time"
 
@@ -97,4 +98,41 @@ func TestClusterManagement(t *testing.T) {
 		require.NoError(t, c.nodes[i].ClearSnapshot("b1"))
 	}
 	require.Len(t, c.values(1, primitive.ConsistencyLevelAll, "SELECT k FROM ks.kv"), 20)
+}
+
+// TestClusterAddressChange: nodes restarted at new internode addresses (a
+// pod's IP changes) keep their place, in the metadata service too, even its
+// only member.
+func TestClusterAddressChange(t *testing.T) {
+	c := newTestCluster(t, 3)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}")
+	c.ok(0, quorum, "CREATE TABLE ks.kv (k int PRIMARY KEY, v text)")
+	c.ok(0, quorum, "INSERT INTO ks.kv (k, v) VALUES (1, 'a')")
+	cms := func() []string { return c.nodes[1].proxy.cmsMembers() }
+	require.Equal(t, []string{c.addrs[0]}, cms())
+
+	// The only member of the metadata service moves.
+	c.stop(0)
+	c.addrs[0] = freeAddr(t)
+	c.start(0)
+	c.waitConverged()
+	require.Eventually(t, func() bool {
+		return len(cms()) == 1 && cms()[0] == c.addrs[0]
+	}, 10*time.Second, 50*time.Millisecond, "member list follows the new address: %v", cms())
+	c.ok(1, quorum, "CREATE TABLE ks.after (k int PRIMARY KEY)")
+
+	// With three members, one moves.
+	require.NoError(t, c.nodes[0].ReconfigureCMS(c.addrs))
+	c.stop(2)
+	c.addrs[2] = freeAddr(t)
+	c.start(2)
+	c.waitConverged()
+	require.Eventually(t, func() bool { return slices.Contains(cms(), c.addrs[2]) }, 10*time.Second, 50*time.Millisecond)
+	require.Len(t, cms(), 3)
+	c.ok(2, quorum, "CREATE TABLE ks.after2 (k int PRIMARY KEY)")
+	require.Equal(t, []string{"a"}, c.values(2, quorum, "SELECT v FROM ks.kv WHERE k = 1"))
+	for _, n := range c.nodes[1].Nodes() {
+		require.Equal(t, "NORMAL", n.Status)
+	}
+	require.Len(t, c.nodes[1].Nodes(), 3)
 }
