@@ -211,7 +211,13 @@ names, not its class structure.
 `internal/db/accord.go` connects the protocol to the database:
 
 - **Every table** runs its conditional statements (and conditional
-  batches) and SERIAL reads on Accord: Paxos was removed. The
+  batches), its LOGGED batches spanning several partitions, and SERIAL
+  reads on Accord: Paxos was removed, and there is no batchlog. A logged
+  batch is then atomic (all or nothing, and never seen half applied); its
+  cells keep the client's timestamp (`USING TIMESTAMP`, or the protocol
+  batch's), and it needs a quorum of each partition's replicas, whatever
+  the consistency level. UNLOGGED and COUNTER batches, and logged ones on
+  one partition (atomic anyway), are applied as plain writes. The
   `transactional_mode` table option chooses what else does:
   - `off` (the default): nothing else. The transaction reads the
     conditions at QUORUM from the executing replica (`AccordInteropRead`),

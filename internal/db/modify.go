@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/datastax/go-cassandra-native-protocol/message"
+	"github.com/pbonard/cassandra-room/internal/accord"
 	"github.com/pbonard/cassandra-room/internal/cql"
 	"github.com/pbonard/cassandra-room/internal/storage/lsm"
 	"github.com/pbonard/cassandra-room/internal/storage/row"
@@ -329,6 +330,27 @@ func (m *modification) execute(e *execCtx) (message.Message, error) {
 	return &message.VoidResult{}, nil
 }
 
+// multiPartition reports whether statements write more than one partition.
+func multiPartition(mods []boundModification) (bool, error) {
+	var first accord.Key
+	n := 0
+	for _, bm := range mods {
+		ks, err := stmtPartitions(bm.e, bm.m.t, bm.m.where)
+		if err != nil {
+			return false, err
+		}
+		for _, k := range ks {
+			if n == 0 {
+				first = k
+			} else if k.Compare(first) != 0 {
+				return true, nil
+			}
+			n++
+		}
+	}
+	return false, nil
+}
+
 type boundModification struct {
 	m *modification
 	e *execCtx
@@ -341,6 +363,13 @@ func (d *DB) applyModifications(mods []boundModification, batchCtx *execCtx) err
 			return invalidf("A batch cannot mix tables with and without transactional_mode 'full'")
 		}
 		return d.proxy.accordWrite(mods, batchCtx)
+	}
+	if d.proxy != nil && batchCtx.logged && len(mods) > 1 && !mods[0].m.isCounter() {
+		if many, err := multiPartition(mods); err != nil {
+			return err
+		} else if many {
+			return d.proxy.accordWrite(mods, batchCtx)
+		}
 	}
 	if d.proxy != nil && mods[0].m.isCounter() {
 		// Counter deltas, applied by each partition's leader.
@@ -952,10 +981,11 @@ func deletionCell(ts, nowSec int64) row.Cell {
 type batchStmt struct {
 	mods        []*modification
 	conditional bool
+	logged      bool
 }
 
 func (d *DB) prepareBatch(s *Schema, session string, st *cql.Batch, vs *vars) (*batchStmt, error) {
-	b := &batchStmt{}
+	b := &batchStmt{logged: st.Type == "LOGGED"}
 	for _, raw := range st.Statements {
 		m, err := d.prepareModification(s, session, raw, vs)
 		if err != nil {
@@ -995,6 +1025,7 @@ func (b *batchStmt) execute(e *execCtx) (message.Message, error) {
 	if b.conditional {
 		return e.d.executeCAS(mods, e)
 	}
+	e.logged = b.logged
 	if err := e.d.applyModifications(mods, e); err != nil {
 		return nil, err
 	}

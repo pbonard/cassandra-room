@@ -173,6 +173,9 @@ type execCtx struct {
 	serial  primitive.ConsistencyLevel // for conditional updates
 	// counterDeltas builds counter updates as deltas (in a cluster).
 	counterDeltas bool
+	// logged marks a LOGGED batch: one spanning several partitions runs as
+	// an Accord transaction, which makes it atomic (there is no batchlog).
+	logged bool
 	// local restricts reads to this node (replica-side reads).
 	local bool
 	// listSeq, if set, numbers list elements deterministically (Accord).
@@ -357,7 +360,8 @@ func (d *DB) executeBatch(typ primitive.BatchType, children []BatchChild, o *Req
 	}
 	var mods []boundModification
 	conditional := false
-	ctx := &execCtx{d: d, now: d.opts.Now(), cl: o.Consistency, serial: o.SerialConsistency, user: o.User, trace: o.Trace}
+	ctx := &execCtx{d: d, now: d.opts.Now(), cl: o.Consistency, serial: o.SerialConsistency, user: o.User, trace: o.Trace,
+		logged: typ == primitive.BatchTypeLogged}
 	ctx.nowSec = ctx.now.Unix()
 	if o.NowInSec != nil {
 		ctx.nowSec = int64(*o.NowInSec)
