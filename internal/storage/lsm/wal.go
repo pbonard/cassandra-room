@@ -3,8 +3,10 @@ package lsm
 import (
 	"fmt"
 	"io"
+	"path/filepath"
 	"sync"
 
+	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/vfs"
 )
@@ -119,4 +121,47 @@ func replayWAL(fs vfs.FS, path string, num uint64, fn func(data []byte) error) e
 			return err
 		}
 	}
+}
+
+// WALEntry is a write read from a WAL segment.
+type WALEntry struct {
+	Seq        uint64
+	Table      TableID
+	Key, Value []byte
+}
+
+// ReadWAL calls fn with each write of a WAL segment (an archived one, for
+// point-in-time recovery), in the order they were applied. The slices fn
+// receives are valid only during the call. A torn tail ends the segment.
+func ReadWAL(fs vfs.FS, path string, fn func(WALEntry) error) error {
+	kind, num, ok := parseFileName(filepath.Base(path))
+	if !ok || kind != "wal" {
+		return fmt.Errorf("lsm: %s is not a WAL segment", path)
+	}
+	return replayWAL(fs, path, num, func(data []byte) error {
+		if len(data) == 0 {
+			return nil
+		}
+		br, err := newBatchReader(data)
+		if err != nil {
+			return err
+		}
+		for seq := br.seq; ; seq++ {
+			ent, ok, err := br.next()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return nil
+			}
+			switch ent.kind {
+			case pebble.InternalKeyKindSet, pebble.InternalKeyKindMerge:
+			default:
+				continue
+			}
+			if err := fn(WALEntry{Seq: seq, Table: ent.table, Key: ent.key, Value: ent.value}); err != nil {
+				return err
+			}
+		}
+	})
 }

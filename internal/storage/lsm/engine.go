@@ -236,6 +236,17 @@ func (e *Engine) recover() error {
 		}
 	}
 
+	if e.opts.WALArchiveDir != "" {
+		if err := e.fs.MkdirAll(e.opts.WALArchiveDir, 0o755); err != nil {
+			return err
+		}
+		for _, num := range wals {
+			if err := e.archiveWAL(num); err != nil {
+				return err
+			}
+		}
+	}
+
 	// Replay the WAL. An entry is applied only if its table exists and the
 	// table has not flushed past it.
 	recovered := map[TableID]*memTable{}
@@ -804,6 +815,12 @@ func (e *Engine) rotateWALLocked() error {
 	}
 	closed := e.mu.wal.size()
 	e.mu.walSegs[len(e.mu.walSegs)-1].size = closed
+	if e.opts.WALArchiveDir != "" {
+		if err := e.archiveWAL(e.mu.walSegs[len(e.mu.walSegs)-1].num); err != nil {
+			e.setBackgroundErrorLocked(fmt.Errorf("lsm: archiving WAL: %w", err))
+			return e.mu.bgErr
+		}
+	}
 	e.closedWALBytes.Add(closed)
 	e.mu.walSegs = append(e.mu.walSegs, walSegment{num: num})
 	e.mu.wal = wal
@@ -970,6 +987,42 @@ func (e *Engine) finishFlushLocked(job flushJob) {
 	e.mu.cond.Broadcast()
 }
 
+// archiveWAL hard-links WAL segment num into the archive directory (a
+// segment already there was archived before a restart).
+func (e *Engine) archiveWAL(num uint64) error {
+	to := e.fs.PathJoin(e.opts.WALArchiveDir, walFileName(num))
+	if _, err := e.fs.Stat(to); err == nil {
+		return nil
+	}
+	if err := e.fs.Link(e.fs.PathJoin(e.dir, walFileName(num)), to); err != nil {
+		return err
+	}
+	return syncDir(e.fs, e.opts.WALArchiveDir)
+}
+
+// WALArchiveDir is where WAL segments are archived, if anywhere.
+func (e *Engine) WALArchiveDir() string { return e.opts.WALArchiveDir }
+
+// ArchiveWAL moves to a new WAL segment, which archives the current one:
+// afterwards every write acknowledged so far is in the archive. It needs
+// WALArchiveDir.
+func (e *Engine) ArchiveWAL() error {
+	if e.opts.WALArchiveDir == "" {
+		return errors.New("lsm: no WAL archive directory")
+	}
+	e.commitMu.Lock()
+	defer e.commitMu.Unlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.checkUsableLocked(); err != nil {
+		return err
+	}
+	if e.mu.wal.size() == 0 {
+		return nil
+	}
+	return e.rotateWALLocked()
+}
+
 // walRecycleLimit is the number of obsolete WAL segments kept for reuse.
 // Segments become obsolete about as fast as new ones are needed, so a small
 // pool suffices; more would only hold disk space.
@@ -981,7 +1034,7 @@ const walRecycleLimit = 2
 // and deletes any left over.
 func (e *Engine) deleteObsoleteWALLocked(minWAL uint64) {
 	for len(e.mu.walSegs) > 1 && e.mu.walSegs[0].num < minWAL {
-		if len(e.mu.recycledWAL) < walRecycleLimit {
+		if len(e.mu.recycledWAL) < walRecycleLimit && e.opts.WALArchiveDir == "" {
 			e.mu.recycledWAL = append(e.mu.recycledWAL, e.mu.walSegs[0].num)
 		} else {
 			_ = e.fs.Remove(e.fs.PathJoin(e.dir, walFileName(e.mu.walSegs[0].num)))

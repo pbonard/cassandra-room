@@ -18,6 +18,14 @@
 //	POST   /api/v1/snapshots       {"name","keyspaces"}: the snapshot's files
 //	DELETE /api/v1/snapshots/{name}
 //	POST   /api/v1/import          {"keyspace","table","files"}
+//	POST   /api/v1/load            {"keyspace","table","files","consistency"}:
+//	                               writes sstables' rows through the
+//	                               coordinator, to their replicas here
+//	                               (sstableloader); the default is ALL
+//	POST   /api/v1/commitlog/archive  closes the commit log segment; the
+//	                               archived segments {"files"}
+//	POST   /api/v1/commitlog/replay   {"files","tables","until"}: replays
+//	                               archived segments (point in time)
 //	GET    /metrics                Prometheus metrics
 //
 // Errors are {"error": "..."} with a 4xx or 5xx status. The text endpoints
@@ -69,6 +77,20 @@ func Handler(d *db.DB, serving func() bool) http.Handler {
 		h.done(w, d.ClearSnapshot(r.PathValue("name")))
 	})
 	mux.HandleFunc("POST /api/v1/import", h.importFiles)
+	mux.HandleFunc("POST /api/v1/load", h.load)
+	mux.HandleFunc("POST /api/v1/commitlog/archive", func(w http.ResponseWriter, r *http.Request) {
+		files, err := d.ArchiveCommitLog()
+		h.result(w, map[string][]string{"files": files}, err)
+	})
+	mux.HandleFunc("POST /api/v1/commitlog/replay", func(w http.ResponseWriter, r *http.Request) {
+		var req db.ReplayRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		res, err := d.Replay(req)
+		h.result(w, res, err)
+	})
 	mux.Handle("GET /metrics", promhttp.HandlerFor(d.Registry(), promhttp.HandlerOpts{}))
 	legacy(mux, d)
 	return mux
@@ -203,6 +225,32 @@ func (h *handler) importFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.done(w, h.d.Import(req.Keyspace, req.Table, req.Files))
+}
+
+// LoadRequest is the body of POST /api/v1/load.
+type LoadRequest struct {
+	Keyspace    string   `json:"keyspace"`
+	Table       string   `json:"table"`
+	Files       []string `json:"files"`
+	Consistency string   `json:"consistency,omitempty"` // ALL if empty
+}
+
+func (h *handler) load(w http.ResponseWriter, r *http.Request) {
+	var req LoadRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Consistency == "" {
+		req.Consistency = "ALL"
+	}
+	cl, err := db.ParseConsistency(req.Consistency)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	res, err := h.d.Load(req.Keyspace, req.Table, req.Files, cl)
+	h.result(w, res, err)
 }
 
 func (h *handler) done(w http.ResponseWriter, err error) {

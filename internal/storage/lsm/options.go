@@ -46,6 +46,11 @@ type Options struct {
 	// WALSegmentSize is the size at which the commit log moves to a new
 	// segment. Defaults to 32 MiB. (Cassandra: commitlog_segment_size.)
 	WALSegmentSize int64
+	// WALArchiveDir, when set, keeps every WAL segment: once the engine
+	// moves on from a segment it hard-links it there (Cassandra's commit log
+	// archiving), for point-in-time recovery. Archived segments are never
+	// reused; whoever reads them (a backup agent) deletes them.
+	WALArchiveDir string
 	// WALTotalSpace is the size of live commit log segments above which the
 	// tables pinning the oldest segment are flushed. Defaults to 1 GiB.
 	// (Cassandra: commitlog_total_space.)

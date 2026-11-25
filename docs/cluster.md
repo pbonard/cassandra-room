@@ -203,10 +203,24 @@ client certificates (`-admin-ca`):
 | `POST /api/v1/repair` | `{"keyspace","table","start","end"}`: a token range (start, end], wrapping allowed, or the whole keyspace |
 | `POST /api/v1/snapshots`, `DELETE /api/v1/snapshots/{name}` | snapshot user keyspaces (returns each table's files), clear |
 | `POST /api/v1/import` | `{"keyspace","table","files"}`: load sstables into a table on this node |
+| `POST /api/v1/load` | `{"keyspace","table","files","consistency"}`: write sstables' rows through the coordinator to their replicas in this cluster, whatever its topology (sstableloader); `ALL` by default |
+| `POST /api/v1/commitlog/archive` | close the commit log's segment, so every acknowledged write is archived; `{"files"}`: the archived segments (needs `-commitlog-archive-dir`) |
+| `POST /api/v1/commitlog/replay` | `{"files","tables","until"}`: replay archived segments on this node, leaving out what was written after `until` (microseconds); `tables` maps the storage ids a snapshot reported to `keyspace.table` |
 | `GET /metrics` | Prometheus metrics: client requests' latency (by kind and consistency level) and errors (timeouts, unavailables...), each table's size, sstables and memtables, flushes and compactions, hints, nodes up and down by data center, dropped and forwarded messages, thread pools, Accord's paths, recoveries and queues, native connections, the Go runtime and process |
 
 A restore is a truncate (new, empty storage on every node) followed by each
-node importing its own snapshot files. `-flags-file` reads further flags
+node importing its own snapshot files. Into a cluster of another topology
+(other nodes, tokens or replication), each table's files from every node of
+the backup are loaded instead (`/api/v1/load`): the coordinator sends each
+partition to its replicas here, keeping timestamps and deletions.
+
+Point in time: with `-commitlog-archive-dir`, the engine hard-links every
+commit log segment it moves on from into that directory (segments are then
+not reused). A restore to time T imports the last backup before T, then
+replays each node's segments since, leaving out cells and deletions whose
+timestamps are after T (Cassandra's `restore_point_in_time`). Writes are
+matched to tables by storage id, so writes from before a `TRUNCATE` never
+come back. `-flags-file` reads further flags
 from a file, one per line (the command line overrides them), for an init
 container to set per-pod flags.
 

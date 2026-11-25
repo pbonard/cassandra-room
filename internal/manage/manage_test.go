@@ -86,6 +86,14 @@ func TestManagementAPI(t *testing.T) {
 	require.Equal(t, http.StatusOK, call(t, srv, "POST", "/api/v1/import", ImportRequest{Keyspace: "ks", Table: "kv", Files: tables[0].Files}, nil))
 	rows = exec(t, d, "SELECT v FROM ks.kv WHERE k = 1").(*message.RowsResult)
 	require.Len(t, rows.Data, 1)
+	// Load: the same files through the coordinator.
+	exec(t, d, "TRUNCATE ks.kv")
+	var lr db.LoadResult
+	require.Equal(t, http.StatusOK, call(t, srv, "POST", "/api/v1/load", LoadRequest{Keyspace: "ks", Table: "kv", Files: tables[0].Files, Consistency: "one"}, &lr))
+	require.Positive(t, lr.Entries)
+	rows = exec(t, d, "SELECT v FROM ks.kv WHERE k = 1").(*message.RowsResult)
+	require.Len(t, rows.Data, 1)
+	require.Equal(t, http.StatusBadRequest, call(t, srv, "POST", "/api/v1/load", LoadRequest{Keyspace: "ks", Table: "kv", Consistency: "most"}, &e))
 	require.Equal(t, http.StatusOK, call(t, srv, "DELETE", "/api/v1/snapshots/s1", nil, nil))
 	require.Equal(t, http.StatusInternalServerError, call(t, srv, "POST", "/api/v1/import", ImportRequest{Keyspace: "ks", Table: "kv", Files: tables[0].Files}, &e), "the snapshot is gone")
 
