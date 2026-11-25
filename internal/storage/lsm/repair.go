@@ -89,6 +89,17 @@ func (t *Table) MerkleTree(r TokenRange, depth int) (*MerkleTree, error) {
 	nowSec := t.e.opts.Now().Unix()
 	gcBefore := t.o().gcBefore(nowSec)
 	noOther := func(int64, int64) (int64, error) { return math.MaxInt64, nil }
+	// The table's row filter too (rows shadowed by partition and range
+	// deletions, and those deletions once purgeable), as a validation
+	// compaction runs the compaction iterator: replicas that compacted
+	// and replicas that did not then hash the same.
+	var filter RowFilter
+	var env *FilterEnv
+	if t.o().RowFilter != nil {
+		filter = t.o().RowFilter()
+		env = &FilterEnv{NowSec: nowSec, GCBefore: gcBefore,
+			MaxPurgeable: func([]byte, []byte, int64, int64) (int64, error) { return math.MaxInt64, nil }}
+	}
 	var buf, msg []byte
 	for ok := it.First(); ok; ok = it.Next() {
 		v := it.Value()
@@ -101,6 +112,18 @@ func (t *Table) MerkleTree(r TokenRange, depth int) (*MerkleTree, error) {
 				continue
 			}
 			buf, v = out, out
+		}
+		if filter != nil {
+			out, drop, err := filter.Filter(it.Key(), v, env)
+			if err != nil {
+				return nil, err
+			}
+			if drop {
+				continue
+			}
+			if out != nil {
+				v = out
+			}
 		}
 		// The row's digest covers its key and its (purged) value, each
 		// length-prefixed.
