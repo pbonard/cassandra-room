@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/datastax/go-cassandra-native-protocol/message"
+	"github.com/datastax/go-cassandra-native-protocol/primitive"
 	"github.com/stretchr/testify/require"
 
 	"github.com/pbonard/cassandra-room/internal/storage/row"
@@ -48,4 +49,40 @@ func TestHintForDroppedTable(t *testing.T) {
 		}
 		return n == 0
 	}, 10*time.Second, 100*time.Millisecond, "no hint is left")
+}
+
+// TestConsistencyAnyNeedsAHint: a write at ANY whose replicas are all down
+// succeeds only if a hint was stored; with hints disabled, it fails.
+func TestConsistencyAnyNeedsAHint(t *testing.T) {
+	c := &testCluster{t: t, tweak: func(o *ClusterOptions) { o.DisableHints = true }}
+	for i := 0; i < 2; i++ {
+		c.add()
+	}
+	for i := range c.nodes {
+		c.start(i)
+	}
+	t.Cleanup(func() {
+		for _, d := range c.nodes {
+			if d != nil {
+				d.Close()
+			}
+		}
+	})
+	c.waitConverged()
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+	c.ok(0, quorum, "CREATE TABLE ks.kv (k int PRIMARY KEY, v text)")
+	k := c.nodes[0].schema.Load().Keyspaces["ks"]
+	key := -1
+	for i := 0; i < 1000 && key < 0; i++ {
+		pk := []byte{byte(i >> 24), byte(i >> 16), byte(i >> 8), byte(i)}
+		if c.nodes[0].proxy.ring.Load().Replicas(k.Replication, Token(pk))[0].Addr == c.addrs[1] {
+			key = i
+		}
+	}
+	require.GreaterOrEqual(t, key, 0)
+	c.stop(1)
+	require.Eventually(t, func() bool { return !c.nodes[0].proxy.g.IsAlive(c.addrs[1]) }, 10*time.Second, 10*time.Millisecond)
+	res := c.exec(0, primitive.ConsistencyLevelAny, "INSERT INTO ks.kv (k, v) VALUES (?, 'x')", key)
+	_, failed := res.(message.Error)
+	require.True(t, failed, "no replica and no hint: the write is nowhere")
 }

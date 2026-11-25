@@ -872,9 +872,10 @@ wait:
 	} else {
 		cancel()
 	}
-	p.storeHints(hints)
+	stored := p.storeHints(hints)
 	if !satisfied() {
-		if cl == primitive.ConsistencyLevelAny && len(hints) > 0 {
+		// ANY is met by a hint, if one was in fact stored.
+		if cl == primitive.ConsistencyLevelAny && stored > 0 {
 			return nil
 		}
 		minAcks, need := 1<<30, 0
@@ -937,9 +938,12 @@ type hint struct {
 	w      write
 }
 
-func (p *proxy) storeHints(hs []hint) {
+// storeHints stores hints for writes nodes missed, returning how many
+// writes were hinted (none when hints are disabled, or a node has been
+// down past the hint window).
+func (p *proxy) storeHints(hs []hint) int {
 	if len(hs) == 0 || p.opts.DisableHints {
-		return
+		return 0
 	}
 	dir := p.d.schema.Load().Nodes
 	by := map[string][]write{}
@@ -950,6 +954,7 @@ func (p *proxy) storeHints(hs []hint) {
 		by[h.hostID] = append(by[h.hostID], h.w)
 	}
 	var ws []write
+	hinted := 0
 	now := time.Now()
 	for host, writes := range by {
 		id, err := types.ParseUUID(host)
@@ -967,8 +972,12 @@ func (p *proxy) storeHints(hs []hint) {
 		v := row.Append(nil, &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: row.NoTimestamp},
 			Cells: []row.Cell{{Column: 1, Timestamp: now.UnixMicro(), TTL: uint32(ttl), LocalDeletionTime: now.Unix() + ttl, Value: encodeWrites(writes)}}})
 		ws = append(ws, write{table: hintsStorage, key: key, value: v})
+		hinted += len(writes)
 	}
-	_ = p.d.applyLocal(ws)
+	if p.d.applyLocal(ws) != nil {
+		return 0
+	}
+	return hinted
 }
 
 // withinHintWindow reports whether a node has been down for less than
