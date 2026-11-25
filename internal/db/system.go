@@ -217,18 +217,28 @@ func localRows(d *DB) []map[string][]byte {
 	}
 	hostID, _ := types.ParseUUID(d.local.HostID)
 	v := d.schema.Load().Version
+	// Internode addresses: the one the node listens on, and the one it is
+	// known by (the client address for a single node).
+	listen, listenPort, broadcast, broadcastPort := addr, 7000, addr, 7000
+	if d.proxy != nil {
+		broadcast, broadcastPort = ipBytes(d.proxy.self), portOf(d.proxy.self)
+		listen, listenPort = ipBytes(d.proxy.opts.ListenAddress), portOf(d.proxy.opts.ListenAddress)
+		if ip := net.IP(listen); listen == nil || ip.IsUnspecified() {
+			listen = broadcast
+		}
+	}
 	return []map[string][]byte{{
 		"key":                     textV("local"),
 		"bootstrapped":            textV("COMPLETED"),
-		"broadcast_address":       addr,
-		"broadcast_port":          intV(7000),
+		"broadcast_address":       broadcast,
+		"broadcast_port":          intV(broadcastPort),
 		"cluster_name":            textV(d.opts.ClusterName),
 		"cql_version":             textV("3.4.7"),
 		"data_center":             textV(d.opts.DataCenter),
 		"gossip_generation":       intV(int(startTime.Unix())),
 		"host_id":                 uuidV(hostID[:]),
-		"listen_address":          addr,
-		"listen_port":             intV(7000),
+		"listen_address":          listen,
+		"listen_port":             intV(listenPort),
 		"native_protocol_version": textV("5"),
 		"partitioner":             textV("org.apache.cassandra.dht.Murmur3Partitioner"),
 		"rack":                    textV(d.opts.Rack),
@@ -272,11 +282,18 @@ func peerRows(d *DB, v2 bool) []map[string][]byte {
 			r["peer_port"] = intV(pn)
 			r["native_address"] = ipBytes(s.NativeAddr)
 			r["native_port"] = intV(s.NativePort)
-			r["preferred_ip"] = ipBytes(s.Addr)
-			r["preferred_port"] = intV(pn)
+			pref := s.Addr
+			if s.InternalAddr != "" && s.DataCenter == d.opts.DataCenter && d.proxy.opts.PreferLocal {
+				pref = s.InternalAddr
+			}
+			r["preferred_ip"] = ipBytes(pref)
+			r["preferred_port"] = intV(portOf(pref))
 		} else {
 			r["rpc_address"] = ipBytes(s.NativeAddr)
 			r["preferred_ip"] = ipBytes(s.Addr)
+			if s.InternalAddr != "" && s.DataCenter == d.opts.DataCenter && d.proxy.opts.PreferLocal {
+				r["preferred_ip"] = ipBytes(s.InternalAddr)
+			}
 		}
 		out = append(out, r)
 	}
@@ -665,4 +682,14 @@ func threadPoolRows(d *DB) []map[string][]byte {
 			"active_tasks_limit": intV(s.Limit), "dropped_messages": bigintV(int64(s.Dropped))})
 	}
 	return out
+}
+
+// portOf is the port of a "host:port" address (7000 if it has none).
+func portOf(addr string) int {
+	if _, p, err := net.SplitHostPort(addr); err == nil {
+		if n, err := strconv.Atoi(p); err == nil {
+			return n
+		}
+	}
+	return 7000
 }

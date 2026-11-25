@@ -9,6 +9,40 @@ levels and the same failure behaviour seen from drivers. Everything is in
 cassandra-room -addr 10.0.0.1:9042 -listen-address 10.0.0.1:7000 -seeds 10.0.0.1:7000 -admin-address 10.0.0.1:7199
 ```
 
+## Addresses
+
+As Cassandra's, each node has an address it listens on and an address it is
+known by, for other nodes and for clients:
+
+| | Listens on | Known by |
+|---|---|---|
+| Internode | `-listen-address` (`listen_address`) | `-broadcast-address` (`broadcast_address`), default the listen address |
+| Clients | `-addr` (`rpc_address`) | `-broadcast-rpc-address` (`broadcast_rpc_address`), default the `-addr` host |
+
+The broadcast address is the node's identity: other nodes connect to it, the
+cluster metadata and seeds name it, and `system.peers` lists it. It is for
+nodes that cannot be reached at the address they listen on: behind NAT, in
+another network or Kubernetes cluster (`-listen-address 0.0.0.0:7000` needs
+one). The client broadcast address is what drivers find in `system.local`
+and `system.peers` and connect to (`-addr :9042` in a cluster needs one).
+Host names are resolved at startup.
+
+With `-prefer-local` (`prefer_local`), nodes of the same data center connect
+to each other at their listen addresses, recorded in the cluster metadata,
+and use broadcast addresses only across data centers; `system.peers` shows
+the listen address as `preferred_ip`. With internode TLS and
+`-internode-verify-hostname`, a certificate is checked against the address
+connected to, so it names both.
+
+## Client encryption
+
+`-client-cert` and `-client-key` encrypt the native port
+(`client_encryption_options`); with `-client-ca`, clients must also present
+a certificate signed by that CA (`require_client_auth`), and with
+`-client-tls-optional` the port also accepts unencrypted connections
+(`optional: true`, told apart by the first byte of a TLS handshake). The
+handshake must complete within 10 seconds.
+
 ## Membership and ring
 
 Cassandra's legacy design gossips everything (tokens, status, schema

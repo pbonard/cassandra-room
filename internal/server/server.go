@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -40,6 +41,10 @@ type Server struct {
 	maxFrameSize int
 	writeTimeout time.Duration
 	listeners    map[net.Listener]struct{}
+	// tlsConfig encrypts client connections (nil: none); tlsOptional
+	// also accepts unencrypted ones.
+	tlsConfig    *tls.Config
+	tlsOptional  bool
 	conns        map[net.Conn]struct{}
 	closed       bool
 	shuttingDown bool
@@ -133,7 +138,9 @@ func (s *Server) Serve(ln net.Listener) error {
 		tempDelay = 0
 
 		go func(c net.Conn) {
-			_ = s.serveConn(c)
+			if c = s.secure(c); c != nil {
+				_ = s.serveConn(c)
+			}
 		}(conn)
 	}
 }

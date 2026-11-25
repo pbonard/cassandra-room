@@ -94,6 +94,10 @@ type Messaging struct {
 
 	stages [numStages]chan struct{}
 
+	// dialAddr, if set, gives the address to connect to a node at (its
+	// private address in this data center: prefer_local).
+	dialAddr atomic.Pointer[func(string) string]
+
 	// Limits, in bytes (internode_application_*_queue_*).
 	outEndpoint map[string]*budget
 	outGlobal   budget
@@ -119,6 +123,10 @@ type MessagingOptions struct {
 	// endpoint, then one shared by all (Cassandra: 4 MiB, 128 MiB,
 	// 512 MiB, both for sending and receiving). Zero uses the defaults.
 	QueueCapacity, EndpointReserve, GlobalReserve int64
+	// Broadcast is the address this node is known by, which other nodes
+	// connect to (broadcast_address), when it differs from the address it
+	// listens on (listen_address: behind NAT, or in another network).
+	Broadcast string
 }
 
 const (
@@ -294,7 +302,11 @@ func NewMessagingWith(addr string, o MessagingOptions) (*Messaging, error) {
 	if err != nil {
 		return nil, err
 	}
-	m := &Messaging{addr: ln.Addr().String(), ln: ln, opts: o,
+	self := ln.Addr().String()
+	if o.Broadcast != "" {
+		self = o.Broadcast
+	}
+	m := &Messaging{addr: self, ln: ln, opts: o,
 		conns: map[outKey]*outConn{}, inbound: map[net.Conn]struct{}{}, peerVer: map[string]uint16{},
 		outEndpoint: map[string]*budget{}, inEndpoint: map[string]*budget{}, relays: map[uint64]relayWait{}}
 	m.outGlobal.cap, m.inGlobal.cap = o.GlobalReserve, o.GlobalReserve
@@ -308,8 +320,19 @@ func NewMessagingWith(addr string, o MessagingOptions) (*Messaging, error) {
 	return m, nil
 }
 
-// Addr returns the address the node listens on.
+// Addr returns the address the node is known by (its broadcast address,
+// else the one it listens on).
 func (m *Messaging) Addr() string { return m.addr }
+
+// SetDialAddress sets how to find the address to connect to a node at,
+// given the address it is known by (prefer_local); nil connects to that.
+func (m *Messaging) SetDialAddress(f func(string) string) {
+	if f == nil {
+		m.dialAddr.Store(nil)
+		return
+	}
+	m.dialAddr.Store(&f)
+}
 
 // Handle registers the handler of a verb. Call before Start.
 func (m *Messaging) Handle(v Verb, h Handler) { m.handlers[v] = h }
@@ -789,7 +812,11 @@ func (m *Messaging) conn(to string, class int) (*outConn, error) {
 // dial connects and performs the handshake.
 func (m *Messaging) dial(to string, class int) (net.Conn, error) {
 	const timeout = 2 * time.Second
-	c, err := net.DialTimeout("tcp", to, timeout)
+	addr := to
+	if f := m.dialAddr.Load(); f != nil {
+		addr = (*f)(to)
+	}
+	c, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -799,7 +826,7 @@ func (m *Messaging) dial(to string, class int) (net.Conn, error) {
 	if m.opts.TLS != nil {
 		cfg := m.opts.TLS.Clone()
 		if cfg.ServerName == "" {
-			cfg.ServerName, _, _ = net.SplitHostPort(to)
+			cfg.ServerName, _, _ = net.SplitHostPort(addr)
 		}
 		c = tls.Client(c, cfg)
 	}

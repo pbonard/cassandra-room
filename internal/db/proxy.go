@@ -33,8 +33,17 @@ import (
 
 // ClusterOptions make a DB a node of a cluster.
 type ClusterOptions struct {
-	// ListenAddress is the internode address, "host:port" (storage_port).
+	// ListenAddress is the internode address, "host:port" (storage_port),
+	// the node listens on.
 	ListenAddress string
+	// BroadcastAddress is the internode address the node is known by and
+	// other nodes connect to (broadcast_address), when it differs from
+	// ListenAddress (NAT, another network); it is the node's identity.
+	BroadcastAddress string
+	// PreferLocal makes nodes of the same data center connect to each
+	// other at their listen addresses (prefer_local), keeping broadcast
+	// addresses for other data centers.
+	PreferLocal bool
 	// ReplaceAddress makes a new node take the place of a dead one, given
 	// by address or host id (replace_address_first_boot).
 	ReplaceAddress string
@@ -169,11 +178,16 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 			return err
 		}
 	}
-	m, err := cluster.NewMessagingWith(o.ListenAddress, o.Messaging)
+	mo := o.Messaging
+	mo.Broadcast = o.BroadcastAddress
+	m, err := cluster.NewMessagingWith(o.ListenAddress, mo)
 	if err != nil {
 		return err
 	}
 	p := &proxy{d: d, m: m, opts: *o, self: m.Addr(), stopCh: make(chan struct{}), started: time.Now()}
+	if o.PreferLocal {
+		m.SetDialAddress(p.dialAddress)
+	}
 	m.Handle(cluster.VerbMutation, p.handleMutation)
 	m.Handle(cluster.VerbReadRow, p.handleReadRow)
 	m.Handle(cluster.VerbReadDigest, p.handleReadDigest)
@@ -266,7 +280,7 @@ func (p *proxy) cmsMembers() []string {
 // (PrepareReplace, streaming, FinishReplace).
 func (p *proxy) join() error {
 	d := p.d
-	me := &cluster.Node{Addr: p.self, HostID: d.local.HostID, NativeAddr: d.opts.Address.String(), NativePort: d.opts.Port,
+	me := &cluster.Node{Addr: p.self, InternalAddr: p.internalAddr(), HostID: d.local.HostID, NativeAddr: d.opts.Address.String(), NativePort: d.opts.Port,
 		DataCenter: d.opts.DataCenter, Rack: d.opts.Rack, Tokens: d.local.Tokens, ReleaseVersion: ReleaseVersion}
 	if r := p.opts.ReplaceAddress; r != "" {
 		if cur := d.schema.Load().Nodes[me.HostID]; cur == nil || cur.Status == cluster.StatusJoining {
@@ -279,7 +293,7 @@ func (p *proxy) join() error {
 			next.CMS = slices.Clone(p.initialCMS)
 		}
 		cur := next.Nodes[me.HostID]
-		if cur != nil && cur.Status != cluster.StatusLeft && cur.Addr == me.Addr && cur.NativeAddr == me.NativeAddr && cur.NativePort == me.NativePort && cur.Ordinal != 0 {
+		if cur != nil && cur.Status != cluster.StatusLeft && cur.Addr == me.Addr && cur.InternalAddr == me.InternalAddr && cur.NativeAddr == me.NativeAddr && cur.NativePort == me.NativePort && cur.Ordinal != 0 {
 			return nil, false, nil
 		}
 		n := *me
@@ -1927,4 +1941,32 @@ func (p *proxy) tokenSegments() [][2]int64 {
 		out = [][2]int64{{math.MinInt64, math.MaxInt64}}
 	}
 	return out
+}
+
+// internalAddr is the address recorded for nodes of this data center to
+// connect to (prefer_local): the listen address, when it differs from the
+// broadcast address and names a host.
+func (p *proxy) internalAddr() string {
+	l := p.opts.ListenAddress
+	if l == p.self {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(l); err != nil || host == "" || net.ParseIP(host) != nil && net.ParseIP(host).IsUnspecified() {
+		return ""
+	}
+	return l
+}
+
+// dialAddress is where to connect to a node known by addr: its internal
+// address if it is in this data center and has one (prefer_local).
+func (p *proxy) dialAddress(addr string) string {
+	for _, n := range p.d.schema.Load().Nodes {
+		if n.Addr == addr {
+			if n.InternalAddr != "" && n.DataCenter == p.d.opts.DataCenter {
+				return n.InternalAddr
+			}
+			break
+		}
+	}
+	return addr
 }
