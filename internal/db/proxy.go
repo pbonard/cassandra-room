@@ -78,6 +78,8 @@ type ClusterOptions struct {
 // by timestamp, so the merge is reconciliation) and repair the replicas
 // that were behind.
 type proxy struct {
+	// testRefuseMutations makes the node refuse MUTATION messages (tests).
+	testRefuseMutations atomic.Pointer[bool]
 	d   *DB
 	m   *cluster.Messaging
 	g   *cluster.Gossiper
@@ -722,6 +724,9 @@ func decodeWrites(b []byte) ([]write, error) {
 }
 
 func (p *proxy) handleMutation(ctx context.Context, _ string, payload []byte) ([]byte, error) {
+	if f := p.testRefuseMutations.Load(); f != nil && *f {
+		return nil, errors.New("db: refusing mutations (test)")
+	}
 	ws, err := decodeWrites(payload)
 	if err != nil {
 		return nil, err
