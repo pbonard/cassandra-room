@@ -54,6 +54,8 @@ func TestWALArchive(t *testing.T) {
 		require.Equal(t, fmt.Sprintf("k%04d", i), k)
 	}
 	require.Error(t, ReadWAL(fs, "archive/x.sst", func(WALEntry) error { return nil }))
+	require.NoError(t, fs.Link(fs.PathJoin("archive", walFileName(1)), "archive/000000-000001.wal"))
+	require.ErrorContains(t, ReadWAL(fs, "archive/000000-000001.wal", func(WALEntry) error { return nil }), "not a WAL segment")
 }
 
 func sortedWALs(names []string) []string {

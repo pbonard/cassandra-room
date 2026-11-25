@@ -134,9 +134,11 @@ type WALEntry struct {
 // point-in-time recovery), in the order they were applied. The slices fn
 // receives are valid only during the call. A torn tail ends the segment.
 func ReadWAL(fs vfs.FS, path string, fn func(WALEntry) error) error {
+	// The name holds the segment's number, which its records carry: a
+	// renamed segment would read as empty.
 	kind, num, ok := parseFileName(filepath.Base(path))
-	if !ok || kind != "wal" {
-		return fmt.Errorf("lsm: %s is not a WAL segment", path)
+	if !ok || kind != "wal" || filepath.Base(path) != walFileName(num) {
+		return fmt.Errorf("lsm: %s is not a WAL segment (named NNNNNN.wal by its number)", path)
 	}
 	return replayWAL(fs, path, num, func(data []byte) error {
 		if len(data) == 0 {
