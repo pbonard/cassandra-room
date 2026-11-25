@@ -179,3 +179,23 @@ func TestOverloadAndBackpressure(t *testing.T) {
 	require.Positive(t, overloaded.Load())
 	require.EqualValues(t, overloaded.Load(), a.Stats().Overloaded)
 }
+
+// TestOversizedFrameAndUnknownVerb: a message larger than every byte
+// budget is still delivered (alone), instead of stalling its connection
+// for good; and a verb this node does not know is answered with an
+// error, not run by another verb's handler.
+func TestOversizedFrameAndUnknownVerb(t *testing.T) {
+	o := MessagingOptions{QueueCapacity: 1 << 20, EndpointReserve: 1 << 20, GlobalReserve: 1 << 20}
+	a, b := startPair(t, o)
+	b.Handle(VerbMutation, func(_ context.Context, _ string, p []byte) ([]byte, error) { return []byte{byte(len(p) >> 20)}, nil })
+	a.Start()
+	b.Start()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := a.Request(ctx, b.Addr(), VerbMutation, make([]byte, 3<<20))
+	require.NoError(t, err, "a 3 MiB message through 1 MiB budgets")
+	require.Equal(t, []byte{3}, out)
+
+	_, err = a.Request(ctx, b.Addr(), Verb(numVerbs)+VerbMutation, []byte("x"))
+	require.ErrorContains(t, err, "no handler", "not the mutation handler")
+}

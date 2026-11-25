@@ -149,7 +149,7 @@ func (m *Messaging) send(to string, kind byte, verb Verb, id uint64, deadline in
 	}
 	defer release()
 	oc.wmu.Lock()
-	err = writeFrame(oc.c, kind|flag, verb, id, deadline, packed)
+	err = writeFrameTo(oc.c, kind|flag, verb, id, deadline, packed)
 	oc.wmu.Unlock()
 	if err != nil {
 		oc.close(err)
