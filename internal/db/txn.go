@@ -1,6 +1,8 @@
 package db
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -10,6 +12,7 @@ import (
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
 	"github.com/pbonard/cassandra-room/internal/accord"
 	"github.com/pbonard/cassandra-room/internal/cql"
+	"github.com/pbonard/cassandra-room/internal/storage/row"
 	"github.com/pbonard/cassandra-room/internal/types"
 )
 
@@ -397,6 +400,9 @@ func (tx *txnStmt) evaluate(e *execCtx, reads txnReads, mu *mutation) ([][][]byt
 			return nil, err
 		}
 	}
+	if err := laterStatementsWin(mu); err != nil {
+		return nil, err
+	}
 	switch {
 	case tx.sel != nil:
 		return reads[len(tx.lets)], nil
@@ -408,6 +414,44 @@ func (tx *txnStmt) evaluate(e *execCtx, reads txnReads, mu *mutation) ([][][]byt
 		return [][][]byte{row}, nil
 	}
 	return nil, nil
+}
+
+// laterStatementsWin combines a transaction's writes to the same row: its
+// statements share one timestamp (the executeAt's), so two writes of a
+// cell would tie, and the larger value win; the later statement's cell
+// replaces the earlier's instead.
+func laterStatementsWin(mu *mutation) error {
+	at := map[string]int{}
+	out := mu.writes[:0]
+	for _, w := range mu.writes {
+		k := string(binary.BigEndian.AppendUint64(nil, uint64(w.table))) + string(w.key)
+		i, seen := at[k]
+		if !seen {
+			at[k] = len(out)
+			out = append(out, w)
+			continue
+		}
+		prev, err := row.Decode(out[i].value)
+		if err != nil {
+			return err
+		}
+		next, err := row.Decode(w.value)
+		if err != nil {
+			return err
+		}
+		prev.Cells = slices.DeleteFunc(prev.Cells, func(c row.Cell) bool {
+			return slices.ContainsFunc(next.Cells, func(n row.Cell) bool {
+				return n.Column == c.Column && bytes.Equal(n.Path, c.Path) && n.ComplexDeletion == c.ComplexDeletion
+			})
+		})
+		merged, err := row.Merge(nil, row.Append(nil, prev), w.value)
+		if err != nil {
+			return err
+		}
+		out[i].value = merged
+	}
+	mu.writes = out
+	return nil
 }
 
 func (c *txnCond) holds(e *execCtx) (bool, error) {

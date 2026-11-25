@@ -116,9 +116,6 @@ type Node struct {
 	lastDurable time.Time
 	// lastSyncedSent is when the leader last re-sent the synced epoch.
 	lastSyncedSent time.Time
-	// bootstrapped is the sync point this node bootstrapped at: the
-	// transactions before it are reflected in the data it streamed.
-	bootstrapped atomic.Pointer[Timestamp]
 	// persisting bounds the transactions whose outcome is being retried
 	// to replicas that missed it.
 	persisting chan struct{}
@@ -248,12 +245,24 @@ func (n *Node) owned(keys []Key, from int64) []Key {
 	return out
 }
 
+// votesOn reports whether this node is a (not pending) replica of a key: a
+// joining node is no member of the fast path's electorate, so it does not
+// coordinate as a privileged replica.
+func (n *Node) votesOn(k Key, from int64) bool {
+	for _, s := range n.topologies([]Key{k}, from, n.epoch()).Shards {
+		if slices.Contains(s.Nodes, n.cfg.ID) && slices.ContainsFunc(s.Keys, func(o Key) bool { return o == k }) {
+			return true
+		}
+	}
+	return false
+}
+
 // newTxnID returns a new transaction id; it is privileged when it has a
 // single key this node replicates (cassandra-accord fc4a769 disabled the
 // coordinator optimisation for multi-key transactions).
 func (n *Node) newTxnID(kind Kind, keys ...Key) TxnID {
 	id := TxnID{Timestamp: Timestamp{Epoch: n.epoch(), HLC: n.clock.Next(0), Node: n.cfg.ID}, Kind: kind}
-	if !n.cfg.NoPrivilegedCoordinator && len(keys) == 1 && len(n.owned(keys, id.Epoch)) > 0 {
+	if !n.cfg.NoPrivilegedCoordinator && len(keys) == 1 && n.votesOn(keys[0], id.Epoch) {
 		id.Privileged = true
 	}
 	return id
@@ -610,13 +619,12 @@ func (n *Node) Pending() []string {
 	return out
 }
 
-// bootstrappedBefore returns the sync point this node bootstrapped at (zero
-// if it did not).
-func (n *Node) bootstrappedBefore() Timestamp {
-	if t := n.bootstrapped.Load(); t != nil {
-		return *t
-	}
-	return Timestamp{}
+// bootstrappedBefore returns the sync point this node bootstrapped the
+// range of a key at (zero if it did not).
+func (n *Node) bootstrappedBefore(k Key) Timestamp {
+	n.s.mu.Lock()
+	defer n.s.mu.Unlock()
+	return boundFor(n.s.bootstrap, k)
 }
 
 // metrics count what the node did (exported through Stats).

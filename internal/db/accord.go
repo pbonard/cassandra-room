@@ -739,13 +739,20 @@ func (p *proxy) accordBarrier(t *Table, pk []byte) error {
 }
 
 func (p *proxy) accordBarrierKey(k accord.Key) error {
-	if err := p.accordAvailable([]accord.Key{k}); err != nil {
+	return p.accordBarrierKeys([]accord.Key{k})
+}
+
+func (p *proxy) accordBarrierKeys(keys []accord.Key) error {
+	keys = slices.Clone(keys)
+	slices.SortFunc(keys, accord.Key.Compare)
+	keys = slices.CompactFunc(keys, func(a, b accord.Key) bool { return a.Compare(b) == 0 })
+	if err := p.accordAvailable(keys); err != nil {
 		return err
 	}
 	b, _ := json.Marshal(accordUpdate{})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*p.opts.ReadTimeout)
 	defer cancel()
-	_, err := p.accord.Coordinate(ctx, &accord.Txn{Kind: accord.Read, Keys: []accord.Key{k}, Update: b})
+	_, err := p.accord.Coordinate(ctx, &accord.Txn{Kind: accord.Read, Keys: keys, Update: b})
 	if err != nil {
 		return &timeoutError{cl: primitive.ConsistencyLevelSerial}
 	}
@@ -754,12 +761,20 @@ func (p *proxy) accordBarrierKey(k accord.Key) error {
 
 // groupWrites assigns writes to the transaction keys of their partitions.
 func groupWrites(keys []accord.Key, writes []write) accord.Writes {
+	// By partition, not just token: two keys of a table may share one.
+	prefixes := make([][]byte, len(keys))
+	for i, k := range keys {
+		if _, pk, err := splitAccordKey(k); err == nil {
+			prefixes[i] = partitionPrefix(pk)
+		}
+	}
 	per := map[string][]write{}
 	for _, w := range writes {
-		for _, k := range keys {
+		for i, k := range keys {
 			id, _, err := splitAccordKey(k)
-			if err == nil && id == w.table && k.Token == w.token {
+			if err == nil && id == w.table && k.Token == w.token && bytes.HasPrefix(w.key, prefixes[i]) {
 				per[accordKeyString(k)] = append(per[accordKeyString(k)], w)
+				break
 			}
 		}
 	}

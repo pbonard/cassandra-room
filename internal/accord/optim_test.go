@@ -352,3 +352,17 @@ func TestPrivilegedRestrictions(t *testing.T) {
 	require.Equal(t, before.MediumPath, after.MediumPath)
 	require.Equal(t, before.SlowPath+1, after.SlowPath)
 }
+
+// TestPendingNotPrivileged: a pending (joining) replica of a key has no
+// fast-path vote, so its transactions on the key are not privileged; a
+// replica's are.
+func TestPendingNotPrivileged(t *testing.T) {
+	c := newSimCluster(t, 4, 3, 1)
+	k := c.keys[0] // replicas n0, n1, n2
+	pending := &Topology{Epoch: 1, Replicas: c.replicas, Nodes: c.ids, Pending: func(Key) []NodeID { return []NodeID{"n3"} }}
+	for i := 0; i < 4; i++ {
+		c.node(i).SetTopology(pending)
+	}
+	require.False(t, c.node(3).newTxnID(Write, k).Privileged, "pending")
+	require.True(t, c.node(0).newTxnID(Write, k).Privileged, "a replica")
+}

@@ -158,3 +158,25 @@ func TestTransactionSchemaPinned(t *testing.T) {
 	s.ok("INSERT INTO ks.acct (id, balance, note) VALUES (1, 5, 'n')")
 	require.Equal(t, []string{"5 n"}, s.rows("SELECT balance, note FROM ks.acct WHERE id = 1"))
 }
+
+// TestTransactionLaterStatementWins: two statements of a transaction that
+// write the same cell share its timestamp; the later one wins (not the
+// larger value).
+func TestTransactionLaterStatementWins(t *testing.T) {
+	s := openTest(t, nil)
+	s.ok("CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+	s.ok("CREATE TABLE ks.t (k int PRIMARY KEY, v text, w text) WITH transactional_mode = 'full'")
+	s.ok(`BEGIN TRANSACTION
+		UPDATE ks.t SET v = 'zzz', w = 'kept' WHERE k = 1;
+		UPDATE ks.t SET v = 'aaa' WHERE k = 1;
+	COMMIT TRANSACTION`)
+	require.Equal(t, []string{"aaa kept"}, s.rows("SELECT v, w FROM ks.t WHERE k = 1"))
+	s.ok(`BEGIN TRANSACTION
+		LET r = (SELECT v FROM ks.t WHERE k = 1);
+		IF r.v = 'aaa' THEN
+			UPDATE ks.t SET v = 'yyy' WHERE k = 1;
+		END IF
+		UPDATE ks.t SET v = 'bbb' WHERE k = 1;
+	COMMIT TRANSACTION`)
+	require.Equal(t, []string{"bbb"}, s.rows("SELECT v FROM ks.t WHERE k = 1"), "the unconditional update comes after the IF block")
+}
