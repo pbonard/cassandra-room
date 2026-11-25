@@ -96,8 +96,22 @@ is a linearized log of epochs**.
 Statements run through a storage interface: the local engine on a single
 node, the coordinator in a cluster.
 
-- **Writes** go to every replica of each partition; the coordinator waits
-  for the consistency level's blockFor acks per partition. Too few live
+- **Writes** go to every replica of each partition, in every data center;
+  the coordinator waits for the consistency level's blockFor acks per
+  partition (for `LOCAL_ONE`, `LOCAL_QUORUM` and `LOCAL_SERIAL`, acks from
+  this data center only: the others still get the write).
+- **Forwarding** (`FORWARD_TO`, `sendMessagesToNonlocalDC`): replicas in
+  this data center are sent the write directly. In each other data center,
+  replicas receiving the same writes are sent one message, to a random one
+  of them, which delivers it to the others over its own connections; each
+  answers the coordinator directly (`RESPOND_TO`). So a write crosses to
+  each data center once instead of once per replica. A replica the
+  forwarding node cannot reach is reported to the coordinator as failed
+  (and hinted); if the forwarding node itself cannot be sent the message,
+  the others are sent it directly. Forwarding needs messaging version 5,
+  so a node still on version 4 is always sent its writes directly. A replica
+  that does not answer within the write timeout is hinted, as one that
+  fails. Too few live
   replicas: `Unavailable`; no answer in time: `WriteTimeout`. Down or
   failing replicas get **hints**, stored locally and replayed when they come
   back (and every 5 s), as Cassandra's hinted handoff: no hints for a node

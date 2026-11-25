@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand/v2"
 	"net"
 	"slices"
 	"sort"
@@ -567,12 +568,22 @@ func (p *proxy) need(cl primitive.ConsistencyLevel, k *Keyspace, pending []*clus
 		}
 		return n
 	}
-	n := ackNeed{total: blockFor(cl, k, p.d.opts.DataCenter)}
-	for _, r := range pending {
-		local := cl == primitive.ConsistencyLevelLocalQuorum || cl == primitive.ConsistencyLevelLocalOne || cl == primitive.ConsistencyLevelLocalSerial
-		if cl != primitive.ConsistencyLevelAny && (!local || r.DataCenter == p.d.opts.DataCenter) {
-			n.total++
+	local := cl == primitive.ConsistencyLevelLocalQuorum || cl == primitive.ConsistencyLevelLocalOne || cl == primitive.ConsistencyLevelLocalSerial
+	if local {
+		// Only this data center's acknowledgements count
+		// (DatacenterWriteResponseHandler); the others still get the write.
+		dc := p.d.opts.DataCenter
+		n := ackNeed{perDC: map[string]int{dc: blockFor(cl, k, dc)}}
+		for _, r := range pending {
+			if r.DataCenter == dc {
+				n.perDC[dc]++
+			}
 		}
+		return n
+	}
+	n := ackNeed{total: blockFor(cl, k, p.d.opts.DataCenter)}
+	if cl != primitive.ConsistencyLevelAny {
+		n.total += len(pending)
 	}
 	return n
 }
@@ -712,7 +723,9 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 		gk := k.Name + "/" + strconv.FormatInt(w.token, 10)
 		g := groups[gk]
 		if g == nil {
-			reps, _ := p.replicas(k, w.token, cl)
+			// Every replica gets the write, in every data center; cl only
+			// decides whose acknowledgements are awaited (need).
+			reps, _ := p.replicas(k, w.token, primitive.ConsistencyLevelAll)
 			// Nodes joining or taking over the range get the write too, and
 			// must acknowledge it on top of the consistency level.
 			pending := p.pendingReplicas(k, w.token, reps)
@@ -736,24 +749,36 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 			}
 		}
 	}
+	// Replicas still working when the consistency level is met keep the
+	// write timeout to finish (and are hinted if they fail).
 	ctx, cancel := context.WithTimeout(context.Background(), p.opts.WriteTimeout)
-	defer cancel()
 	type ack struct {
 		addr string
 		err  error
 	}
 	acks := make(chan ack, len(perNode))
 	m.trace.event("Writing %d partitions at %s to %d replicas", len(groups), clName(cl), len(perNode))
-	for addr, ws := range perNode {
-		m.trace.event("Sending MUTATION (%d writes) to %s", len(ws), addr)
+	for _, sg := range p.sendGroups(perNode, nodes) {
+		if len(sg.forward) > 0 {
+			m.trace.event("Sending MUTATION (%d writes) to %s, to forward to %s", len(sg.ws), sg.via, strings.Join(sg.forward, ", "))
+			go func() {
+				ch := p.m.RequestForward(ctx, sg.via, sg.forward, cluster.VerbMutation, sg.enc)
+				for range len(sg.forward) + 1 {
+					r := <-ch
+					acks <- ack{r.From, r.Err}
+				}
+			}()
+			continue
+		}
+		m.trace.event("Sending MUTATION (%d writes) to %s", len(sg.ws), sg.via)
 		go func() {
 			var err error
-			if addr == p.self {
-				err = p.d.applyLocal(ws)
+			if sg.via == p.self {
+				err = p.d.applyLocal(sg.ws)
 			} else {
-				_, err = p.m.Request(ctx, addr, cluster.VerbMutation, encodeWrites(ws))
+				_, err = p.m.Request(ctx, sg.via, cluster.VerbMutation, encodeWrites(sg.ws))
 			}
-			acks <- ack{addr, err}
+			acks <- ack{sg.via, err}
 		}()
 	}
 	satisfied := func() bool {
@@ -768,6 +793,7 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 	for a := range perNode {
 		pending[a] = true
 	}
+wait:
 	for len(pending) > 0 && !satisfied() {
 		select {
 		case a := <-acks:
@@ -787,13 +813,14 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 				g.acks.add(nodes[a.addr])
 			}
 		case <-ctx.Done():
-			pending = nil
+			break wait // the rest time out and are hinted below
 		}
 	}
 	// Replicas that have not answered yet get hints only if they fail;
 	// let them finish in the background.
 	if n := len(pending); n > 0 {
 		go func() {
+			defer cancel()
 			for i := 0; i < n; i++ {
 				a := <-acks
 				if a.err != nil {
@@ -805,6 +832,8 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 				}
 			}
 		}()
+	} else {
+		cancel()
 	}
 	p.storeHints(hints)
 	if !satisfied() {
@@ -820,6 +849,48 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 		return &timeoutError{write: true, cl: cl, received: minAcks, blockFor: need, batch: len(groups) > 1}
 	}
 	return nil
+}
+
+// sendGroup is one message of a write: to via, which forwards it to the
+// others in its data center.
+type sendGroup struct {
+	via     string
+	forward []string
+	ws      []write
+	enc     []byte // ws encoded, for a forwarded message
+}
+
+// sendGroups plans the messages of a write (sendToHintedReplicas): one per
+// replica in this data center; in each other data center, one per set of
+// replicas receiving the same writes, sent to a random one of them, which
+// forwards it to the others (sendMessagesToNonlocalDC), so the write
+// crosses to each data center once.
+func (p *proxy) sendGroups(perNode map[string][]write, nodes map[string]*cluster.Node) []sendGroup {
+	var out []sendGroup
+	remote := map[string][]string{} // by data center and writes
+	encs := map[string][]byte{}
+	var keys []string
+	for addr, ws := range perNode {
+		n := nodes[addr]
+		if addr == p.self || n.DataCenter == p.d.opts.DataCenter {
+			out = append(out, sendGroup{via: addr, ws: ws})
+			continue
+		}
+		enc := encodeWrites(ws)
+		key := n.DataCenter + "\x00" + string(enc)
+		if remote[key] == nil {
+			keys = append(keys, key)
+			encs[key] = enc
+		}
+		remote[key] = append(remote[key], addr)
+	}
+	for _, key := range keys {
+		addrs := remote[key]
+		i := rand.IntN(len(addrs))
+		addrs[0], addrs[i] = addrs[i], addrs[0]
+		out = append(out, sendGroup{via: addrs[0], forward: addrs[1:], ws: perNode[addrs[0]], enc: encs[key]})
+	}
+	return out
 }
 
 // ---- hints (HintsService) ----
