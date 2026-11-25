@@ -763,6 +763,37 @@ func replication(props []cql.Property) (map[string]string, bool, error) {
 	return repl, durable, nil
 }
 
+// expandReplicationFactor replaces NetworkTopologyStrategy's
+// replication_factor option by that factor for each data center not given
+// one (Cassandra's auto-expansion): left as is, it named a data center
+// called "replication_factor", and the keyspace had no replicas.
+func expandReplicationFactor(repl map[string]string, dcs []string) {
+	rf, ok := repl["replication_factor"]
+	if !ok || !strings.HasSuffix(repl["class"], "NetworkTopologyStrategy") {
+		return
+	}
+	delete(repl, "replication_factor")
+	for _, dc := range dcs {
+		if _, set := repl[dc]; !set {
+			repl[dc] = rf
+		}
+	}
+}
+
+// dataCenters lists the cluster's data centers (this node's alone).
+func (d *DB) dataCenters(s *Schema) []string {
+	seen := map[string]bool{d.opts.DataCenter: true}
+	out := []string{d.opts.DataCenter}
+	for _, n := range s.Nodes {
+		if n.Status != cluster.StatusLeft && !seen[n.DataCenter] {
+			seen[n.DataCenter] = true
+			out = append(out, n.DataCenter)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Persisted form of a table.
 type tableJSON struct {
 	Keyspace, Name string

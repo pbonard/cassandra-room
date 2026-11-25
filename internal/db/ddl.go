@@ -92,6 +92,7 @@ func (s *ddlStmt) plan(e *execCtx, next *Schema) (res message.Message, changed b
 		if err != nil {
 			return nil, false, err
 		}
+		expandReplicationFactor(repl, e.d.dataCenters(cur))
 		next.Keyspaces[st.Keyspace] = &Keyspace{Name: st.Keyspace, Replication: repl, DurableWrites: durable, Tables: map[string]*Table{}}
 		res = schemaChange(primitive.SchemaChangeTypeCreated, st.Keyspace, "")
 	case *cql.AlterKeyspace:
@@ -113,6 +114,7 @@ func (s *ddlStmt) plan(e *execCtx, next *Schema) (res message.Message, changed b
 				if err != nil {
 					return nil, false, err
 				}
+				expandReplicationFactor(repl, e.d.dataCenters(cur))
 				nk.Replication = repl
 			case "durable_writes":
 				v, err := stringProperty(p)

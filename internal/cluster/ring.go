@@ -201,8 +201,10 @@ func (r *Ring) ntsReplicas(replication map[string]string, t int64) []*Node {
 		n, _ := strconv.Atoi(v)
 		want[dc] = n
 	}
+	// Racks of the nodes that own tokens: a rack whose nodes own none is
+	// never reached, and waiting for it would keep the skipped nodes out.
 	racks := map[string]map[string]bool{}
-	for _, n := range r.nodes {
+	for _, n := range r.owner {
 		if racks[n.DataCenter] == nil {
 			racks[n.DataCenter] = map[string]bool{}
 		}
@@ -237,6 +239,14 @@ func (r *Ring) ntsReplicas(replication map[string]string, t int64) []*Node {
 				skipped[dc] = skipped[dc][1:]
 				have[dc]++
 			}
+		}
+	}
+	// Fewer racks than replicas left nodes skipped: take them in ring order.
+	for dc, s := range skipped {
+		for len(s) > 0 && have[dc] < want[dc] {
+			out = append(out, s[0])
+			s = s[1:]
+			have[dc]++
 		}
 	}
 	return out
