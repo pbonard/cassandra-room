@@ -181,12 +181,14 @@ func (n *Node) rangeTopologies(r Range) *Topologies {
 // its id once it applied at a quorum of every shard (at every replica if
 // universal).
 func (n *Node) SyncPoint(ctx context.Context, r Range, universal bool) (TxnID, error) {
-	return n.syncPoint(ctx, []Range{r}, universal)
+	return n.syncPoint(ctx, []Range{r}, universal, nil)
 }
 
 // syncPoint coordinates one exclusive sync point over ranges: every
 // transaction on any of them with a lower id is one of its dependencies.
-func (n *Node) syncPoint(ctx context.Context, ranges []Range, universal bool) (TxnID, error) {
+// Besides a quorum (or every replica if universal), the nodes must have
+// applied it.
+func (n *Node) syncPoint(ctx context.Context, ranges []Range, universal bool, must []NodeID) (TxnID, error) {
 	ts := &Topologies{}
 	for _, r := range ranges {
 		ts.Shards = append(ts.Shards, n.rangeTopologies(r).Shards...)
@@ -241,7 +243,8 @@ func (n *Node) syncPoint(ctx context.Context, ranges []Range, universal bool) (T
 				tr.success(rep.from)
 			}
 		}
-		if universal && len(applied) == len(nodes) || !universal && tr.done() {
+		mustDone := !slices.ContainsFunc(must, func(x NodeID) bool { return slices.Contains(nodes, x) && !applied[x] })
+		if universal && len(applied) == len(nodes) || !universal && tr.done() && mustDone {
 			return id, nil
 		}
 		select {
@@ -297,8 +300,8 @@ func (n *Node) durability() {
 // this node about to stream the ranges' data: the data then holds every
 // transaction on a range before its point, and this node does not wait for
 // those it does not know (reads still fetch them first).
-func (n *Node) Bootstrap(ctx context.Context, ranges []Range) error {
-	pts, err := n.BootstrapPoints(ctx, ranges)
+func (n *Node) Bootstrap(ctx context.Context, ranges []Range, sources ...NodeID) error {
+	pts, err := n.BootstrapPoints(ctx, ranges, sources...)
 	if err != nil {
 		return err
 	}
@@ -328,7 +331,11 @@ func (b BootstrapPoints) For(ranges []Range) BootstrapPoints {
 // Bootstrap for this node). One sync point, not one per range: a
 // transaction on a range with an id between that range's point and a later
 // one's would be covered by neither, though a node-wide point skipped it.
-func (n *Node) BootstrapPoints(ctx context.Context, ranges []Range) (BootstrapPoints, error) {
+//
+// sources are the nodes the data may be streamed from: the point is only
+// valid if they applied the sync point before streaming (a quorum without
+// them would let a node skip a transaction the data it received lacks).
+func (n *Node) BootstrapPoints(ctx context.Context, ranges []Range, sources ...NodeID) (BootstrapPoints, error) {
 	if len(ranges) == 0 {
 		return nil, nil
 	}
@@ -340,10 +347,10 @@ func (n *Node) BootstrapPoints(ctx context.Context, ranges []Range) (BootstrapPo
 	// and they are coordinated again in an epoch that includes them.
 	n.awaitSynced(ctx, n.epoch())
 	uctx, cancel := context.WithTimeout(ctx, 4*n.cfg.RequestTimeout)
-	id, err := n.syncPoint(uctx, ranges, true)
+	id, err := n.syncPoint(uctx, ranges, true, nil)
 	cancel()
 	if err != nil {
-		id, err = n.syncPoint(ctx, ranges, false)
+		id, err = n.syncPoint(ctx, ranges, false, sources)
 	}
 	if err != nil {
 		return nil, err

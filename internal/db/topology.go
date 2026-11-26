@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/datastax/go-cassandra-native-protocol/message"
+	"github.com/pbonard/cassandra-room/internal/accord"
 	"github.com/pbonard/cassandra-room/internal/cluster"
 	"github.com/pbonard/cassandra-room/internal/storage/lsm"
 )
@@ -76,8 +77,25 @@ func (p *proxy) bootstrap() error {
 	// replaced at RF 2), this node instead fetches the earlier transactions
 	// it does not know before using them.
 	if p.accord != nil && !cur.Empty() {
+		// The point is only valid where the data comes from: every live
+		// current replica it may be streamed from must apply it.
+		fut := cluster.NewFutureRing(nodeList(p.d.schema.Load()))
+		var sources []accord.NodeID
+		for _, t := range p.d.userTables() {
+			k := p.d.schema.Load().Keyspaces[t.Keyspace]
+			for _, r := range fut.Ranges() {
+				if !containsAddr(fut.Replicas(k.Replication, r[1]), p.self) {
+					continue
+				}
+				for _, n := range cur.Replicas(k.Replication, r[1]) {
+					if n.Addr != p.self && !p.replacedNode(n) && p.up(n) && !slices.Contains(sources, accord.NodeID(n.Addr)) {
+						sources = append(sources, accord.NodeID(n.Addr))
+					}
+				}
+			}
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		_ = p.accord.Bootstrap(ctx, p.accordOwnedRanges(cluster.NewFutureRing(nodeList(p.d.schema.Load())), false))
+		_ = p.accord.Bootstrap(ctx, p.accordOwnedRanges(fut, false), sources...)
 		cancel()
 	}
 	future := cluster.NewFutureRing(nodeList(p.d.schema.Load()))
@@ -283,7 +301,7 @@ func (p *proxy) unbootstrap() error {
 	future := cluster.NewFutureRing(nodeList(d.schema.Load()))
 	// Accord: the nodes taking over this node's ranges learn, once they
 	// have the data, the sync points it holds every transaction before.
-	handoff := p.accordHandoff(p.gainedAccordRanges(cur, future, func(reps []*cluster.Node) bool { return containsAddr(reps, p.self) }))
+	handoff := p.accordHandoff(p.gainedAccordRanges(cur, future, func(reps []*cluster.Node) bool { return containsAddr(reps, p.self) }), []string{p.self})
 	for _, t := range d.userTables() {
 		k := d.schema.Load().Keyspaces[t.Keyspace]
 		for _, r := range cur.Ranges() {
@@ -644,9 +662,26 @@ func (p *proxy) removeRanges(dead *cluster.Node, op string) error {
 	cur := p.ring.Load()
 	future := cluster.NewFutureRing(nodeList(d.schema.Load()))
 	// Accord, as for a decommission: sync points before the streaming.
+	// The data is streamed from a live replica of each range: they must
+	// all have applied the sync points.
+	var sources []string
+	for _, t := range d.userTables() {
+		k := d.schema.Load().Keyspaces[t.Keyspace]
+		for _, r := range cur.Ranges() {
+			reps := cur.Replicas(k.Replication, r[1])
+			if !slices.ContainsFunc(reps, func(n *cluster.Node) bool { return n.HostID == dead.HostID }) {
+				continue
+			}
+			for _, n := range reps {
+				if n.HostID != dead.HostID && p.up(n) && !slices.Contains(sources, n.Addr) {
+					sources = append(sources, n.Addr)
+				}
+			}
+		}
+	}
 	handoff := p.accordHandoff(p.gainedAccordRanges(cur, future, func(reps []*cluster.Node) bool {
 		return slices.ContainsFunc(reps, func(n *cluster.Node) bool { return n.HostID == dead.HostID })
-	}))
+	}), sources)
 	for _, t := range d.userTables() {
 		k := d.schema.Load().Keyspaces[t.Keyspace]
 		for _, r := range cur.Ranges() {

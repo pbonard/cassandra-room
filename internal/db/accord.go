@@ -1292,7 +1292,10 @@ func (p *proxy) gainedAccordRanges(cur, future *cluster.Ring, from func(reps []*
 // they then do not wait for the transactions before the points, which the
 // streamed data holds). Best effort, as a join's bootstrap: without the
 // points, the nodes fetch the earlier transactions they lack.
-func (p *proxy) accordHandoff(gained map[string][]accord.Range) (done func()) {
+//
+// sources are the nodes the data is streamed from: they must have applied
+// the sync points (else no point is sent).
+func (p *proxy) accordHandoff(gained map[string][]accord.Range, sources []string) (done func()) {
 	if p.accord == nil || len(gained) == 0 {
 		return func() {}
 	}
@@ -1305,7 +1308,11 @@ func (p *proxy) accordHandoff(gained map[string][]accord.Range) (done func()) {
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	pts, err := p.accord.BootstrapPoints(ctx, all)
+	var src []accord.NodeID
+	for _, s := range sources {
+		src = append(src, accord.NodeID(s))
+	}
+	pts, err := p.accord.BootstrapPoints(ctx, all, src...)
 	cancel()
 	if err != nil {
 		return func() {}
