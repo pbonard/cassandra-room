@@ -15,7 +15,35 @@ const (
 	StatusNormal     = "NORMAL"
 	StatusLeaving    = "LEAVING"
 	StatusLeft       = "LEFT"
+	// StatusMidJoin and StatusMidLeave are the middle steps of a range
+	// movement (TCM's MidJoin and MidLeave): reads have moved to the new
+	// owners, while writes still reach the old ones too, so that a
+	// coordinator still on the previous step reads what one on this step
+	// writes, and the other way around.
+	StatusMidJoin  = "MID_JOIN"
+	StatusMidLeave = "MID_LEAVE"
 )
+
+// Moving reports whether a node's status is a step of a range movement.
+func Moving(status string) bool {
+	switch status {
+	case StatusJoining, StatusMidJoin, StatusLeaving, StatusMidLeave:
+		return true
+	}
+	return false
+}
+
+// Placements of a range movement (TCM's data placements), each a ring:
+//
+//	          JOINING      MID_JOIN     LEAVING      MID_LEAVE
+//	read      old          new          old          new
+//	write     old + new    old + new    old + new    old + new
+//
+// then NORMAL (or LEFT): new only. Old owners are NORMAL, LEAVING and
+// MID_LEAVE nodes, new owners NORMAL, JOINING and MID_JOIN ones (less the
+// nodes they replace). Between two steps, every live node learns the
+// first before the second is committed (a progress barrier), so reads at
+// any step meet the writes at any neighbouring step.
 
 // Node is a node as the cluster metadata describes it (Directory): its
 // addresses, location, tokens and state.
@@ -74,13 +102,43 @@ type Ring struct {
 	nodes  map[string]*Node
 }
 
-// NewRing builds a ring from the nodes that own tokens: normal nodes and,
-// when withLeaving, leaving ones.
+// NewRing builds the read placement: the ring of NORMAL, LEAVING and
+// MID_JOIN nodes (a node being replaced, until its replacement reaches
+// MID_JOIN).
 func NewRing(states []Node) *Ring {
+	replaced := map[string]bool{}
+	for _, s := range states {
+		if s.Status == StatusMidJoin && s.Replaces != "" {
+			replaced[s.Replaces] = true
+		}
+	}
+	return ringOf(states, func(s *Node) bool {
+		switch s.Status {
+		case StatusNormal, StatusLeaving, StatusMidJoin:
+			return !replaced[s.HostID]
+		}
+		return false
+	})
+}
+
+// NewOldRing builds the placement before the movements in progress: the
+// ring of NORMAL, LEAVING and MID_LEAVE nodes.
+func NewOldRing(states []Node) *Ring {
+	return ringOf(states, func(s *Node) bool {
+		switch s.Status {
+		case StatusNormal, StatusLeaving, StatusMidLeave:
+			return true
+		}
+		return false
+	})
+}
+
+// ringOf builds the ring of the nodes owns selects.
+func ringOf(states []Node, owns func(*Node) bool) *Ring {
 	r := &Ring{owner: map[int64]*Node{}, nodes: map[string]*Node{}}
 	for i := range states {
 		s := &states[i]
-		if s.Status != StatusNormal && s.Status != StatusLeaving {
+		if !owns(s) {
 			continue
 		}
 		r.nodes[s.Addr] = s
@@ -100,24 +158,17 @@ func NewRing(states []Node) *Ring {
 func NewFutureRing(states []Node) *Ring {
 	replaced := map[string]bool{}
 	for _, s := range states {
-		if s.Status == StatusJoining && s.Replaces != "" {
+		if (s.Status == StatusJoining || s.Status == StatusMidJoin) && s.Replaces != "" {
 			replaced[s.Replaces] = true
 		}
 	}
-	var next []Node
-	for _, s := range states {
-		if replaced[s.HostID] {
-			continue
-		}
+	return ringOf(states, func(s *Node) bool {
 		switch s.Status {
-		case StatusJoining:
-			s.Status = StatusNormal
-			next = append(next, s)
-		case StatusNormal:
-			next = append(next, s)
+		case StatusNormal, StatusJoining, StatusMidJoin:
+			return !replaced[s.HostID]
 		}
-	}
-	return NewRing(next)
+		return false
+	})
 }
 
 // Ranges returns the ring's ranges as (start, end] pairs, the first one

@@ -198,7 +198,7 @@ client certificates (`-admin-ca`):
 | `GET /api/v1/ring?keyspace=` | ranges and their replicas (`describering`) |
 | `GET /api/v1/keyspaces` | the user keyspaces |
 | `POST /api/v1/flush` | flush every memtable |
-| `POST /api/v1/decommission` | leave the ring, in the background (`/node` shows LEAVING, then LEFT) |
+| `POST /api/v1/decommission` | leave the ring, in the background (`/node` shows LEAVING, MID_LEAVE, then LEFT) |
 | `POST /api/v1/cleanup?keyspace=`, `/removenode?node=`, `/cms?members=` | as nodetool |
 | `POST /api/v1/repair` | `{"keyspace","table","start","end"}`: a token range (start, end], wrapping allowed, or the whole keyspace |
 | `POST /api/v1/snapshots`, `DELETE /api/v1/snapshots/{name}` | snapshot user keyspaces (returns each table's files), clear |
@@ -236,15 +236,41 @@ container to set per-pod flags.
   decommission and removenode record every range they finish
   (`stream-progress.json`), so an interrupted operation run again resumes
   where it stopped. Not done: sendfile (chunks go through messages).
+- **Range movements** go through TCM's three steps, each a commit:
+  Prepare, Mid, Finish. While ranges move, writes go to the old owners and
+  the new ones together (and need a quorum plus every pending replica);
+  reads use the old owners until the Mid step, the new ones from then on:
+
+  |        | JOINING   | MID_JOIN  | LEAVING   | MID_LEAVE |
+  |--------|-----------|-----------|-----------|-----------|
+  | read   | old       | new       | old       | new       |
+  | write  | old + new | old + new | old + new | old + new |
+
+  After each commit the node driving the movement runs a **progress
+  barrier**: every live node must reach the epoch (`VerbMetadataSync`),
+  then it waits out the read and write timeouts so requests coordinated
+  with the placements before it are over. So coordinators are never more
+  than one step apart, and a quorum read at any step meets a quorum write
+  at any neighbouring one (jumping from old reads to new ones in one
+  step, as before, does not). Down nodes are not waited for: they catch
+  up with the log before serving.
+- **One movement at a time** (TCM's locked ranges, for the whole ring):
+  starting a join, a replace, a decommission or a removenode is refused
+  while another node is in one of these states. A joining or replacing
+  node waits for it (up to 10 minutes); decommission and removenode
+  return the error.
 - **Bootstrap**: a new node catches up with the metadata, then commits its
   registration as JOINING (TCM's PrepareJoin: from that epoch writes also
-  go to it), streams the ranges it will own from current replicas, and
-  commits NORMAL (FinishJoin). The first
-  node of a cluster registers as NORMAL directly.
+  go to it), waits for the barrier, streams the ranges it will own from
+  current replicas, commits MID_JOIN (reads move to it), waits for the
+  barrier and commits NORMAL (FinishJoin). A node restarted mid-join
+  resumes from its step. The first node of a cluster registers as NORMAL
+  directly.
 - **Decommission** (`POST /api/v1/decommission`): refused for CMS members, and if
   fewer nodes than a replication factor would remain; otherwise the node
-  commits LEAVING (PrepareLeave), streams its ranges to their new replicas,
-  replays its hints, and commits LEFT (FinishLeave).
+  commits LEAVING (PrepareLeave), streams its ranges to their new replicas
+  after the barrier, commits MID_LEAVE, and after the next barrier
+  replays its hints and commits LEFT (FinishLeave).
 - **Repair** (`POST /api/v1/repair`): for each range this node
   replicates, each replica builds a Merkle tree (the engine's, over purged
   rows); differing leaves are streamed both ways.
@@ -254,12 +280,14 @@ container to set per-pod flags.
 - **Removenode** (`POST /api/v1/removenode?node=`, an address or host id): a dead
   node is committed LEAVING; for each of its ranges, the nodes that become
   replicas get the data from a surviving replica (the coordinator asks the
-  source to push it); then it is LEFT.
+  source to push it); then it is MID_LEAVE, and LEFT, with barriers in
+  between as for a decommission.
 - **Replace** (`-replace-address` on a new node's first boot): the new
   node takes the dead node's tokens as JOINING with `Replaces` set (writes
   of those ranges reach it as a pending replica, the dead node counts as
   down even if the address is reused), streams them from the other
-  replicas, then one commit makes it NORMAL and the dead node LEFT.
+  replicas, commits MID_JOIN (reads move to it), then one commit makes it
+  NORMAL and the dead node LEFT; barriers as for a join.
 - **Metadata service membership** (`POST /api/v1/cms?members=`) is
   part of the metadata: the members of epoch N decide epoch N+1. As TCM's
   Prepare/AdvanceCMSReconfiguration, a reconfiguration moves one member
@@ -269,8 +297,9 @@ container to set per-pod flags.
   interrupted one is continued by running it again. The seeds are the
   initial members.
 - **Metadata history**: each commit records its epoch, kind (REGISTER,
-  PREPARE_JOIN/FINISH_JOIN, PREPARE_LEAVE/FINISH_LEAVE, PREPARE_REMOVE,
-  PREPARE_REPLACE/FINISH_REPLACE, RECONFIGURE_CMS, SCHEMA_CHANGE, ROLES)
+  MID_JOIN/FINISH_JOIN, PREPARE_LEAVE/MID_LEAVE/FINISH_LEAVE,
+  PREPARE_REMOVE/MID_REMOVE/FINISH_REMOVE,
+  PREPARE_REPLACE/MID_REPLACE/FINISH_REPLACE, RECONFIGURE_CMS, SCHEMA_CHANGE, ROLES)
   and what it did; the last 256 are in `system_views.cluster_metadata_log`,
   the node directory in `system_views.cluster_metadata_directory`.
 - `GET /api/v1/nodes` is nodetool status.
@@ -280,6 +309,12 @@ container to set per-pod flags.
 - Metadata: applying an entry still re-encodes the whole metadata to check
   its hash; the target of an interrupted reconfiguration is not recorded
   in the metadata (TCM records it so any node can finish it).
+- Range movements: the lock is the whole ring, not the ranges moved (TCM
+  locks only those, so movements of disjoint ranges run together); a
+  movement whose node is gone for good cannot be cancelled; the barrier waits for every live
+  node rather than a quorum of each range's replicas, and replicas do not
+  check a request's epoch (TCM refuses requests from coordinators behind
+  the replica's placements, which makes the drain wait unnecessary).
 - Repair is full repair only (no incremental repair); streaming sends
   files through messages (no sendfile).
 
@@ -296,7 +331,13 @@ divergence detection, and replay of logged entries at startup. `internal/db/clus
 clusters: schema propagation, replication at RF 3, QUORUM with a node down
 and ALL unavailable, metadata catch-up and hint replay after restart, read repair of a divergent
 replica, counters and LWT from every coordinator,
-bootstrap streaming, repair of divergent replicas and decommission. The
+bootstrap streaming, repair of divergent replicas and decommission.
+`internal/cluster/placements_test.go` checks that quorum reads and writes
+intersect at every pair of neighbouring steps of a join, a leave and a
+replace, and fail to when a step is skipped;
+`internal/db/transitions_test.go` checks the steps' commits, that the
+barrier waits for every node, and that a second movement waits or is
+refused. The
 gocql test runs three nodes on 127.0.0.1-3 and checks token-aware routing
 to all of them. Three real processes were also checked with cqlsh: QUORUM
 with one node killed, Unavailable at ALL, hint delivery on restart, and

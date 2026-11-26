@@ -98,10 +98,13 @@ type proxy struct {
 	replaced atomic.Pointer[map[string]bool]
 	opts     ClusterOptions
 	ring     atomic.Pointer[cluster.Ring]
-	self     string
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
-	hintMu   sync.Mutex
+	// moving holds the placements of the range movements in progress (nil
+	// when none): writes go to their old and future owners.
+	moving atomic.Pointer[movingRings]
+	self   string
+	stopCh chan struct{}
+	wg     sync.WaitGroup
+	hintMu sync.Mutex
 	// downSince is when each node was last seen going down.
 	downSince sync.Map // addr -> time.Time
 	started   time.Time
@@ -306,12 +309,62 @@ func (p *proxy) join() error {
 	me := &cluster.Node{Addr: p.self, InternalAddr: p.internalAddr(), HostID: d.local.HostID, NativeAddr: d.opts.Address.String(), NativePort: d.opts.Port,
 		DataCenter: d.opts.DataCenter, Rack: d.opts.Rack, Tokens: d.local.Tokens, ReleaseVersion: ReleaseVersion}
 	if r := p.opts.ReplaceAddress; r != "" {
-		if cur := d.schema.Load().Nodes[me.HostID]; cur == nil || cur.Status == cluster.StatusJoining {
+		if cur := d.schema.Load().Nodes[me.HostID]; cur == nil || cur.Status == cluster.StatusJoining || cur.Status == cluster.StatusMidJoin {
 			return p.replace(me, r)
 		}
 	}
-	kind := "REGISTER"
-	_, err := d.change(kind, func(next *Schema) (message.Message, bool, error) {
+	if err := p.register(me); err != nil {
+		return err
+	}
+	switch d.schema.Load().Nodes[me.HostID].Status {
+	case cluster.StatusJoining:
+		// PrepareJoin committed: once every node knows it, writes reach
+		// this node too, and the streaming below misses none.
+		if err := p.progressBarrier(); err != nil {
+			return err
+		}
+		if err := p.bootstrap(); err != nil {
+			return err
+		}
+		// MidJoin: reads move to this node.
+		if err := p.setNodeStatus("MID_JOIN", me.HostID, cluster.StatusMidJoin); err != nil {
+			return err
+		}
+		fallthrough
+	case cluster.StatusMidJoin:
+		// FinishJoin once no read uses the placements before MidJoin:
+		// writes then stop reaching the nodes that no longer own.
+		if err := p.progressBarrier(); err != nil {
+			return err
+		}
+		if err := p.setNodeStatus("FINISH_JOIN", me.HostID, cluster.StatusNormal); err != nil {
+			return err
+		}
+		return d.progress().clear("bootstrap")
+	}
+	return nil
+}
+
+// register commits this node in the directory (REGISTER), as JOINING if
+// there is data to stream to it: while another node moves, it waits.
+func (p *proxy) register(me *cluster.Node) error {
+	deadline := time.Now().Add(10 * time.Minute)
+	for {
+		err := p.registerOnce(me)
+		if !errors.Is(err, errRangeMovement) || time.Now().After(deadline) {
+			return err
+		}
+		select {
+		case <-time.After(time.Second):
+		case <-p.stopCh:
+			return err
+		}
+	}
+}
+
+func (p *proxy) registerOnce(me *cluster.Node) error {
+	d := p.d
+	_, err := d.change("REGISTER", func(next *Schema) (message.Message, bool, error) {
 		if len(next.CMS) == 0 {
 			next.CMS = slices.Clone(p.initialCMS)
 		}
@@ -339,6 +392,11 @@ func (p *proxy) join() error {
 				next.CMS[i] = n.Addr // still a member of the metadata service
 			}
 		}
+		if n.Status == cluster.StatusJoining && (cur == nil || cur.Status == cluster.StatusLeft) {
+			if o := movingOther(next, me.HostID); o != nil {
+				return nil, false, fmt.Errorf("%w (%s %s is %s)", errRangeMovement, o.HostID, o.Addr, o.Status)
+			}
+		}
 		next.Nodes[me.HostID] = &n
 		next.logDetail = fmt.Sprintf("%s %s as %s", n.HostID, n.Addr, n.Status)
 		return nil, true, nil
@@ -346,16 +404,7 @@ func (p *proxy) join() error {
 	if err != nil {
 		return fmt.Errorf("db: registering in the cluster metadata: %w", err)
 	}
-	if d.schema.Load().Nodes[me.HostID].Status != cluster.StatusJoining {
-		return nil
-	}
-	if err := p.bootstrap(); err != nil {
-		return err
-	}
-	if err := p.setNodeStatus("FINISH_JOIN", me.HostID, cluster.StatusNormal); err != nil {
-		return err
-	}
-	return d.progress().clear("bootstrap")
+	return nil
 }
 
 // replace joins in place of a dead node (by address or host id): this
@@ -386,34 +435,18 @@ func (p *proxy) replace(me *cluster.Node, target string) error {
 	if slices.Contains(p.cmsMembers(), old.Addr) && old.Addr != p.self {
 		return fmt.Errorf("db: cannot replace %s: it is a member of the cluster metadata service; reconfigure it first", target)
 	}
-	_, err := d.change("PREPARE_REPLACE", func(next *Schema) (message.Message, bool, error) {
-		o := next.Nodes[old.HostID]
-		if o == nil || o.Status != cluster.StatusNormal {
-			return nil, false, fmt.Errorf("db: node %s changed while preparing its replacement", target)
+	if cur := d.schema.Load().Nodes[me.HostID]; cur == nil || cur.Status != cluster.StatusMidJoin {
+		if err := p.prepareReplace(me, old, target); err != nil {
+			return err
 		}
-		n := *me
-		n.Tokens, n.Status, n.Replaces = slices.Clone(o.Tokens), cluster.StatusJoining, o.HostID
-		n.Ordinal = cluster.NextOrdinal(next.Nodes)
-		next.Nodes[me.HostID] = &n
-		next.logDetail = fmt.Sprintf("%s %s replaces %s %s", n.HostID, n.Addr, o.HostID, o.Addr)
-		return nil, true, nil
-	})
-	if err != nil {
-		return fmt.Errorf("db: preparing the replacement of %s: %w", target, err)
 	}
-	d.local.Tokens = slices.Clone(old.Tokens)
-	d.ddlMu.Lock()
-	err = d.saveSchema(d.schema.Load())
-	d.ddlMu.Unlock()
-	if err != nil {
+	// FinishReplace once no read uses the placements before MidReplace.
+	if err := p.progressBarrier(); err != nil {
 		return err
 	}
-	if err := p.bootstrap(); err != nil {
-		return err
-	}
-	_, err = d.change("FINISH_REPLACE", func(next *Schema) (message.Message, bool, error) {
+	_, err := d.change("FINISH_REPLACE", func(next *Schema) (message.Message, bool, error) {
 		n, o := next.Nodes[me.HostID], next.Nodes[old.HostID]
-		if n == nil || n.Status != cluster.StatusJoining {
+		if n == nil || n.Status != cluster.StatusMidJoin {
 			return nil, false, nil
 		}
 		n.Status, n.Replaces = cluster.StatusNormal, ""
@@ -427,6 +460,64 @@ func (p *proxy) replace(me *cluster.Node, target string) error {
 		return err
 	}
 	return d.progress().clear("bootstrap")
+}
+
+// prepareReplace takes the dead node's tokens as JOINING (PrepareReplace),
+// streams its ranges once every node writes to this one, then moves reads
+// to this node (MidReplace).
+func (p *proxy) prepareReplace(me, old *cluster.Node, target string) error {
+	d := p.d
+	deadline := time.Now().Add(10 * time.Minute)
+	for {
+		err := p.prepareReplaceOnce(me, old, target)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, errRangeMovement) || time.Now().After(deadline) {
+			return fmt.Errorf("db: preparing the replacement of %s: %w", target, err)
+		}
+		select {
+		case <-time.After(time.Second):
+		case <-p.stopCh:
+			return err
+		}
+	}
+	d.local.Tokens = slices.Clone(old.Tokens)
+	d.ddlMu.Lock()
+	err := d.saveSchema(d.schema.Load())
+	d.ddlMu.Unlock()
+	if err != nil {
+		return err
+	}
+	if err := p.progressBarrier(); err != nil {
+		return err
+	}
+	if err := p.bootstrap(); err != nil {
+		return err
+	}
+	return p.setNodeStatus("MID_REPLACE", me.HostID, cluster.StatusMidJoin)
+}
+
+func (p *proxy) prepareReplaceOnce(me, old *cluster.Node, target string) error {
+	_, err := p.d.change("PREPARE_REPLACE", func(next *Schema) (message.Message, bool, error) {
+		o := next.Nodes[old.HostID]
+		if o == nil || o.Status != cluster.StatusNormal {
+			return nil, false, fmt.Errorf("db: node %s changed while preparing its replacement", target)
+		}
+		if c := next.Nodes[me.HostID]; c != nil && c.Status == cluster.StatusJoining && c.Replaces == o.HostID {
+			return nil, false, nil // resumed
+		}
+		if m := movingOther(next, me.HostID); m != nil {
+			return nil, false, fmt.Errorf("%w (%s %s is %s)", errRangeMovement, m.HostID, m.Addr, m.Status)
+		}
+		n := *me
+		n.Tokens, n.Status, n.Replaces = slices.Clone(o.Tokens), cluster.StatusJoining, o.HostID
+		n.Ordinal = cluster.NextOrdinal(next.Nodes)
+		next.Nodes[me.HostID] = &n
+		next.logDetail = fmt.Sprintf("%s %s replaces %s %s", n.HostID, n.Addr, o.HostID, o.Addr)
+		return nil, true, nil
+	})
+	return err
 }
 
 // setStatus commits a change of this node's state.
@@ -496,13 +587,21 @@ func (p *proxy) setOwnedRanges(s *Schema) {
 // metadataChanged is called when a new metadata snapshot is installed.
 func (p *proxy) metadataChanged(s *Schema) {
 	replaced := map[string]bool{}
+	movement := false
 	for _, n := range s.Nodes {
-		if n.Status == cluster.StatusJoining && n.Replaces != "" {
+		if (n.Status == cluster.StatusJoining || n.Status == cluster.StatusMidJoin) && n.Replaces != "" {
 			replaced[n.Replaces] = true
 		}
+		movement = movement || cluster.Moving(n.Status)
 	}
 	p.replaced.Store(&replaced)
-	p.ring.Store(cluster.NewRing(nodeList(s)))
+	nodes := nodeList(s)
+	if movement {
+		p.moving.Store(&movingRings{old: cluster.NewOldRing(nodes), future: cluster.NewFutureRing(nodes)})
+	} else {
+		p.moving.Store(nil)
+	}
+	p.ring.Store(cluster.NewRing(nodes))
 	p.setOwnedRanges(s)
 	p.accordTopology(s)
 	p.g.Update(func(st *cluster.EndpointState) { st.Epoch = s.Epoch })
