@@ -236,7 +236,7 @@ func (s *store) registerLocked(c *command, keys []Key) {
 			f.ids = slices.Insert(f.ids, i, c.ID)
 		}
 		if c.Status != NotDefined && c.Status != Truncated {
-			f.maxTS = maxTimestamp(f.maxTS, c.ExecuteAt)
+			f.maxTS = mergeMax(f.maxTS, c.ExecuteAt)
 		}
 	}
 	if len(owned) > len(c.owned) {
@@ -268,7 +268,7 @@ func (s *store) witnessLocked(c *command, ts Timestamp) {
 	if c.ID.Kind != SyncPoint {
 		for _, k := range c.owned {
 			if f := s.keys[keyString(k)]; f != nil {
-				f.maxTS = maxTimestamp(f.maxTS, ts)
+				f.maxTS = mergeMax(f.maxTS, ts)
 			}
 		}
 	}
@@ -284,12 +284,12 @@ func (s *store) keyLocked(k Key) *cfk {
 	return &cfk{key: k}
 }
 
-// maxConflict returns the largest timestamp witnessed on the command's
-// keys before it.
+// maxConflict returns a timestamp at least every one witnessed on the
+// command's keys before it, in epoch and in HLC (see mergeMax).
 func (s *store) maxConflictLocked(c *command) Timestamp {
 	var m Timestamp
 	for _, k := range c.owned {
-		m = maxTimestamp(m, s.keyLocked(k).maxTS)
+		m = mergeMax(m, s.keyLocked(k).maxTS)
 	}
 	return m
 }

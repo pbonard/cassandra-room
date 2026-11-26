@@ -196,3 +196,48 @@ func TestLateOwned(t *testing.T) {
 		}
 	}
 }
+
+// TestExecuteAtHLCDominates: a transaction's execution timestamp exceeds
+// every conflicting one its replica witnessed in HLC too, not only in
+// timestamp order (epoch first). The per-key maximum kept only the
+// largest timestamp: having seen (epoch 1, HLC h+1s) and then (epoch 2,
+// HLC h), it kept the latter, and a new transaction at (epoch 2, HLC
+// h+500) took the fast path. It executed after the epoch 1 one but wrote
+// its cells at a lower HLC, so they lost to it: an update lost across an
+// epoch change.
+func TestExecuteAtHLCDominates(t *testing.T) {
+	c := newSimCluster(t, 3, 3, 1)
+	k := c.keys[0]
+	n := c.node(0)
+	n.SetTopology(&Topology{Epoch: 2, Replicas: c.replicas, Nodes: c.ids})
+	h := n.clock.Next(0)
+	witness := func(ts Timestamp) {
+		n.s.mu.Lock()
+		defer n.s.mu.Unlock()
+		cmd := n.s.get(TxnID{Timestamp: ts, Kind: Write})
+		cmd.Txn = appendTxn(t, k, 1)
+		n.s.registerLocked(cmd, cmd.Txn.Keys)
+		n.s.witnessLocked(cmd, ts)
+	}
+	early := Timestamp{Epoch: 1, HLC: h + 1_000_000, Node: "n1"}
+	witness(early)
+	witness(Timestamp{Epoch: 2, HLC: h, Node: "n2"})
+	id := TxnID{Timestamp: Timestamp{Epoch: 2, HLC: h + 500, Node: "n2"}, Kind: Write}
+	rep, err := n.s.preAccept(&preAcceptReq{ID: id, Txn: appendTxn(t, k, 2)})
+	require.NoError(t, err)
+	require.False(t, rep.FastVote)
+	require.Greater(t, rep.ExecuteAt.HLC, early.HLC)
+	require.True(t, early.Less(rep.ExecuteAt))
+}
+
+// TestMergeMax: the coordinator's execution timestamp from several
+// replicas' proposals is at least each in epoch and in HLC.
+func TestMergeMax(t *testing.T) {
+	a := Timestamp{Epoch: 1, HLC: 900, Node: "n1"}
+	b := Timestamp{Epoch: 2, HLC: 100, Node: "n2"}
+	m := mergeMax(a, b)
+	require.Equal(t, Timestamp{Epoch: 2, HLC: 900, Node: "n1"}, m)
+	require.False(t, m.Less(a))
+	require.False(t, m.Less(b))
+	require.Equal(t, m, mergeMax(b, a))
+}

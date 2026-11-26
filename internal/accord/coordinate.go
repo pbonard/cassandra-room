@@ -193,7 +193,7 @@ func (n *Node) coordinate(ctx context.Context, id TxnID, txn *Txn) ([]byte, erro
 	executeAt := id.Timestamp
 	deps := Deps{}
 	for _, r := range oks {
-		executeAt = maxTimestamp(executeAt, r.ExecuteAt)
+		executeAt = mergeMax(executeAt, r.ExecuteAt)
 		deps = deps.with(r.Deps)
 	}
 	n.metrics.slowPath.Add(1)
