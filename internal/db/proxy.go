@@ -1686,14 +1686,10 @@ func (p *proxy) handleReadRangeReverse(ctx context.Context, _ string, payload []
 	return append([]byte{more}, out...), it.Error()
 }
 
-// errNoReverseReads: a replica does not know reverse range reads (an older
-// version); the query reads forward instead.
-var errNoReverseReads = errors.New("db: a replica does not read backwards")
-
 // riter reads [lo, hi) of one partition backwards across its replicas.
 func (s *distSource) riter(lo, hi []byte) (revIterator, error) {
 	if lo == nil || hi == nil || keyToken(lo) != keyToken(hi) {
-		return nil, errNoReverseReads // only within one partition
+		return nil, errors.New("db: reverse reads are within one partition")
 	}
 	return &revDistIter{s: s, lo: lo, hi: hi}, nil
 }
@@ -1875,7 +1871,6 @@ func (s *distSource) fetch(reps []*cluster.Node, need ackNeed, from, to []byte, 
 	if reverse {
 		verb = cluster.VerbReadRangeReverse
 	}
-	unknownVerb := false
 	ctx, cancel := context.WithTimeout(context.Background(), p.opts.ReadTimeout)
 	defer cancel()
 	type resp struct {
@@ -1914,9 +1909,6 @@ func (s *distSource) fetch(reps []*cluster.Node, need ackNeed, from, to []byte, 
 		case r := <-ch:
 			outstanding--
 			if r.err != nil {
-				if strings.Contains(r.err.Error(), "no handler for verb") {
-					unknownVerb = true // an older node
-				}
 				// Another replica in its place, of the same data center
 				// for EACH_QUORUM.
 				for _, alt := range reps {
@@ -1928,9 +1920,6 @@ func (s *distSource) fetch(reps []*cluster.Node, need ackNeed, from, to []byte, 
 					}
 				}
 				if outstanding == 0 {
-					if unknownVerb {
-						return nil, nil, errNoReverseReads
-					}
 					return nil, nil, timeout()
 				}
 				continue

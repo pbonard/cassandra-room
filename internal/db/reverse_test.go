@@ -11,8 +11,6 @@ import (
 	"github.com/datastax/go-cassandra-native-protocol/message"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
 	"github.com/stretchr/testify/require"
-
-	"github.com/pbonard/cassandra-room/internal/cluster"
 )
 
 // TestReversedReads: a query in the opposite of the clustering order
@@ -171,13 +169,6 @@ func TestClusterReversedReads(t *testing.T) {
 	require.Less(t, rowsReadBackward.Load()-before, int64(64))
 	require.Positive(t, rowsReadBackward.Load()-before, "read backwards")
 
-	// Replicas of an older version, without reverse reads: the query reads
-	// forward instead, with the same result.
-	for _, d := range c.nodes {
-		d.proxy.m.Handle(cluster.VerbReadRangeReverse, nil)
-	}
-	require.Equal(t, want, ordered(c, 0, quorum, "SELECT c FROM ks.t WHERE p = 1 ORDER BY c DESC"))
-	require.Equal(t, want[:2], ordered(c, 1, quorum, "SELECT c FROM ks.t WHERE p = 1 ORDER BY c DESC LIMIT 2"))
 }
 
 // ordered runs a query of one int column, keeping the rows' order.

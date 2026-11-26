@@ -241,17 +241,17 @@ container to set per-pod flags.
   go to it), streams the ranges it will own from current replicas, and
   commits NORMAL (FinishJoin). The first
   node of a cluster registers as NORMAL directly.
-- **Decommission** (`POST /decommission`): refused for CMS members, and if
+- **Decommission** (`POST /api/v1/decommission`): refused for CMS members, and if
   fewer nodes than a replication factor would remain; otherwise the node
   commits LEAVING (PrepareLeave), streams its ranges to their new replicas,
   replays its hints, and commits LEFT (FinishLeave).
-- **Repair** (`POST /repair?keyspace=`): for each range this node
+- **Repair** (`POST /api/v1/repair`): for each range this node
   replicates, each replica builds a Merkle tree (the engine's, over purged
   rows); differing leaves are streamed both ways.
-- **Cleanup** (`POST /cleanup?keyspace=`): rewrites the tables without the rows of ranges this node no longer replicates, as
+- **Cleanup** (`POST /api/v1/cleanup?keyspace=`): rewrites the tables without the rows of ranges this node no longer replicates, as
   nodetool cleanup does after nodes join; refused while nodes are joining
   or leaving.
-- **Removenode** (`POST /removenode?node=`, an address or host id): a dead
+- **Removenode** (`POST /api/v1/removenode?node=`, an address or host id): a dead
   node is committed LEAVING; for each of its ranges, the nodes that become
   replicas get the data from a surviving replica (the coordinator asks the
   source to push it); then it is LEFT.
@@ -260,7 +260,7 @@ container to set per-pod flags.
   of those ranges reach it as a pending replica, the dead node counts as
   down even if the address is reused), streams them from the other
   replicas, then one commit makes it NORMAL and the dead node LEFT.
-- **Metadata service membership** (`POST /cms/reconfigure?members=`) is
+- **Metadata service membership** (`POST /api/v1/cms?members=`) is
   part of the metadata: the members of epoch N decide epoch N+1. As TCM's
   Prepare/AdvanceCMSReconfiguration, a reconfiguration moves one member
   per epoch, additions first; a node is brought up to date with the log
@@ -273,7 +273,7 @@ container to set per-pod flags.
   PREPARE_REPLACE/FINISH_REPLACE, RECONFIGURE_CMS, SCHEMA_CHANGE, ROLES)
   and what it did; the last 256 are in `system_views.cluster_metadata_log`,
   the node directory in `system_views.cluster_metadata_directory`.
-- `GET /status` is nodetool status.
+- `GET /api/v1/nodes` is nodetool status.
 
 ## Not done
 

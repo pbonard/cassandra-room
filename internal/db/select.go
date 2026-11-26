@@ -848,12 +848,7 @@ func (q *query) readPartition(p []byte, pk [][]byte) error {
 		return q.emitPartition(p, pk, nil, deletions{}, []kv{{p, v}})
 	}
 	if rs, ok := q.src.(reverseSource); ok && q.s.reversed {
-		before := len(q.rows)
-		err := q.readPartitionReversed(rs, p, pk)
-		if !errors.Is(err, errNoReverseReads) || len(q.rows) != before {
-			return err
-		}
-		// A replica of an older version: read forward.
+		return q.readPartitionReversed(rs, p, pk)
 	}
 	it, err := q.src.iter(append(slices.Clip(p), headerSuffix), append(slices.Clip(p), types.GTNext))
 	if err != nil {

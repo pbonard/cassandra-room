@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
@@ -444,28 +443,6 @@ func tokenRangesOf(start, end int64) []lsm.TokenRange {
 		out = append(out, lsm.TokenRange{First: u(start + 1), Last: u(math.MaxInt64)})
 	}
 	return out
-}
-
-// Status describes the cluster as nodetool status does.
-func (d *DB) Status() string {
-	if d.proxy == nil {
-		return "single node\n"
-	}
-	p := d.proxy
-	var b strings.Builder
-	fmt.Fprintf(&b, "Datacenter: %s\n", d.opts.DataCenter)
-	fmt.Fprintf(&b, "%-4s %-22s %-7s %-37s %s\n", "--", "Address", "Tokens", "Host ID", "Rack")
-	nodes := nodeList(d.schema.Load())
-	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Addr < nodes[j].Addr })
-	for _, s := range nodes {
-		state := "U"
-		if s.Addr != p.self && !p.g.IsAlive(s.Addr) {
-			state = "D"
-		}
-		state += map[string]string{cluster.StatusNormal: "N", cluster.StatusJoining: "J", cluster.StatusLeaving: "L", cluster.StatusLeft: "-"}[s.Status]
-		fmt.Fprintf(&b, "%-4s %-22s %-7d %-37s %s\n", state, s.Addr, len(s.Tokens), s.HostID, s.Rack)
-	}
-	return b.String()
 }
 
 // Cleanup removes the data of ranges this node no longer replicates

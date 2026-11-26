@@ -28,9 +28,7 @@
 //	                               archived segments (point in time)
 //	GET    /metrics                Prometheus metrics
 //
-// Errors are {"error": "..."} with a 4xx or 5xx status. The text endpoints
-// of earlier versions (GET /status, POST /repair, /cleanup, /removenode,
-// /cms/reconfigure, /decommission) remain.
+// Errors are {"error": "..."} with a 4xx or 5xx status.
 package manage
 
 import (
@@ -92,7 +90,6 @@ func Handler(d *db.DB, serving func() bool) http.Handler {
 		h.result(w, res, err)
 	})
 	mux.Handle("GET /metrics", promhttp.HandlerFor(d.Registry(), promhttp.HandlerOpts{}))
-	legacy(mux, d)
 	return mux
 }
 
@@ -284,47 +281,4 @@ func splitList(s string) []string {
 		}
 	}
 	return out
-}
-
-// legacy are the text endpoints of earlier versions.
-func legacy(mux *http.ServeMux, d *db.DB) {
-	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, d.Status()) })
-	mux.HandleFunc("POST /repair", func(w http.ResponseWriter, r *http.Request) {
-		st, err := d.Repair(r.URL.Query().Get("keyspace"))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintf(w, "repaired %d ranges: %d mismatches, %d bytes streamed\n", st.Ranges, st.Mismatches, st.Streamed)
-	})
-	mux.HandleFunc("POST /cleanup", func(w http.ResponseWriter, r *http.Request) {
-		n, err := d.Cleanup(r.URL.Query().Get("keyspace"))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintf(w, "cleaned %d tables\n", n)
-	})
-	mux.HandleFunc("POST /removenode", func(w http.ResponseWriter, r *http.Request) {
-		if err := d.RemoveNode(r.URL.Query().Get("node")); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintln(w, "removed")
-	})
-	mux.HandleFunc("POST /cms/reconfigure", func(w http.ResponseWriter, r *http.Request) {
-		members := splitList(r.URL.Query().Get("members"))
-		if err := d.ReconfigureCMS(members); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintln(w, "the metadata service is now", strings.Join(members, ", "))
-	})
-	mux.HandleFunc("POST /decommission", func(w http.ResponseWriter, _ *http.Request) {
-		if err := d.Decommission(); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintln(w, "decommissioned: the node has left the ring and can be stopped")
-	})
 }

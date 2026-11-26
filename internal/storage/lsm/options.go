@@ -66,8 +66,7 @@ type Options struct {
 	// PartitionPrefix, if set, returns the length of a key's partition
 	// prefix (all of it, or 0, for a key with none): Bloom filters then
 	// hold partitions, and a range read within one partition (as a read of
-	// a table with clustering columns is) skips sstables without it. Files
-	// written before keep their whole-key filters.
+	// a table with clustering columns is) skips sstables without it.
 	PartitionPrefix func(key []byte) int
 	// BlockSize is the target uncompressed size of sstable data blocks. Zero
 	// uses Pebble's default.

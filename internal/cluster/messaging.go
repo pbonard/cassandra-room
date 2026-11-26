@@ -46,7 +46,7 @@ const (
 	VerbMetadataSync
 	VerbAccord
 	// VerbReadRangeReverse reads a key range from its end down (reversed
-	// queries); appended, so older nodes refuse it as unknown.
+	// queries).
 	VerbReadRangeReverse
 	numVerbs
 )
@@ -147,11 +147,9 @@ type MessagingOptions struct {
 
 const (
 	// ProtocolVersion is this node's messaging version; MinProtocolVersion
-	// the oldest it can talk to.
-	// Version 5 adds forwarding (kindForward and after); a node uses it
-	// only towards peers that speak it.
+	// the oldest it can talk to: only its own (no mixed-version clusters).
 	ProtocolVersion    = 5
-	MinProtocolVersion = 4
+	MinProtocolVersion = ProtocolVersion
 
 	kindRequest  = 1
 	kindResponse = 2

@@ -114,18 +114,3 @@ func TestRequestForwardFailures(t *testing.T) {
 	require.Empty(t, a.relays)
 	a.relayMu.Unlock()
 }
-
-// TestRequestForwardOldPeer: towards a node without forwarding, every node
-// is sent the request directly.
-func TestRequestForwardOldPeer(t *testing.T) {
-	nodes, _ := forwardNodes(t, 3)
-	a, b, c := nodes[0], nodes[1], nodes[2]
-	a.mu.Lock()
-	a.peerVer[c.Addr()] = 4
-	a.mu.Unlock()
-	replies := collect(t, a.RequestForward(context.Background(), b.Addr(), []string{c.Addr()}, VerbMutation, []byte("w")), 2)
-	require.NoError(t, replies[b.Addr()].Err)
-	require.NoError(t, replies[c.Addr()].Err)
-	require.Zero(t, a.Stats().Forwards)
-	require.Zero(t, b.Stats().Relayed)
-}

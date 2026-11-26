@@ -103,18 +103,9 @@ func (m *Messaging) RequestForward(ctx context.Context, via string, forward []st
 	return out
 }
 
-// canForward reports whether via and every forwarded node speak forwarding.
-func (m *Messaging) canForward(via string, forward []string) bool {
-	if via == m.addr {
-		return false
-	}
-	for _, n := range append([]string{via}, forward...) {
-		if m.PeerVersion(n) < 5 {
-			return false
-		}
-	}
-	return true
-}
+// canForward reports whether a request can go through via for forward
+// (every node speaks forwarding: the cluster runs one version).
+func (m *Messaging) canForward(via string, _ []string) bool { return via != m.addr }
 
 // relay delivers a forwarded request to node to, for the coordinator; when
 // it cannot, it reports the failure to the coordinator through reply.

@@ -65,7 +65,7 @@ func main() {
 		adminKey              = flag.String("admin-key", "", "PEM private key for the management API")
 		adminCA               = flag.String("admin-ca", "", "PEM CA the management API's clients must present a certificate from")
 		_                     = flag.String("flags-file", "", "File of further flags, one per line (\"-name=value\"); the command line overrides them")
-		adminAddress          = flag.String("admin-address", "", "HTTP address for nodetool-style operations: GET /status, POST /repair?keyspace=, POST /cleanup?keyspace=, POST /removenode?node=, POST /cms/reconfigure?members=, POST /decommission")
+		adminAddress          = flag.String("admin-address", "", "HTTP address of the management API (/api/v1/...: nodes, ring, repair, cleanup, decommission, snapshots...; see docs/cluster.md)")
 	)
 	if err := flag.CommandLine.Parse(withFlagsFile(os.Args[1:])); err != nil {
 		os.Exit(2)
