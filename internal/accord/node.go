@@ -359,6 +359,7 @@ const (
 	mRedundant     msgType = "SetShardDurable"
 	mMajority      msgType = "SetMajorityDurable"
 	mBootstrapped  msgType = "SetBootstrapped"
+	mDecideHLC     msgType = "DecideUniqueHlc"
 )
 
 type envelope struct {
@@ -457,6 +458,22 @@ type applyReply struct {
 	MaxHLC  int64 `json:",omitempty"`
 }
 
+// decideHLCReq proposes, at a ballot, the HLC a transaction's writes
+// carry; decideHLCReply answers the HLC this replica holds for it (the one
+// applied, if it was).
+type decideHLCReq struct {
+	ID        TxnID
+	Ballot    Ballot
+	UniqueHLC int64
+	Keys      []Key
+}
+
+type decideHLCReply struct {
+	Outcome   outcome
+	UniqueHLC int64
+	Applied   bool `json:",omitempty"`
+}
+
 type recoverReq struct {
 	ID     TxnID
 	Ballot Ballot
@@ -470,6 +487,8 @@ type recoverReply struct {
 	Accepted  Ballot
 	ExecuteAt Timestamp
 	UniqueHLC int64 `json:",omitempty"`
+	// HLCBallot is the ballot UniqueHLC was accepted with.
+	HLCBallot Ballot `json:",omitempty"`
 	Deps      Deps
 	LocalDeps Deps
 	FastVote  bool
@@ -615,6 +634,14 @@ func (n *Node) Handle(ctx context.Context, from NodeID, payload []byte) ([]byte,
 		var r syncReq
 		if err = json.Unmarshal(env.B, &r); err == nil {
 			err = n.s.markRedundant(r.ID, r.Txn.Ranges)
+		}
+	case mDecideHLC:
+		var r decideHLCReq
+		if err = json.Unmarshal(env.B, &r); err == nil {
+			if err = n.awaitEpochFrom(ctx, from, r.ID.Epoch); err != nil {
+				break
+			}
+			reply, err = n.s.decideHLC(&r)
 		}
 	case mBootstrapped:
 		var r bootstrappedReq

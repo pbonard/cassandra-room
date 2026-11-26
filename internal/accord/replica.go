@@ -64,6 +64,10 @@ type Command struct {
 	// writes carry so they exceed every earlier write applied on its keys
 	// (TimestampWithUniqueHlc).
 	UniqueHLC int64 `json:",omitempty"`
+	// HLCBallot is the ballot UniqueHLC was accepted with (DecideUniqueHlc)
+	// before the transaction applied here: a recovery adopts the one of
+	// the highest ballot, so that every replica writes it at the same HLC.
+	HLCBallot Ballot `json:",omitempty"`
 	// Deps are the proposed (Accepted) or decided (Committed and after)
 	// dependencies; LocalDeps those this replica computed at PreAccept.
 	Deps      Deps `json:",omitempty"`
@@ -554,6 +558,40 @@ func (s *store) commit(ctx context.Context, r *commitReq) (*commitReply, error) 
 	return &commitReply{Outcome: ok, Reads: reads, MinHLC: minHLC}, nil
 }
 
+// decideHLC accepts, at a ballot, the HLC a transaction's writes carry
+// (a Paxos accept of that one value: the command's ballots order its
+// executors). The HLC depends on what the executor's read replica applied
+// before (UniqueHLC), so two executors (its coordinator and a recovery)
+// may compute different ones; without agreeing on one first, each replica
+// kept the first it was sent, and a later transaction, writing just above
+// one replica's, lost to another's.
+func (s *store) decideHLC(r *decideHLCReq) (*decideHLCReply, error) {
+	s.mu.Lock()
+	if s.forgottenLocked(r.ID, r.Keys) {
+		return &decideHLCReply{Outcome: redundant}, s.unlock()
+	}
+	c := s.get(r.ID)
+	switch {
+	case c.Status == Invalidated:
+		return &decideHLCReply{Outcome: redundant}, s.unlock()
+	case c.Status >= PreApplied:
+		return &decideHLCReply{Outcome: ok, Applied: true, UniqueHLC: c.UniqueHLC}, s.unlock()
+	case r.Ballot.Less(c.Promised):
+		return &decideHLCReply{Outcome: rejectedBallot}, s.unlock()
+	}
+	if c.UniqueHLC == 0 || !r.Ballot.Less(c.HLCBallot) {
+		c.UniqueHLC, c.HLCBallot = r.UniqueHLC, r.Ballot
+		if len(c.Keys) == 0 {
+			s.registerLocked(c, r.Keys)
+		}
+		if err := s.saveLocked(c); err != nil {
+			s.mu.Unlock()
+			return nil, err
+		}
+	}
+	return &decideHLCReply{Outcome: ok, UniqueHLC: c.UniqueHLC}, s.unlock()
+}
+
 func (s *store) commitLocked(c *command, executeAt Timestamp, deps Deps, txn *Txn, keys []Key, ballot Ballot, stable bool) error {
 	if c.Status == Truncated || c.Status == Applied || c.Status == PreApplied {
 		return nil
@@ -809,7 +847,7 @@ func (s *store) beginRecoveryLocked2(r *recoverReq) (*recoverReply, error) {
 	} else if err := s.saveLocked(c); err != nil {
 		return nil, err
 	}
-	rep := &recoverReply{Outcome: ok, Status: c.Status, Accepted: c.Accepted, ExecuteAt: c.ExecuteAt, UniqueHLC: c.UniqueHLC, Deps: c.Deps,
+	rep := &recoverReply{Outcome: ok, Status: c.Status, Accepted: c.Accepted, ExecuteAt: c.ExecuteAt, UniqueHLC: c.UniqueHLC, HLCBallot: c.HLCBallot, Deps: c.Deps,
 		LocalDeps: c.LocalDeps, FastVote: c.FastVote, Txn: c.Txn, Writes: c.Writes, Result: c.Result, Rejects: refused}
 	if c.Status >= Accepted {
 		return rep, nil
