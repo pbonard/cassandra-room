@@ -212,6 +212,7 @@ client certificates (`-admin-ca`):
 | `POST /api/v1/flush` | flush every memtable |
 | `POST /api/v1/decommission` | leave the ring, in the background (`/node` shows LEAVING, MID_LEAVE, then LEFT) |
 | `POST /api/v1/cleanup?keyspace=`, `/removenode?node=`, `/cms?members=` | as nodetool |
+| `POST /api/v1/cancel?node=` | give up the join (or replacement) of a node gone for good |
 | `POST /api/v1/repair` | `{"keyspace","table","start","end"}`: a token range (start, end], wrapping allowed, or the whole keyspace |
 | `POST /api/v1/snapshots`, `DELETE /api/v1/snapshots/{name}` | snapshot user keyspaces (returns each table's files), clear |
 | `POST /api/v1/import` | `{"keyspace","table","files"}`: load sstables into a table on this node |
@@ -265,7 +266,13 @@ container to set per-pod flags.
   coordinator, refused, catches up with the log from that replica and
   plans the request again (up to 3 times; refused replicas get no hints,
   and counter deltas are only sent again to the leader that refused them,
-  which applied nothing). Hints and streaming are not fenced.
+  which applied nothing). Hints and streaming are not fenced. The other
+  way round, a replica that gets a request planned with newer metadata
+  than its own catches up from its sender (or else from the metadata
+  service), in the background, serving requests meanwhile; one that does
+  not know a table the request names (created, not yet pushed to it)
+  catches up first, instead of failing the request. Concurrent requests
+  that find it behind fetch the log once (`CatchUpTo`).
 
   After each commit the node driving the movement runs a **progress
   barrier**: for every range whose owners change, enough of its old owners
@@ -307,7 +314,17 @@ container to set per-pod flags.
   node is committed LEAVING; for each of its ranges, the nodes that become
   replicas get the data from a surviving replica (the coordinator asks the
   source to push it); then it is MID_LEAVE, and LEFT, with barriers in
-  between as for a decommission.
+  between as for a decommission. It also finishes the leave of a node that
+  died decommissioning. A node that died joining is refused: made
+  LEAVING, it would be an owner reads go to, though it never had the
+  data; its join is cancelled instead.
+- **Cancel** (`POST /api/v1/cancel?node=`, a dead node): gives up a join
+  or replacement, so that it no longer holds every other movement up
+  (TCM's CancelInProgressSequence). From JOINING one commit makes the node
+  LEFT: reads never moved to it. From MID_JOIN the steps are undone in
+  turn: back to JOINING (reads return to the old owners, writes still
+  reach both), a progress barrier that does not wait for the dead node,
+  then LEFT. A node being replaced stays NORMAL, to be replaced again.
 - **Replace** (`-replace-address` on a new node's first boot): the new
   node takes the dead node's tokens as JOINING with `Replaces` set (writes
   of those ranges reach it as a pending replica, the dead node counts as
@@ -337,10 +354,10 @@ container to set per-pod flags.
   in the metadata (TCM records it so any node can finish it).
 - Range movements: the lock is the whole ring, not the ranges moved (TCM
   locks only those, so movements of disjoint ranges run together); a
-  movement whose node is gone for good cannot be cancelled. Fencing is by
-  the epoch the node's placements last changed at, for every range (TCM
-  refuses only requests for the ranges whose placements changed), and a
-  replica behind a coordinator does not catch up from it on the spot.
+  leave cannot be cancelled (a dead leaving node is removed instead).
+  Fencing is by the epoch the node's placements last changed at, for every
+  range (TCM refuses only requests for the ranges whose placements
+  changed).
 - Repair is full repair only (no incremental repair); streaming sends
   files through messages (no sendfile).
 
@@ -363,7 +380,10 @@ intersect at every pair of neighbouring steps of a join, a leave and a
 replace, and fail to when a step is skipped;
 `internal/db/transitions_test.go` checks the steps' commits, that the
 barrier waits for the nodes, and that a second movement waits or is
-refused; `internal/db/fence_test.go` checks the fence, the barrier's
+refused; `internal/db/cancel_test.go` checks cancelling a dead joiner from
+JOINING and MID_JOIN (removenode refuses it; another node joins after),
+and a replica catching up when a write names a table it has not heard
+of; `internal/db/fence_test.go` checks the fence, the barrier's
 quorums, and a node cut off from the log during a join: the join does not
 wait for it, its writes and reads with the old placements are refused
 (they succeed without fencing), and once reconnected it catches up when

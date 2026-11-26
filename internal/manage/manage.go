@@ -12,6 +12,8 @@
 //	POST   /api/v1/decommission    leave the ring (asynchronous: see /node)
 //	POST   /api/v1/cleanup?keyspace=
 //	POST   /api/v1/removenode?node=<address or host id>
+//	POST   /api/v1/cancel?node=<address or host id>  give up the join of a
+//	                               node gone for good
 //	POST   /api/v1/cms?members=a,b reconfigure the metadata service
 //	POST   /api/v1/repair          {"keyspace","table","start","end"}: a range
 //	                               (start, end] when given, else everything
@@ -65,6 +67,9 @@ func Handler(d *db.DB, serving func() bool) http.Handler {
 	})
 	mux.HandleFunc("POST /api/v1/removenode", func(w http.ResponseWriter, r *http.Request) {
 		h.done(w, d.RemoveNode(r.URL.Query().Get("node")))
+	})
+	mux.HandleFunc("POST /api/v1/cancel", func(w http.ResponseWriter, r *http.Request) {
+		h.done(w, d.CancelMovement(r.URL.Query().Get("node")))
 	})
 	mux.HandleFunc("POST /api/v1/cms", func(w http.ResponseWriter, r *http.Request) {
 		h.done(w, d.ReconfigureCMS(splitList(r.URL.Query().Get("members"))))
