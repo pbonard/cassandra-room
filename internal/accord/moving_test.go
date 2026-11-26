@@ -320,10 +320,8 @@ func TestProposeKeepsDeps(t *testing.T) {
 	c.net.down["n2"] = true
 	c.net.mu.Unlock()
 
-	// Also apply dep on n0 and n1 only after propose's Accept round? Even
-	// simpler: invalidated on n0/n1 after Commit, or apply dep on n0/n1
-	// once propose commits so execute unblocks, verifying Commit recorded
-	// dep in c.Deps!
+	// n0 and n1 apply dep only once the transaction is committed: until
+	// then its execution waits on dep, so the commit must have kept it.
 	id := TxnID{Timestamp: Timestamp{Epoch: 1, HLC: 200, Node: "n0"}, Kind: Write}
 	txn := appendTxn(t, k, 2)
 	done := make(chan error, 1)
@@ -395,4 +393,95 @@ func TestDurabilityWaitsForPending(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		require.Equal(t, 1, c.node(i).Stats().Redundant, "node n%d learnt the redundancy bound", i)
 	}
+}
+
+// highBound gives a node a bootstrap bound over a key whose HLC is far
+// above the others' (a node that took the range over from streamed data):
+// it reads, for a transaction, a minimum write HLC above theirs.
+func highBound(t *testing.T, n *Node, k Key, hlc int64) {
+	require.NoError(t, n.s.setBootstrapped(BootstrapPoints{{R: Range{Lo: k.Token, Hi: k.Token}, TS: Timestamp{Epoch: 1, HLC: 1, Node: "x"}, MaxHLC: hlc}}))
+}
+
+// TestRecoveryAdoptsDecidedHLC: a transaction's write HLC is decided at a
+// quorum before any replica applies it, and a recovery executing it again
+// adopts the one accepted at the highest ballot instead of its own. Its
+// read replica here would give another (n0 holds a higher bound): with
+// each executor choosing its own, replicas stored the same transaction at
+// different HLCs, and a later transaction, written just above one
+// replica's, lost to another's.
+func TestRecoveryAdoptsDecidedHLC(t *testing.T) {
+	c := newSimCluster(t, 3, 3, 1)
+	k := c.keys[0]
+	n0, n1 := c.node(0), c.node(1)
+	highBound(t, n0, k, n1.clock.Next(0)+10_000_000)
+	id := TxnID{Timestamp: Timestamp{Epoch: 1, HLC: n1.clock.Next(0), Node: "n1"}, Kind: Write}
+	txn := appendTxn(t, k, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ts := n1.phaseTopologies(txn.Keys, id.Epoch, id.Epoch)
+	// n1 coordinated it up to the decided HLC, then stopped.
+	require.NoError(t, n1.quorum(ctx, ts, mCommit, &commitReq{ID: id, ExecuteAt: id.Timestamp, Deps: Deps{}, Txn: txn, Keys: txn.Keys}))
+	decided, err := n1.decideHLC(ctx, ts, Ballot{}, id, txn.Keys, id.HLC)
+	require.NoError(t, err)
+	require.Equal(t, id.HLC, decided)
+
+	require.NoError(t, n0.recover(ctx, id, txn, txn.Keys))
+	c.settle()
+	for _, r := range c.ids {
+		st := c.stores[r]
+		st.mu.Lock()
+		got := st.data[keyString(k)]
+		st.mu.Unlock()
+		require.Len(t, got, 1, r)
+		require.Equal(t, decided, got[0].At.HLC, "%s writes at the decided HLC", r)
+	}
+}
+
+// TestDecideHLCPreempted: once a recovery promised a higher ballot, the
+// transaction's earlier executor can no longer have its write HLC
+// accepted (it then waits for the recovery's outcome).
+func TestDecideHLCPreempted(t *testing.T) {
+	c := newSimCluster(t, 3, 3, 1)
+	k := c.keys[0]
+	n0, n1 := c.node(0), c.node(1)
+	id := TxnID{Timestamp: Timestamp{Epoch: 1, HLC: n1.clock.Next(0), Node: "n1"}, Kind: Write}
+	txn := appendTxn(t, k, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ts := n1.phaseTopologies(txn.Keys, id.Epoch, id.Epoch)
+	require.NoError(t, n1.quorum(ctx, ts, mCommit, &commitReq{ID: id, ExecuteAt: id.Timestamp, Deps: Deps{}, Txn: txn, Keys: txn.Keys}))
+	b := Ballot{Epoch: 1, HLC: n0.clock.Next(0), Node: "n0"}
+	for i := 0; i < 3; i++ {
+		_, err := c.node(i).s.beginRecovery(&recoverReq{ID: id, Ballot: b, Txn: txn, Keys: txn.Keys})
+		require.NoError(t, err)
+	}
+	_, err := n1.decideHLC(ctx, ts, Ballot{}, id, txn.Keys, id.HLC)
+	require.ErrorIs(t, err, errPreempted)
+}
+
+// TestBootstrapSyncPointSkipsPending: a bootstrap's sync point applies at
+// the replicas, not the pending ones (the nodes about to receive the
+// data, which cannot apply it before they have it): its universal attempt
+// succeeds without them, instead of timing out on every join.
+func TestBootstrapSyncPointSkipsPending(t *testing.T) {
+	c := newSimCluster(t, 3, 2, 1)
+	whole := Range{Lo: math.MinInt64, Hi: math.MaxInt64}
+	topo := &Topology{Epoch: 2, Replicas: c.replicas, Nodes: c.ids,
+		Pending: func(Key) []NodeID { return []NodeID{"n2"} },
+		RangeReplicas: func(r Range) []RangeShard {
+			return []RangeShard{{Range: r, Nodes: []NodeID{"n0", "n1"}, Pending: []NodeID{"n2"}}}
+		}}
+	for i := 0; i < 3; i++ {
+		c.node(i).SetTopology(topo)
+	}
+	c.net.mu.Lock()
+	c.net.down["n2"] = true
+	c.net.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, applied, _, err := c.node(0).syncPoint(ctx, []Range{whole}, true, false)
+	require.NoError(t, err)
+	require.Equal(t, []NodeID{"n0", "n1"}, applied)
+	require.Less(t, time.Since(start), time.Second)
 }

@@ -183,16 +183,22 @@ func (n *Node) rangeTopologies(r Range) *Topologies {
 // its id once it applied at a quorum of every shard (at every replica if
 // universal).
 func (n *Node) SyncPoint(ctx context.Context, r Range, universal bool) (TxnID, error) {
-	id, _, _, err := n.syncPoint(ctx, []Range{r}, universal)
+	id, _, _, err := n.syncPoint(ctx, []Range{r}, universal, universal)
 	return id, err
 }
 
 // syncPoint coordinates one exclusive sync point over ranges: every
 // transaction on any of them with a lower id is one of its dependencies.
-// It returns once it applied at a quorum of every shard (or every replica,
-// pending ones included, if universal), with the nodes it applied at by
-// then and the largest HLC applied on their ranges.
-func (n *Node) syncPoint(ctx context.Context, ranges []Range, universal bool) (TxnID, []NodeID, int64, error) {
+// It returns once it applied at a quorum of every shard (or every replica
+// if universal, pending ones too if pending), with the nodes it applied at
+// by then and the largest HLC applied on their ranges.
+//
+// Durability rounds wait for pending replicas, so that a redundancy bound
+// is never set before they applied the transactions it covers. A
+// bootstrap's sync point does not: the pending replicas are the nodes
+// about to receive the ranges' data, which cannot apply it before they
+// have it (the universal attempt would always time out).
+func (n *Node) syncPoint(ctx context.Context, ranges []Range, universal, pending bool) (TxnID, []NodeID, int64, error) {
 	ts := &Topologies{}
 	for _, r := range ranges {
 		ts.Shards = append(ts.Shards, n.rangeTopologies(r).Shards...)
@@ -227,11 +233,9 @@ func (n *Node) syncPoint(ctx context.Context, ranges []Range, universal bool) (T
 		return TxnID{}, nil, 0, ErrTimeout
 	}
 	n.metrics.syncPoints.Add(1)
-	// Applying it means every dependency applied at that replica. A
-	// universal sync point also waits for pending replicas, so a redundancy
-	// bound is never set before they applied the transactions it covers.
+	// Applying it means every dependency applied at that replica.
 	applyTargets := nodes
-	if universal {
+	if universal && pending {
 		applyTargets = ts.applyNodes()
 	}
 	req := &applyReq{ID: id, ExecuteAt: id.Timestamp, Deps: deps, Txn: txn, Writes: Writes{}}
@@ -366,10 +370,10 @@ func (n *Node) BootstrapPoints(ctx context.Context, ranges []Range) (BootstrapPo
 	// and they are coordinated again in an epoch that includes them.
 	n.awaitSynced(ctx, n.epoch())
 	uctx, cancel := context.WithTimeout(ctx, 4*n.cfg.RequestTimeout)
-	id, applied, maxHLC, err := n.syncPoint(uctx, ranges, true)
+	id, applied, maxHLC, err := n.syncPoint(uctx, ranges, true, false)
 	cancel()
 	if err != nil {
-		id, applied, maxHLC, err = n.syncPoint(ctx, ranges, false)
+		id, applied, maxHLC, err = n.syncPoint(ctx, ranges, false, false)
 	}
 	if err != nil {
 		return nil, nil, err

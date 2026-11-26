@@ -259,6 +259,12 @@ func (n *Node) propose(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 // (Stabilise, then ExecuteTxn), computes the writes and result and applies
 // them (Persist).
 func (n *Node) execute(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, executeAt Timestamp, deps Deps) ([]byte, error) {
+	return n.executeWith(ctx, ballot, id, txn, executeAt, deps, 0)
+}
+
+// executeWith executes with prior, if not 0, the write HLC an earlier
+// executor had accepted at the highest ballot a recovery found.
+func (n *Node) executeWith(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, executeAt Timestamp, deps Deps, prior int64) ([]byte, error) {
 	if txn == nil {
 		return nil, errors.New("accord: executing a transaction without its definition")
 	}
@@ -269,11 +275,13 @@ func (n *Node) execute(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 	commit := func(stable bool) *commitReq {
 		return &commitReq{ID: id, Ballot: ballot, ExecuteAt: executeAt, Deps: deps, Txn: txn, Keys: txn.Keys, Stable: stable}
 	}
-	// Committed at a quorum of every shard first, so any recovery finds the
-	// decision (and its dependencies) before a replica executes it.
-	if err := n.quorum(ctx, ts, mCommit, commit(false)); err != nil {
-		return nil, err
-	}
+	// Committed at a quorum of every shard, so any recovery finds the
+	// decision (and its dependencies) before a replica executes it. The
+	// reads go out meanwhile: a read replica only reads (the transaction
+	// executes, writing, once the HLC below is decided at a quorum, which
+	// is after this), and the decision is already final.
+	committed := make(chan error, 1)
+	go func() { committed <- n.quorum(ctx, ts, mCommit, commit(false)) }()
 	// Stable everywhere; read from one replica per shard.
 	stable := commit(true)
 	reads := map[string][]byte{}
@@ -327,6 +335,9 @@ func (n *Node) execute(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 			return nil, ErrTimeout
 		}
 	}
+	if err := <-committed; err != nil {
+		return nil, err
+	}
 	for _, to := range ts.nodes() {
 		if !readers[to] {
 			go func() { _ = n.send(context.Background(), to, mCommit, stable, nil) }()
@@ -339,9 +350,18 @@ func (n *Node) execute(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 		writes, result = applied.Writes, applied.Result
 		uniqueHLC = max(executeAt.HLC, applied.UniqueHLC)
 	} else {
+		// One HLC for the writes at every replica, decided at a quorum
+		// under this execution's ballot: an earlier executor's accepted
+		// one (found by this recovery) wins over this one's own.
+		if prior > 0 {
+			uniqueHLC = prior
+		}
+		var err error
+		if uniqueHLC, err = n.decideHLC(ctx, ts, ballot, id, txn.Keys, uniqueHLC); err != nil {
+			return nil, err
+		}
 		writeAt := Timestamp{Epoch: executeAt.Epoch, HLC: uniqueHLC, Node: executeAt.Node}
 		n.clock.Observe(uniqueHLC)
-		var err error
 		writes, result, err = n.cfg.Agent.Execute(txn, writeAt, reads)
 		if err != nil {
 			return nil, err
@@ -352,6 +372,44 @@ func (n *Node) execute(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 		return nil, err
 	}
 	return result, n.persist(ctx, ats, id, txn, executeAt, uniqueHLC, deps, writes, result)
+}
+
+// decideHLC has a quorum of every shard accept the HLC a transaction's
+// writes carry, at a ballot, and returns the decided one: a replica that
+// already applied the transaction answers the HLC it applied it at, which
+// is final.
+func (n *Node) decideHLC(ctx context.Context, ts *Topologies, ballot Ballot, id TxnID, keys []Key, hlc int64) (int64, error) {
+	req := &decideHLCReq{ID: id, Ballot: ballot, UniqueHLC: hlc, Keys: keys}
+	nodes := ts.nodes()
+	ch := broadcast[decideHLCReply](ctx, n, nodes, mDecideHLC, func(NodeID) any { return req })
+	tr := newTracker(ts, (*Shard).slowQuorum)
+	for i := 0; i < len(nodes) && !tr.done(); i++ {
+		var r response[decideHLCReply]
+		select {
+		case r = <-ch:
+		case <-ctx.Done():
+			return 0, ErrTimeout
+		}
+		switch {
+		case r.err != nil:
+			tr.failure(r.from)
+		case r.reply.Outcome == rejectedBallot:
+			return 0, errPreempted
+		case r.reply.Outcome != ok:
+			tr.failure(r.from)
+		case r.reply.Applied:
+			return r.reply.UniqueHLC, nil
+		default:
+			tr.success(r.from)
+		}
+		if tr.impossible() {
+			return 0, ErrTimeout
+		}
+	}
+	if !tr.done() {
+		return 0, ErrTimeout
+	}
+	return hlc, nil
 }
 
 // applyTopologies are the replicas a transaction's writes go to: those of
@@ -583,7 +641,17 @@ func (n *Node) recover(ctx context.Context, id TxnID, txn *Txn, keys []Key) erro
 		}
 		return n.persist(ctx, ats, id, txn, best.ExecuteAt, best.UniqueHLC, best.Deps, best.Writes, best.Result)
 	case best.Status == Stable || best.Status == Committed:
-		_, err := n.execute(ctx, ballot, id, txn, best.ExecuteAt, best.Deps)
+		// The write HLC accepted at the highest ballot, if any: one an
+		// earlier executor may have had decided (Paxos: a quorum that
+		// accepted it intersects this recovery's).
+		var prior int64
+		var at Ballot
+		for _, r := range oks {
+			if r.UniqueHLC > 0 && (prior == 0 || at.Less(r.HLCBallot)) {
+				prior, at = r.UniqueHLC, r.HLCBallot
+			}
+		}
+		_, err := n.executeWith(ctx, ballot, id, txn, best.ExecuteAt, best.Deps, prior)
 		return err
 	case best.Status == Accepted:
 		// The latest proposal's dependencies, with what the replicas

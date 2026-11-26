@@ -139,6 +139,19 @@ names, not its class structure.
        HLC after a newer-epoch fast-path transaction committed, and two
        slow-path transactions across shards proposing the same microsecond
        HLC on different nodes.
+    3. That HLC is decided before any replica applies the transaction
+       (`DecideUniqueHlc`): it depends on what the executor's read
+       replica applied, so two executors (its coordinator and a
+       recovery) reading different replicas can compute different ones,
+       and each replica kept the first it was sent; a later transaction
+       written just above one replica's then lost to another's. The
+       executor has a quorum of every shard accept its HLC at its ballot
+       (a replica that promised a higher ballot refuses: the executor
+       was preempted; one that already applied the transaction answers
+       the HLC it applied, which is final). A recovery adopts the HLC
+       accepted at the highest ballot among its replies: a quorum that
+       accepted one intersects its own. The reads go out with the commit
+       round instead of after it, so that this costs no extra round trip.
   - **Late ownership** (`late_owned`): a transaction applied here that
     gains a key this node owned at the epoch it executed at is counted.
     Gaining keys of a later epoch is normal (a range the node starts
@@ -175,7 +188,9 @@ names, not its class structure.
      replicas (a schema change) needs no sync point.
 - **Durability** (`CoordinateShardDurable`, `RedundantBefore`): each node
   periodically runs a sync point over the ranges it is the first replica
-  of, applied at every replica (pending replicas included). It skips
+  of, applied at every replica (pending replicas included: a bootstrap's
+  sync point, whose pending replicas are the nodes about to receive the
+  data, does not wait for them). It skips
   ranges with no transaction above their current bound. Each sync point's
   id then becomes the range's redundancy bound on every replica and
   pending replica.
@@ -416,8 +431,10 @@ names, not its class structure.
     applying, reads skip keys a replica is only pending on, pending
     replicas changing a range's epoch sync, bootstrap points waking
     waiting commands, late ownership counted, `UniqueHLC` across epochs
-    and same-HLC ties, `propose` keeping input dependencies, and
-    universal durability sync points waiting for pending replicas;
+    and same-HLC ties, a recovery adopting the decided write HLC, a
+    preempted executor's HLC refused, `propose` keeping input
+    dependencies, universal durability sync points waiting for pending
+    replicas, and a bootstrap's sync point not waiting for them;
   - majority durability with a replica down, and its catching up.
 - `internal/accord/review_test.go`: recovery across epochs, a `Truncated`
   outcome, and ephemeral reads retried at a newer epoch.
