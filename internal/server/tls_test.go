@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/cockroachdb/pebble/vfs"
-	"github.com/gocql/gocql"
 	"github.com/pbonard/cassandra-room/internal/db"
 	"github.com/stretchr/testify/require"
 )

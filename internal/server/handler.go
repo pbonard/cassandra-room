@@ -118,6 +118,10 @@ func (s *Server) handleMessage(
 
 	switch m := msg.(type) {
 	case *message.Register:
+		session.register(m.EventTypes)
+		s.mu.Lock()
+		s.eventSessions[session] = struct{}{}
+		s.mu.Unlock()
 		return &message.Ready{}
 
 	case *message.Query:

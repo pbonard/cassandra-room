@@ -131,6 +131,13 @@ read and served through the same SELECT path, so drivers' metadata queries
 work unchanged. The node reports release version 5.0.4 and owns the whole
 ring.
 
+Clients that `REGISTER` for `SCHEMA_CHANGE` events are pushed one (on
+stream -1) for each keyspace, table and user type created, altered or
+dropped, by every node as it installs the metadata version; a dropped
+keyspace is one event. Drivers that cache the schema (gocql v2, the Java
+driver) refresh their metadata on them. Topology and status events are not
+sent.
+
 Also virtual: `system.size_estimates` and `system.table_estimates` (per
 table and primary range, estimated from the engine's row counts and a
 sample of partition sizes, as Spark's connector reads them),
@@ -215,10 +222,11 @@ sstables or the memtables.
   through every query shape against the unpaged result, TTL and timestamps,
   schema persistence across restarts and the system tables, LWT, DESCRIBE,
   Murmur3 against Cassandra's Java implementation.
-- `internal/server`: protocol tests on a real (in-memory) database, and
-  `TestGocql`, which runs the gocql driver over TCP with protocols v3 and
-  v4: every common type, paging, batches, LWT, TTL, error codes and schema
-  metadata. cqlsh 6.2 (Python driver, protocol v5) was also checked by hand:
+- `internal/server`: protocol tests on a real (in-memory) database, schema
+  change events (`TestSchemaChangeEvents`), and `TestGocql`, which runs the
+  gocql driver (`github.com/apache/cassandra-gocql-driver/v2`) over TCP
+  with protocols v3 and v4: every common type, paging, batches, LWT, TTL,
+  error codes and schema metadata (refreshed from the events). cqlsh 6.2 (Python driver, protocol v5) was also checked by hand:
   queries, DESCRIBE and `system.local` display correctly.
 
 `BenchmarkExecute` (in-process, no network, one core): a 6-column insert

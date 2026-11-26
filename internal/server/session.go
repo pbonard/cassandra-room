@@ -1,6 +1,8 @@
 package server
 
 import (
+	"net"
+	"slices"
 	"sync"
 
 	"github.com/datastax/go-cassandra-native-protocol/compression"
@@ -31,6 +33,29 @@ type Session struct {
 
 	writeMu  sync.Mutex
 	writeErr error
+
+	// conn is the session's connection, and events the event types its
+	// client registered for (REGISTER), pushed to it on stream -1.
+	conn   net.Conn
+	events []primitive.EventType
+}
+
+// register records the event types the client registered for.
+func (s *Session) register(types []primitive.EventType) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, t := range types {
+		if !slices.Contains(s.events, t) {
+			s.events = append(s.events, t)
+		}
+	}
+}
+
+// registered reports whether the client registered for an event type.
+func (s *Session) registered(t primitive.EventType) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return slices.Contains(s.events, t)
 }
 
 // isInitialized returns true if STARTUP has already completed on this session.

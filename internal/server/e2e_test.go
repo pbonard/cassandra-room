@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/cockroachdb/pebble/vfs"
-	"github.com/gocql/gocql"
 	"github.com/pbonard/cassandra-room/internal/db"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/inf.v0"
@@ -184,10 +184,15 @@ func TestGocql(t *testing.T) {
 			require.NoError(t, s.Query(`SELECT n FROM views WHERE page = 'home'`).Scan(&views))
 			require.Equal(t, int64(15), views)
 
-			// Schema metadata through the driver.
-			md, err := s.KeyspaceMetadata(ks)
-			require.NoError(t, err)
-			require.Contains(t, md.Tables, "events")
+			// Schema metadata through the driver: it caches the schema and
+			// refreshes it on the server's schema change events (debounced
+			// by a second).
+			var md *gocql.KeyspaceMetadata
+			require.Eventually(t, func() bool {
+				var err error
+				md, err = s.KeyspaceMetadata(ks)
+				return err == nil && md.Tables["events"] != nil
+			}, 10*time.Second, 100*time.Millisecond, "the schema change event refreshes the driver's metadata")
 			require.Equal(t, []string{"sensor"}, columnNames(md.Tables["events"].PartitionKey))
 			require.Equal(t, []string{"at"}, columnNames(md.Tables["events"].ClusteringColumns))
 		})

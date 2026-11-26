@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/datastax/go-cassandra-native-protocol/message"
 	"io"
 	"net"
 	"os"
@@ -69,6 +70,10 @@ type DB struct {
 	ddlMu   sync.Mutex
 	tableMu sync.RWMutex
 	schema  atomic.Pointer[Schema]
+	// schemaEvents is told the schema changes of each metadata version
+	// installed (OnSchemaChange).
+	schemaEventsMu sync.Mutex
+	schemaEvents   func([]*message.SchemaChangeEvent)
 	// schemas are recent metadata snapshots, for transactions made at an
 	// earlier one (see pinnedSchema).
 	schemas schemaHistory

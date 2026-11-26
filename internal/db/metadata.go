@@ -108,6 +108,7 @@ func (d *DB) installLocked(next *Schema) error {
 		return err
 	}
 	d.setSchema(next)
+	d.notifySchemaChanges(old, next)
 	// Options changed by ALTER TABLE take effect now.
 	for id, t := range next.byStorage {
 		if ot := old.byStorage[id]; ot != nil && !reflect.DeepEqual(ot.Params, t.Params) {
