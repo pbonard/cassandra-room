@@ -501,6 +501,11 @@ type frame struct {
 	size     int // bytes on the wire
 }
 
+// maxInflightPerConn bounds the requests of one inbound connection being
+// processed or waiting for their stage (Cassandra pairs its byte limits
+// with a count).
+const maxInflightPerConn = 4096
+
 // writeTimeout bounds writing a frame of n bytes: a peer that stops
 // reading must not hold the connection's writers forever. Generous: 30
 // seconds, plus a second per MiB.
@@ -647,6 +652,10 @@ func (m *Messaging) serve(c net.Conn) {
 
 	own := newBudget(m.opts.QueueCapacity)
 	endpoint := m.endpointBudget(m.inEndpoint, from, true)
+	// Requests in flight on this connection, by count as well as bytes:
+	// tiny frames within the byte budget could otherwise park any number
+	// of goroutines waiting for their stage.
+	inflight := make(chan struct{}, maxInflightPerConn)
 	var wmu sync.Mutex
 	for {
 		f, err := readFrame(r)
@@ -705,6 +714,9 @@ func (m *Messaging) serve(c net.Conn) {
 		if release == nil {
 			return // closing
 		}
+		inflight <- struct{}{} // past the limit, stop reading
+		free := release
+		release = func() { free(); <-inflight }
 		go m.dispatch(handlerFrom, f, release, reply)
 	}
 }
