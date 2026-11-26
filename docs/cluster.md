@@ -174,7 +174,11 @@ node, the coordinator in a cluster.
   (as a Cassandra replica applies its tombstones), though they are stored
   until compaction: read repair never copies such a row to a replica that
   compacted it away and, past `gc_grace_seconds`, purged the deletion,
-  which would resurrect it.
+  which would resurrect it. Forward reads starting at or before a
+  partition's header take its deletions from the scan itself (they sort
+  before its rows); reverse reads, and pages starting within a partition,
+  read them with one scan of the partition's header and tombstones.
+  Tables without clustering columns are not filtered.
 - **Schema** and role changes are metadata commits (above), from any node.
 - **Counters** are CounterMutations: the coordinator builds deltas, each
   partition's leader (this node if it is a live replica, else a live one
