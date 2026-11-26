@@ -289,6 +289,15 @@ func (p *proxy) startAccord() error {
 		EpochRanges:        p.accordTableRanges,
 		DurabilityInterval: p.opts.AccordDurabilityInterval,
 		Proximity:          p.accordProximity,
+		// A transaction of an epoch this node does not know yet waits for
+		// it: catch up with the node that knows it.
+		FetchEpoch: func(from accord.NodeID, epoch int64) {
+			f := string(from)
+			if f == "" {
+				f = p.self
+			}
+			p.fetchEpoch(f, epoch)
+		},
 	})
 	if err != nil {
 		return err
@@ -353,14 +362,27 @@ func (p *proxy) accordTopology(s *Schema) {
 			repl := s.Keyspaces[t.Keyspace].Replication
 			var out []accord.RangeShard
 			for tok := r.Lo; ; {
-				end, wraps := ring.RangeEnd(tok)
-				if wraps {
-					end = math.MaxInt64
+				// Split where any of the read, old or future placements
+				// changes owners.
+				end := r.Hi
+				for _, rg := range []*cluster.Ring{ring, future, old} {
+					if rg.Empty() {
+						continue
+					}
+					if e, wraps := rg.RangeEnd(tok); !wraps {
+						end = min(end, e)
+					}
 				}
-				end = min(end, r.Hi)
 				sh := accord.RangeShard{Range: accord.Range{Prefix: r.Prefix, Lo: tok, Hi: end}}
 				for _, n := range ring.Replicas(repl, tok) {
 					sh.Nodes = append(sh.Nodes, n.Addr)
+				}
+				for _, r := range []*cluster.Ring{future, old} {
+					for _, n := range r.Replicas(repl, tok) {
+						if !slices.Contains(sh.Nodes, n.Addr) && !slices.Contains(sh.Pending, n.Addr) {
+							sh.Pending = append(sh.Pending, n.Addr)
+						}
+					}
 				}
 				out = append(out, sh)
 				if end >= r.Hi {
@@ -1171,7 +1193,7 @@ func accordStatRows(d *DB) []map[string][]byte {
 		{"majority_rounds", st.MajorityRounds}, {"journal_errors", st.JournalErrors}, {"persist_shed", st.PersistShed},
 		{"epoch_syncs", st.EpochSyncs},
 		{"commands", int64(st.Commands)}, {"keys", int64(st.Keys)}, {"barriers", int64(st.Barriers)},
-		{"redundant_bounds", int64(st.Redundant)}, {"bootstrapped_ranges", int64(st.Bootstrapped)}, {"epoch", st.Epoch}, {"synced_epoch", st.SyncedEpoch},
+		{"redundant_bounds", int64(st.Redundant)}, {"bootstrapped_ranges", int64(st.Bootstrapped)}, {"late_owned", st.LateOwned}, {"epoch", st.Epoch}, {"synced_epoch", st.SyncedEpoch},
 	} {
 		out = append(out, map[string][]byte{"name": textV(kv.name), "value": bigintV(kv.v)})
 	}
@@ -1258,6 +1280,82 @@ func accordRangesOf(prefix string, r [2]int64) []accord.Range {
 // accordPrefix is a table's prefix in Accord keys and ranges.
 func accordPrefix(id lsm.TableID) string {
 	return string(binary.BigEndian.AppendUint64(nil, uint64(id)))
+}
+
+// gainedAccordRanges returns, per node, the Accord ranges of the user
+// tables it replicates in future and not in cur, among the ranges whose
+// current replicas from selects (a leaving or removed node's ranges).
+func (p *proxy) gainedAccordRanges(cur, future *cluster.Ring, from func(reps []*cluster.Node) bool) map[string][]accord.Range {
+	s := p.d.schema.Load()
+	out := map[string][]accord.Range{}
+	for _, t := range p.d.userTables() {
+		k := s.Keyspaces[t.Keyspace]
+		if k == nil {
+			continue
+		}
+		for _, r := range cur.Ranges() {
+			reps := cur.Replicas(k.Replication, r[1])
+			if !from(reps) {
+				continue
+			}
+			for _, n := range future.Replicas(k.Replication, r[1]) {
+				if !slices.ContainsFunc(reps, func(c *cluster.Node) bool { return c.HostID == n.HostID }) {
+					out[n.Addr] = append(out[n.Addr], accordRangesOf(accordPrefix(t.Storage), r)...)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// accordHandoff takes Accord's bootstrap point of the ranges nodes take
+// over, before their data is streamed to them, and returns what tells them
+// once it is (Accord's bootstrap for nodes that do not stream themselves),
+// and whether a node applied the point: the data must be streamed from one
+// that did, so that it holds every transaction before it (one of an
+// earlier epoch may otherwise apply at the source after the export, and at
+// a node taking over only on the keys it replicated then). Where a range
+// has no live quorum, no Accord transaction commits there meanwhile, and
+// the nodes go without the point: they fetch the earlier transactions they
+// do not know.
+func (p *proxy) accordHandoff(gained map[string][]accord.Range) (done func(), applied func(addr string) bool, err error) {
+	any := func(string) bool { return true }
+	if p.accord == nil || len(gained) == 0 {
+		return func() {}, any, nil
+	}
+	var all []accord.Range
+	for _, rs := range gained {
+		for _, r := range rs {
+			if !slices.Contains(all, r) {
+				all = append(all, r)
+			}
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	pts, at, err := p.accord.BootstrapPoints(ctx, all)
+	cancel()
+	switch {
+	case errors.Is(err, accord.ErrUnavailable):
+		return func() {}, any, nil
+	case err != nil:
+		return nil, nil, fmt.Errorf("Accord sync point before streaming: %w", err)
+	}
+	return func() {
+			for addr, rs := range gained {
+				// Best effort: a node not told waits for (and fetches) the
+				// earlier transactions instead.
+				for try := 0; try < 3; try++ {
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					err := p.accord.SendBootstrapped(ctx, accord.NodeID(addr), pts.For(rs))
+					cancel()
+					if err == nil {
+						break
+					}
+				}
+			}
+		}, func(addr string) bool {
+			return slices.Contains(at, accord.NodeID(addr))
+		}, nil
 }
 
 // accordTableRanges are the whole token ranges of the user tables.

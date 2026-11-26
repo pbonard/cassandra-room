@@ -83,6 +83,12 @@ type Config struct {
 	// Proximity, if set, ranks another node by distance (lower is nearer):
 	// reads go to the nearest replicas first.
 	Proximity func(NodeID) int
+	// FetchEpoch, if set, is called when this node needs a topology epoch
+	// it does not know yet (a message planned with it, or a transaction
+	// executing at it), with the node that knows it ("" if none in
+	// particular): it should bring the node's metadata up to that epoch.
+	// The node waits for it either way.
+	FetchEpoch func(from NodeID, epoch int64)
 }
 
 // Errors returned by Coordinate.
@@ -92,6 +98,9 @@ var (
 	ErrInvalidated = errors.New("accord: transaction invalidated")
 	// ErrTimeout: the outcome is unknown.
 	ErrTimeout = errors.New("accord: transaction outcome unknown")
+	// ErrUnavailable: a sync point could not reach a quorum of some shard
+	// (its replicas are down); nothing was decided.
+	ErrUnavailable = errors.New("accord: a shard has no live quorum")
 
 	errStopped = errors.New("accord: node stopped")
 )
@@ -200,23 +209,45 @@ func (n *Node) epoch() int64 {
 	return n.latest
 }
 
-// topologies returns the shards of keys over epochs [from, to], skipping
-// epochs this node does not know (and using the newest if it knows none).
+// topologies returns the shards of keys over epochs [from, to]. Epochs
+// this node never knew (it skipped them with a metadata snapshot) or
+// forgot are left out, but from's own placements are those of the newest
+// epoch at or before it. Callers wait until the node knows epoch to (see
+// awaitEpoch): a newer epoch is never stood in for by an older one, or a
+// replica would decide it does not own keys it does.
 func (n *Node) topologies(keys []Key, from, to int64) *Topologies {
 	n.topoMu.RLock()
 	defer n.topoMu.RUnlock()
 	ts := &Topologies{}
-	for e := from; e <= to; e++ {
+	if n.topos[from] == nil {
+		if t := n.topologyAtLocked(from); t != nil {
+			ts.Shards = append(ts.Shards, t.shards(keys)...)
+		}
+	}
+	for e := from; e <= min(to, n.latest); e++ {
 		if t := n.topos[e]; t != nil {
 			ts.Shards = append(ts.Shards, t.shards(keys)...)
 		}
 	}
-	if len(ts.Shards) == 0 {
-		if t := n.topos[n.latest]; t != nil {
-			ts.Shards = t.shards(keys)
+	return ts
+}
+
+// topologyAtLocked returns the placements in force at epoch e: those of
+// the newest epoch known at or before it (or the oldest known, if none).
+func (n *Node) topologyAtLocked(e int64) *Topology {
+	var at, oldest *Topology
+	for k, t := range n.topos {
+		if k <= e && (at == nil || k > at.Epoch) {
+			at = t
+		}
+		if oldest == nil || k < oldest.Epoch {
+			oldest = t
 		}
 	}
-	return ts
+	if at == nil {
+		return oldest
+	}
+	return at
 }
 
 // phaseTopologies returns the topologies a transaction's phases use: from
@@ -230,7 +261,12 @@ func (n *Node) phaseTopologies(keys []Key, from, to int64) *Topologies {
 
 // owned returns the keys this node replicates at some epoch from from on.
 func (n *Node) owned(keys []Key, from int64) []Key {
-	ts := n.topologies(keys, from, n.epoch())
+	return n.ownedIn(keys, from, n.epoch())
+}
+
+// ownedIn returns the keys this node replicates at some epoch of [from, to].
+func (n *Node) ownedIn(keys []Key, from, to int64) []Key {
+	ts := n.topologies(keys, from, to)
 	var out []Key
 	for _, s := range ts.Shards {
 		if slices.Contains(s.Nodes, n.cfg.ID) || slices.Contains(s.Pending, n.cfg.ID) {
@@ -255,6 +291,26 @@ func (n *Node) votesOn(k Key, from int64) bool {
 		}
 	}
 	return false
+}
+
+// readOwned returns the keys this node is a (read, not pending) replica
+// of at epoch e: the keys it answers a transaction's reads for. Keys it is
+// only pending on may not have reached it yet (their data streams to it).
+func (n *Node) readOwned(keys []Key, e int64) []Key {
+	n.topoMu.RLock()
+	t := n.topologyAtLocked(e)
+	n.topoMu.RUnlock()
+	var out []Key
+	if t == nil {
+		return out
+	}
+	for _, s := range t.shards(keys) {
+		if slices.Contains(s.Nodes, n.cfg.ID) {
+			out = append(out, s.Keys...)
+		}
+	}
+	slices.SortFunc(out, Key.Compare)
+	return out
 }
 
 // newTxnID returns a new transaction id; it is privileged when it has a
@@ -467,32 +523,50 @@ func (n *Node) Handle(ctx context.Context, from NodeID, payload []byte) ([]byte,
 	if err := json.Unmarshal(payload, &env); err != nil {
 		return nil, err
 	}
+	// A request planned at an epoch this node does not know yet waits for
+	// it (and has the node fetch it): its placements decide which of the
+	// transaction's keys this node owns.
 	var reply any
 	var err error
 	switch env.T {
 	case mPreAccept:
 		var r preAcceptReq
 		if err = json.Unmarshal(env.B, &r); err == nil {
+			if err = n.awaitEpochFrom(ctx, from, r.ID.Epoch); err != nil {
+				break
+			}
 			reply, err = n.s.preAccept(&r)
 		}
 	case mAccept:
 		var r acceptReq
 		if err = json.Unmarshal(env.B, &r); err == nil {
+			if err = n.awaitEpochFrom(ctx, from, max(r.ID.Epoch, r.ExecuteAt.Epoch)); err != nil {
+				break
+			}
 			reply, err = n.s.accept(&r)
 		}
 	case mCommit:
 		var r commitReq
 		if err = json.Unmarshal(env.B, &r); err == nil {
+			if err = n.awaitEpochFrom(ctx, from, max(r.ID.Epoch, r.ExecuteAt.Epoch)); err != nil {
+				break
+			}
 			reply, err = n.s.commit(ctx, &r)
 		}
 	case mApply:
 		var r applyReq
 		if err = json.Unmarshal(env.B, &r); err == nil {
+			if err = n.awaitEpochFrom(ctx, from, max(r.ID.Epoch, r.ExecuteAt.Epoch)); err != nil {
+				break
+			}
 			reply, err = n.s.apply(ctx, &r)
 		}
 	case mRecover:
 		var r recoverReq
 		if err = json.Unmarshal(env.B, &r); err == nil {
+			if err = n.awaitEpochFrom(ctx, from, r.ID.Epoch); err != nil {
+				break
+			}
 			reply, err = n.s.beginRecovery(&r)
 		}
 	case mCheckStatus:
@@ -523,6 +597,9 @@ func (n *Node) Handle(ctx context.Context, from NodeID, payload []byte) ([]byte,
 	case mSyncPropose:
 		var r syncReq
 		if err = json.Unmarshal(env.B, &r); err == nil {
+			if err = n.awaitEpochFrom(ctx, from, r.ID.Epoch); err != nil {
+				break
+			}
 			reply, err = n.s.syncPropose(&r)
 		}
 	case mRedundant:
@@ -631,6 +708,9 @@ type metrics struct {
 	ephemeralReads, rangeReads, syncPoints, durableRounds     atomic.Int64
 	majorityRounds, persistShed                               atomic.Int64
 	preempted, stale, timeouts, epochSyncs, journalErrors     atomic.Int64
+	// lateOwned counts transactions applied here without a key this node
+	// owned at the epoch they executed at (an invariant: always 0).
+	lateOwned atomic.Int64
 }
 
 // Stats are a node's Accord metrics and state (for virtual tables).
@@ -641,7 +721,11 @@ type Stats struct {
 	Preempted, Stale, Timeouts, EpochSyncs, JournalErrors     int64
 	Commands, Keys, Barriers, Redundant                       int
 	// Bootstrapped is the number of ranges with a bootstrap point.
-	Bootstrapped       int
+	Bootstrapped int
+	// LateOwned counts transactions applied without a key this node owned
+	// at the epoch they executed at: their writes there are lost (always 0
+	// unless a bug).
+	LateOwned          int64
 	Epoch, SyncedEpoch int64
 }
 
@@ -651,7 +735,7 @@ func (n *Node) Stats() Stats {
 	st := Stats{FastPath: m.fastPath.Load(), MediumPath: m.mediumPath.Load(), SlowPath: m.slowPath.Load(),
 		Recoveries: m.recoveries.Load(), Invalidations: m.invalidations.Load(), EphemeralReads: m.ephemeralReads.Load(),
 		RangeReads: m.rangeReads.Load(), SyncPoints: m.syncPoints.Load(), DurabilityRounds: m.durableRounds.Load(), MajorityRounds: m.majorityRounds.Load(), PersistShed: m.persistShed.Load(),
-		Preempted: m.preempted.Load(), Stale: m.stale.Load(), Timeouts: m.timeouts.Load(), EpochSyncs: m.epochSyncs.Load(), JournalErrors: m.journalErrors.Load(),
+		Preempted: m.preempted.Load(), Stale: m.stale.Load(), Timeouts: m.timeouts.Load(), EpochSyncs: m.epochSyncs.Load(), JournalErrors: m.journalErrors.Load(), LateOwned: m.lateOwned.Load(),
 		Epoch: n.epoch(), SyncedEpoch: n.synced.Load()}
 	n.s.mu.Lock()
 	st.Commands, st.Keys, st.Barriers, st.Redundant = len(n.s.cmds), len(n.s.keys), len(n.s.barriers), len(n.s.redundant)

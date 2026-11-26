@@ -1,6 +1,8 @@
 package db
 
 import (
+	"encoding/binary"
+	"fmt"
 	"slices"
 	"strconv"
 	"sync"
@@ -14,7 +16,10 @@ import (
 )
 
 // TestClusterAccordDecommission: transactions keep running while a node
-// leaves; balances are conserved, and every replica converges.
+// leaves; balances are conserved, and every replica converges. The nodes
+// taking over its ranges learn their bootstrap points (the sync point the
+// leaving node applied before streaming), and no transaction applied at
+// them misses a key they owned when it executed.
 func TestClusterAccordDecommission(t *testing.T) {
 	c := newTestCluster(t, 3)
 	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
@@ -70,7 +75,31 @@ func TestClusterAccordDecommission(t *testing.T) {
 		require.NoError(t, err)
 		total += b
 	}
+	if total != accounts*100 {
+		// Diagnostics: every node's own value of each account.
+		for i := 0; i < accounts; i++ {
+			var vals []string
+			for n := 0; n < 2; n++ {
+				res := c.nodes[n].Execute(mustPrepare(t, c.nodes[n], "SELECT balance, writetime(balance) FROM ks.acct WHERE id = ?"),
+					&RequestOptions{Consistency: one, local: true, Values: []*primitive.Value{primitive.NewValue(int32Bytes(i))}})
+				if rows, isRows := res.(*message.RowsResult); isRows && len(rows.Data) == 1 {
+					vals = append(vals, fmt.Sprintf("n%d=%d@%d", n, int32(binary.BigEndian.Uint32(rows.Data[0][0])), int64(binary.BigEndian.Uint64(rows.Data[0][1]))))
+				}
+			}
+			t.Logf("account %d: %v", i, vals)
+		}
+		for n := 0; n < 2; n++ {
+			t.Logf("node %d: %+v", n, c.nodes[n].proxy.accord.Stats())
+		}
+	}
 	require.Equal(t, accounts*100, total)
+	bootstrapped := 0
+	for i := 0; i < 2; i++ {
+		st := c.nodes[i].proxy.accord.Stats()
+		require.Zero(t, st.LateOwned, "node %d", i)
+		bootstrapped += st.Bootstrapped
+	}
+	require.Positive(t, bootstrapped, "the nodes taking over learnt the points")
 	ring := c.nodes[0].proxy.ring.Load()
 	repl := map[string]string{"class": "SimpleStrategy", "replication_factor": "2"}
 	require.Eventually(t, func() bool {

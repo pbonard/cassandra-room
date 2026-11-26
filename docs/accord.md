@@ -114,6 +114,26 @@ names, not its class structure.
   - **Stale epochs:** a replica refuses a new transaction from an epoch
     before that (`StaleTopology`). The coordinator then recovers it (so it
     never executes) and retries in the newer epoch.
+  - **Unknown epochs:** a replica sent a message of an epoch it does not
+    know yet (the transaction's id, or its execution timestamp) waits for
+    it, and asks the sender for the metadata (`FetchEpoch`); a coordinator
+    waits likewise before it proposes, executes or applies at an epoch a
+    replica proposed. A replica never executes a transaction before it
+    knows both epochs. Ownership is decided by the epochs a transaction
+    spans: with an older epoch in their place, a node behind the one that
+    made it a pending replica of a key applied the transaction without
+    that key, and the write was lost there once it learnt the epoch.
+  - **HLC order:** transactions execute in timestamp order (epoch
+    first), but their writes are cells timestamped with the HLC alone. An
+    execution timestamp therefore exceeds every conflicting one its
+    replicas witnessed in HLC too (`mergeMax`, as upstream's
+    `Timestamp.mergeMax`): with only the largest timestamp kept per key, a
+    transaction of a newer epoch could execute after one of an older epoch
+    at a lower HLC, and its writes lost to the older one's.
+  - **Late ownership** (`late_owned`): a transaction applied here that
+    gains a key this node owned at the epoch it executed at is counted.
+    Gaining keys of a later epoch is normal (a range the node starts
+    receiving: the streamed data holds the write).
 - **Exclusive sync points** (`syncpoint.go`, `CoordinateSyncPoint`): a
   transaction over ranges, with no reads or writes.
   - **Proposal:** a quorum of every shard (in every epoch not yet
@@ -130,7 +150,10 @@ names, not its class structure.
     abandons only leaves barriers, and is invalidated locally after a while.
 - **Epoch synchronisation**: for each new epoch, in order, the leader (the
   live normal node with the lowest address) finds the ranges whose replicas
-  changed from the previous epoch.
+  or pending replicas changed from the previous epoch (a range starting to
+  move to a node changes only its pending replicas: earlier-epoch
+  transactions, which do not reach that node, must be done before data is
+  streamed to it).
   1. It runs a sync point over each of them, with quorums in both epochs.
      The barrier refuses any earlier-epoch transaction the sync point doesn't
      follow.
@@ -168,7 +191,10 @@ names, not its class structure.
 - **Joining nodes** (`Bootstrap`): before streaming, a joining node takes
   one sync point over all the ranges it will own in every table, applied
   at every current replica (or at a quorum when one is down, as when
-  replacing it).
+  replacing it). If it fails the join fails (and can be retried), unless a
+  range has no live quorum (`ErrUnavailable`, a replica being replaced at
+  RF 2): no transaction commits there meanwhile, and the node goes without
+  the point.
   - **One sync point, after the epoch is synchronised:** it first waits
     (briefly, best effort) until the epoch it learnt of the movement in is
     synchronised: until then, a transaction of an earlier epoch, whose
@@ -186,13 +212,15 @@ names, not its class structure.
     live current replicas it may be streamed from must have applied the
     sync point (when not every replica answers in time, the quorum must
     include them).
-  - **Leaving and removed nodes' ranges:** the nodes taking over them get
-    no bootstrap point: they wait for (and fetch) every earlier transaction
-    they do not know. `BootstrapPoints` and `SendBootstrapped` let the node
-    driving the movement hand them points, but doing so after streaming
-    lost a transfer's update in about one decommission in ten under the
-    race detector (`TestClusterAccordDecommission`), for a reason not found
-    yet; it is not used.
+  - **Leaving and removed nodes' ranges:** the node driving the movement
+    takes the sync point (`BootstrapPoints`) before streaming, applied at
+    every node the data is streamed from, and tells the nodes taking over
+    once they have the data (`SendBootstrapped`, best effort: a node not
+    told fetches the earlier transactions instead). The sync point is not
+    optional: without it, a transaction of the epoch before could apply at
+    the source after the export, and at a node taking over only on the keys
+    it replicated then. Its failure fails the movement, as for a join.
+    Learning a point wakes the commands waiting on dependencies below it.
   - **Persisted:** the bootstrap points are journaled and restored on
     restart.
   - **Streamed data:** it then holds every transaction before the sync
@@ -202,6 +230,13 @@ names, not its class structure.
     doesn't know, because writes are timestamped cells and the latest wins
     in any order. Its reads wait until they are fetched; it answers "not
     ready" and the coordinator reads from another replica.
+  - **Reads:** a replica reads, for a transaction, only the keys it is a
+    read replica of at the execution epoch, and waits only for their
+    dependencies: keys it is only pending on may still be streaming to it.
+    (It answered them, and the coordinator then skipped their own shard;
+    and an unknown dependency on them held up the read of the others until
+    the request timed out.) The coordinator keeps a reply's reads only for
+    the keys its replica reads for.
 - **Shards** group a transaction's keys by their replicas and their
   pending replicas together: a node pending on one key (taking over its
   range) is not an owner of keys that merely share its replicas, whose
@@ -367,13 +402,18 @@ names, not its class structure.
   - an unknown earlier dependency skipped on a bootstrapped range and
     waited for on another;
   - shards split by pending replicas (`review_test.go`);
+  - `moving_test.go`: a replica behind the epoch waits for it before
+    applying, reads skip keys a replica is only pending on, pending
+    replicas changing a range's epoch sync, bootstrap points waking
+    waiting commands, and late ownership counted;
   - majority durability with a replica down, and its catching up.
 - `internal/accord/review_test.go`: recovery across epochs, a `Truncated`
   outcome, and ephemeral reads retried at a newer epoch.
 - `TestTransactionSchemaPinned` (`internal/db`): a table changed under a
   transaction.
 - `TestClusterAccordDecommission` (`internal/db`): transfers while a node
-  leaves; balances are conserved, and the replicas converge.
+  leaves; balances are conserved, the replicas converge, the nodes taking
+  over learn their bootstrap points, and no late ownership is counted.
 - `TestPrivilegedRestrictions`: the two cassandra-accord `fc4a769`
   restrictions.
 - `internal/db` cluster tests:
@@ -385,6 +425,14 @@ names, not its class structure.
     tables reporting them.
 
 ## Not done
+
+- **A rare lost update during decommissions:** `TestClusterAccordDecommission`
+  ends with balances off by 5 in about one run in 50 under the race
+  detector, on main as well (2 in 120); the replicas agree, and
+  `late_owned` is 0. Not found yet.
+- **Durability rounds and pending replicas:** their universal sync points
+  apply at the read replicas only; a pending replica that missed a
+  transaction could adopt the others' redundancy bound and skip it.
 
 - **Range reads:** they are ephemeral, so they form a per-partition
   snapshot, not one across the range. Sync points are the only range

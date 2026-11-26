@@ -63,6 +63,24 @@ func (t Timestamp) IsZero() bool          { return t == Timestamp{} }
 
 func (t Timestamp) String() string { return fmt.Sprintf("%d:%d:%s", t.Epoch, t.HLC, t.Node) }
 
+// mergeMax returns a timestamp at least both a and b in epoch and in HLC
+// (Timestamp.mergeMax): the execution timestamp of a transaction must
+// exceed every conflicting one it saw in both. Transactions execute in
+// timestamp order, epoch first, but their writes are cells timestamped
+// with the HLC alone: a transaction after another (a newer epoch) with a
+// lower HLC would apply after it and lose to it, its update lost. The node
+// is the one of the higher HLC (an HLC is unique to its node).
+func mergeMax(a, b Timestamp) Timestamp {
+	m := Timestamp{Epoch: max(a.Epoch, b.Epoch)}
+	switch {
+	case a.HLC > b.HLC || a.HLC == b.HLC && a.Node >= b.Node:
+		m.HLC, m.Node = a.HLC, a.Node
+	default:
+		m.HLC, m.Node = b.HLC, b.Node
+	}
+	return m
+}
+
 func maxTimestamp(a, b Timestamp) Timestamp {
 	if a.Less(b) {
 		return b
@@ -239,6 +257,9 @@ func (r Range) String() string { return fmt.Sprintf("%x[%d,%d]", r.Prefix, r.Lo,
 type RangeShard struct {
 	Range
 	Nodes []NodeID
+	// Pending are the nodes the range is moving to or from, beyond Nodes
+	// (they receive its writes without voting).
+	Pending []NodeID
 }
 
 // bound is a timestamp over a range: a sync point's barrier, or the

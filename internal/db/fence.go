@@ -177,7 +177,17 @@ func (p *proxy) admit(from string, payload []byte) (rest []byte, epoch int64, do
 // ahead of them); requests keep being served meanwhile. One catch-up runs
 // per epoch seen, however many requests carry it.
 func (p *proxy) noteEpoch(from string, epoch int64) {
-	if from == p.self || epoch <= p.d.schema.Load().Epoch {
+	if from == p.self {
+		return
+	}
+	p.fetchEpoch(from, epoch)
+}
+
+// fetchEpoch catches up, in the background, to an epoch at least, from a
+// node (this node: from the metadata service's members); one catch-up runs
+// per epoch.
+func (p *proxy) fetchEpoch(from string, epoch int64) {
+	if epoch <= p.d.schema.Load().Epoch {
 		return
 	}
 	for {

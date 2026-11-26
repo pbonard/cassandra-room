@@ -193,7 +193,7 @@ func (n *Node) coordinate(ctx context.Context, id TxnID, txn *Txn) ([]byte, erro
 	executeAt := id.Timestamp
 	deps := Deps{}
 	for _, r := range oks {
-		executeAt = maxTimestamp(executeAt, r.ExecuteAt)
+		executeAt = mergeMax(executeAt, r.ExecuteAt)
 		deps = deps.with(r.Deps)
 	}
 	n.metrics.slowPath.Add(1)
@@ -214,6 +214,11 @@ func (n *Node) fastQuorumOf(id TxnID) func(*Shard) int {
 // propose runs the Accept round (Propose), then executes.
 func (n *Node) propose(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, executeAt Timestamp, deps Deps, medium bool) ([]byte, error) {
 	n.clock.Observe(executeAt.HLC)
+	// A replica may have proposed an epoch this node does not know yet:
+	// its replicas would be missed.
+	if err := n.awaitEpoch(ctx, executeAt.Epoch); err != nil {
+		return nil, err
+	}
 	ts := n.phaseTopologies(txn.Keys, id.Epoch, executeAt.Epoch)
 	req := &acceptReq{ID: id, Ballot: ballot, ExecuteAt: executeAt, Deps: deps, Txn: txn, Keys: txn.Keys, NoDeps: medium}
 	ch := broadcast[acceptReply](ctx, n, ts.nodes(), mAccept, func(NodeID) any { return req })
@@ -257,6 +262,9 @@ func (n *Node) execute(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 	if txn == nil {
 		return nil, errors.New("accord: executing a transaction without its definition")
 	}
+	if err := n.awaitEpoch(ctx, executeAt.Epoch); err != nil {
+		return nil, err
+	}
 	ts := n.phaseTopologies(txn.Keys, id.Epoch, executeAt.Epoch)
 	commit := func(stable bool) *commitReq {
 		return &commitReq{ID: id, Ballot: ballot, ExecuteAt: executeAt, Deps: deps, Txn: txn, Keys: txn.Keys, Stable: stable}
@@ -271,6 +279,14 @@ func (n *Node) execute(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 	reads := map[string][]byte{}
 	readers := map[NodeID]bool{}
 	var applied *commitReply
+	// A reply's reads count only for keys its replica reads for (a
+	// replica of several shards answers them all at once).
+	readsFor := map[string][]NodeID{}
+	for _, s := range ts.latest() {
+		for _, k := range s.Keys {
+			readsFor[keyString(k)] = s.Nodes
+		}
+	}
 	for _, s := range ts.latest() {
 		covered := true
 		for _, k := range s.Keys {
@@ -298,7 +314,9 @@ func (n *Node) execute(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 				applied = &rep
 			}
 			for k, v := range rep.Reads {
-				reads[k] = v
+				if slices.Contains(readsFor[k], to) {
+					reads[k] = v
+				}
 			}
 			done = true
 			break
@@ -324,14 +342,21 @@ func (n *Node) execute(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 			return nil, err
 		}
 	}
-	return result, n.persist(ctx, n.applyTopologies(txn.Keys, id, executeAt), id, txn, executeAt, deps, writes, result)
+	ats, err := n.applyTopologies(ctx, txn.Keys, id, executeAt)
+	if err != nil {
+		return nil, err
+	}
+	return result, n.persist(ctx, ats, id, txn, executeAt, deps, writes, result)
 }
 
 // applyTopologies are the replicas a transaction's writes go to: those of
 // every epoch up to the current one, and pending replicas, so that nodes
 // joining since it was decided receive them too.
-func (n *Node) applyTopologies(keys []Key, id TxnID, executeAt Timestamp) *Topologies {
-	return n.phaseTopologies(keys, id.Epoch, max(executeAt.Epoch, n.epoch()))
+func (n *Node) applyTopologies(ctx context.Context, keys []Key, id TxnID, executeAt Timestamp) (*Topologies, error) {
+	if err := n.awaitEpoch(ctx, executeAt.Epoch); err != nil {
+		return nil, err
+	}
+	return n.phaseTopologies(keys, id.Epoch, max(executeAt.Epoch, n.epoch())), nil
 }
 
 // persist applies the outcome at every replica, returning once a quorum
@@ -462,7 +487,11 @@ func (n *Node) awaitOutcome(ctx context.Context, id TxnID, keys []Key) ([]byte, 
 				// right after the answer sees it (on tables whose
 				// conditional statements or writes run on Accord and
 				// reads do not).
-				if err := n.persist(ctx, n.applyTopologies(keys, id, rep.ExecuteAt), id, rep.Txn, rep.ExecuteAt, rep.Deps, rep.Writes, rep.Result); err != nil {
+				ats, err := n.applyTopologies(ctx, keys, id, rep.ExecuteAt)
+				if err == nil {
+					err = n.persist(ctx, ats, id, rep.Txn, rep.ExecuteAt, rep.Deps, rep.Writes, rep.Result)
+				}
+				if err != nil {
 					return nil, err
 				}
 				return rep.Result, nil
@@ -543,7 +572,11 @@ func (n *Node) recover(ctx context.Context, id TxnID, txn *Txn, keys []Key) erro
 	case best.Status == Invalidated:
 		return n.commitInvalidate(ts, id, keys)
 	case best.Status == Applied || best.Status == PreApplied:
-		return n.persist(ctx, n.applyTopologies(keys, id, best.ExecuteAt), id, txn, best.ExecuteAt, best.Deps, best.Writes, best.Result)
+		ats, err := n.applyTopologies(ctx, keys, id, best.ExecuteAt)
+		if err != nil {
+			return err
+		}
+		return n.persist(ctx, ats, id, txn, best.ExecuteAt, best.Deps, best.Writes, best.Result)
 	case best.Status == Stable || best.Status == Committed:
 		_, err := n.execute(ctx, ballot, id, txn, best.ExecuteAt, best.Deps)
 		return err
@@ -879,8 +912,19 @@ func (n *Node) ephemeralRead(ctx context.Context, txn *Txn) ([]byte, error) {
 	}
 }
 
-// awaitEpoch waits until this node knows an epoch.
+// awaitEpoch waits until this node knows an epoch, asking for it (from
+// the node that knows it, if any) when it does not.
 func (n *Node) awaitEpoch(ctx context.Context, e int64) error {
+	return n.awaitEpochFrom(ctx, "", e)
+}
+
+func (n *Node) awaitEpochFrom(ctx context.Context, from NodeID, e int64) error {
+	if n.epoch() >= e {
+		return nil
+	}
+	if f := n.cfg.FetchEpoch; f != nil {
+		f(from, e)
+	}
 	for n.epoch() < e {
 		select {
 		case <-ctx.Done():
@@ -1005,8 +1049,11 @@ func (n *Node) syncEpochs() {
 	}
 }
 
-// changedRanges returns the parts of the epoch ranges whose replicas
-// differ between two topologies (all of them without the earlier one).
+// changedRanges returns the parts of the epoch ranges whose replicas or
+// pending replicas differ between two topologies (all of them without the
+// earlier one): a range starting to move to a node must be synchronised
+// too, or transactions of the epoch before, which do not reach the new
+// node, could still be executing when its data is streamed.
 func (n *Node) changedRanges(prev, cur *Topology) []Range {
 	if n.cfg.EpochRanges == nil || cur.RangeReplicas == nil {
 		return nil
@@ -1021,9 +1068,10 @@ func (n *Node) changedRanges(prev, cur *Topology) []Range {
 		owner := func(shards []RangeShard, tok int64) string {
 			for _, s := range shards {
 				if tok >= s.Lo && tok <= s.Hi {
-					nodes := slices.Clone(s.Nodes)
+					nodes, pending := slices.Clone(s.Nodes), slices.Clone(s.Pending)
 					slices.Sort(nodes)
-					return strings.Join(nodes, ",")
+					slices.Sort(pending)
+					return strings.Join(nodes, ",") + "|" + strings.Join(pending, ",")
 				}
 			}
 			return ""
