@@ -261,14 +261,15 @@ type ucsLevel struct {
 // next one F times higher.
 func (t *Table) formLevelsLocked(files []*fileMeta) []*ucsLevel {
 	files = slices.Clone(files)
-	slices.SortFunc(files, func(a, b *fileMeta) int { return cmp.Compare(density(a), density(b)) })
+	own := t.own.Load()
+	slices.SortFunc(files, func(a, b *fileMeta) int { return cmp.Compare(own.density(a), own.density(b)) })
 	f0 := float64(t.o().fanout(0))
 	base := max(1<<20, t.flushSizeBytesLocked()) * (1 - 0.9/f0)
 	maxDensity := math.Floor(base * f0)
 	levels := []*ucsLevel{}
 	level := &ucsLevel{index: 0, min: 0, max: maxDensity}
 	for _, f := range files {
-		d := density(f)
+		d := own.density(f)
 		for d >= level.max {
 			levels = append(levels, level)
 			next := level.index + 1
@@ -1281,7 +1282,8 @@ func (t *Table) outputShards(inputs []*fileMeta) [][2][]byte {
 			hi = f.largest.UserKey
 		}
 	}
-	bounds := shardBoundaries(t.o().numShards(combinedDensity(inputs)))
+	own := t.own.Load()
+	bounds := own.boundaries(t.o().numShards(own.combinedDensity(inputs)))
 	var out [][2][]byte
 	var lower []byte
 	for _, b := range bounds {

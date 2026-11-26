@@ -12,6 +12,9 @@ import (
 // Table is one table's store: its memtables and sstables, in its own
 // directory. Writes go through Engine.Apply; reads go through the Table.
 type Table struct {
+	// own is the token space this node owns of the table, for densities
+	// and shards (nil: all of it).
+	own atomic.Pointer[ownership]
 	e   *Engine
 	id  TableID
 	dir string
@@ -57,7 +60,7 @@ func (t *Table) flushBoundaries(mem *memTable) [][]byte {
 	if t.o().TimeWindow > 0 {
 		return nil
 	}
-	return shardBoundaries(t.o().numShards(float64(mem.approximateSize())))
+	return t.own.Load().boundaries(t.o().numShards(float64(mem.approximateSize())))
 }
 
 // readState is an immutable view of a table's memtables and sstables. It is
