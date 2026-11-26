@@ -129,7 +129,8 @@ func TestBootstrapSyncPoint(t *testing.T) {
 	c.setRanges(false, 0)
 	_, err := c.node(0).Coordinate(context.Background(), appendTxn(t, c.keys[0], 1))
 	require.NoError(t, err)
-	require.NoError(t, c.node(2).Bootstrap(context.Background(), []Range{{Lo: math.MinInt64, Hi: math.MaxInt64}}))
+	_, err = c.node(2).Bootstrap(context.Background(), []Range{{Lo: math.MinInt64, Hi: math.MaxInt64}})
+	require.NoError(t, err)
 	at := bootstrappedAt(c.node(2), c.keys[0])
 	require.False(t, at.IsZero())
 	// Every replica applied the transaction before the sync point.
@@ -163,7 +164,8 @@ func TestBootstrapPerRange(t *testing.T) {
 	ctx := context.Background()
 	_, err := c.node(0).Coordinate(ctx, appendTxn(t, ka, 1))
 	require.NoError(t, err)
-	require.NoError(t, c.node(2).Bootstrap(ctx, []Range{ra}))
+	_, err = c.node(2).Bootstrap(ctx, []Range{ra})
+	require.NoError(t, err)
 	atA := bootstrappedAt(c.node(2), ka)
 	require.False(t, atA.IsZero())
 	require.True(t, bootstrappedAt(c.node(2), kb).IsZero(), "the other range is not bootstrapped")
@@ -171,9 +173,10 @@ func TestBootstrapPerRange(t *testing.T) {
 	// Later, n1 takes range b's point and streams it to n2.
 	_, err = c.node(0).Coordinate(ctx, appendTxn(t, kb, 2))
 	require.NoError(t, err)
-	pts, err := c.node(1).BootstrapPoints(ctx, []Range{ra, rb})
+	pts, applied, err := c.node(1).BootstrapPoints(ctx, []Range{ra, rb})
 	require.NoError(t, err)
 	require.Len(t, pts.For([]Range{rb}), 1)
+	require.Equal(t, c.ids, applied, "every replica answered")
 	require.NoError(t, c.node(1).SendBootstrapped(ctx, "n2", pts.For([]Range{rb})))
 	atB := bootstrappedAt(c.node(2), kb)
 	require.False(t, atB.IsZero())
@@ -231,7 +234,8 @@ func TestBootstrapSkipsOnlyItsRanges(t *testing.T) {
 	n := c.node(2)
 	ctx := context.Background()
 	unknown := TxnID{Timestamp: Timestamp{Epoch: 1, HLC: n.clock.Next(0), Node: "n0"}, Kind: Write}
-	require.NoError(t, n.Bootstrap(ctx, []Range{{Lo: ka.Token, Hi: ka.Token}}))
+	_, err := n.Bootstrap(ctx, []Range{{Lo: ka.Token, Hi: ka.Token}})
+	require.NoError(t, err)
 	require.True(t, unknown.Timestamp.Less(bootstrappedAt(n, ka)))
 
 	for _, tc := range []struct {

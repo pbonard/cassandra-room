@@ -1,6 +1,8 @@
 package db
 
 import (
+	"encoding/binary"
+	"fmt"
 	"slices"
 	"strconv"
 	"sync"
@@ -72,6 +74,23 @@ func TestClusterAccordDecommission(t *testing.T) {
 		b, err := strconv.Atoi(v[0])
 		require.NoError(t, err)
 		total += b
+	}
+	if total != accounts*100 {
+		// Diagnostics: every node's own value of each account.
+		for i := 0; i < accounts; i++ {
+			var vals []string
+			for n := 0; n < 2; n++ {
+				res := c.nodes[n].Execute(mustPrepare(t, c.nodes[n], "SELECT balance, writetime(balance) FROM ks.acct WHERE id = ?"),
+					&RequestOptions{Consistency: one, local: true, Values: []*primitive.Value{primitive.NewValue(int32Bytes(i))}})
+				if rows, isRows := res.(*message.RowsResult); isRows && len(rows.Data) == 1 {
+					vals = append(vals, fmt.Sprintf("n%d=%d@%d", n, int32(binary.BigEndian.Uint32(rows.Data[0][0])), int64(binary.BigEndian.Uint64(rows.Data[0][1]))))
+				}
+			}
+			t.Logf("account %d: %v", i, vals)
+		}
+		for n := 0; n < 2; n++ {
+			t.Logf("node %d: %+v", n, c.nodes[n].proxy.accord.Stats())
+		}
 	}
 	require.Equal(t, accounts*100, total)
 	bootstrapped := 0

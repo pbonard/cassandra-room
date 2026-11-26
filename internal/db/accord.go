@@ -1310,17 +1310,18 @@ func (p *proxy) gainedAccordRanges(cur, future *cluster.Ring, from func(reps []*
 
 // accordHandoff takes Accord's bootstrap point of the ranges nodes take
 // over, before their data is streamed to them, and returns what tells them
-// once it is (Accord's bootstrap for nodes that do not stream themselves).
-// sources are the nodes the data is streamed from: the point must have
-// applied at them, so that the data holds every transaction before it
-// (one of an earlier epoch may otherwise apply at the source after the
-// export, and at a node taking over only on the keys it replicated then).
-// Where a range has no live quorum, no Accord transaction commits there
-// meanwhile, and the nodes go without the point: they fetch the earlier
-// transactions they do not know.
-func (p *proxy) accordHandoff(gained map[string][]accord.Range, sources []string) (done func(), err error) {
+// once it is (Accord's bootstrap for nodes that do not stream themselves),
+// and whether a node applied the point: the data must be streamed from one
+// that did, so that it holds every transaction before it (one of an
+// earlier epoch may otherwise apply at the source after the export, and at
+// a node taking over only on the keys it replicated then). Where a range
+// has no live quorum, no Accord transaction commits there meanwhile, and
+// the nodes go without the point: they fetch the earlier transactions they
+// do not know.
+func (p *proxy) accordHandoff(gained map[string][]accord.Range) (done func(), applied func(addr string) bool, err error) {
+	any := func(string) bool { return true }
 	if p.accord == nil || len(gained) == 0 {
-		return func() {}, nil
+		return func() {}, any, nil
 	}
 	var all []accord.Range
 	for _, rs := range gained {
@@ -1330,33 +1331,31 @@ func (p *proxy) accordHandoff(gained map[string][]accord.Range, sources []string
 			}
 		}
 	}
-	var src []accord.NodeID
-	for _, s := range sources {
-		src = append(src, accord.NodeID(s))
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	pts, err := p.accord.BootstrapPoints(ctx, all, src...)
+	pts, at, err := p.accord.BootstrapPoints(ctx, all)
 	cancel()
 	switch {
 	case errors.Is(err, accord.ErrUnavailable):
-		return func() {}, nil
+		return func() {}, any, nil
 	case err != nil:
-		return nil, fmt.Errorf("Accord sync point before streaming: %w", err)
+		return nil, nil, fmt.Errorf("Accord sync point before streaming: %w", err)
 	}
 	return func() {
-		for addr, rs := range gained {
-			// Best effort: a node not told waits for (and fetches) the
-			// earlier transactions instead.
-			for try := 0; try < 3; try++ {
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				err := p.accord.SendBootstrapped(ctx, accord.NodeID(addr), pts.For(rs))
-				cancel()
-				if err == nil {
-					break
+			for addr, rs := range gained {
+				// Best effort: a node not told waits for (and fetches) the
+				// earlier transactions instead.
+				for try := 0; try < 3; try++ {
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					err := p.accord.SendBootstrapped(ctx, accord.NodeID(addr), pts.For(rs))
+					cancel()
+					if err == nil {
+						break
+					}
 				}
 			}
-		}
-	}, nil
+		}, func(addr string) bool {
+			return slices.Contains(at, accord.NodeID(addr))
+		}, nil
 }
 
 // accordTableRanges are the whole token ranges of the user tables.
