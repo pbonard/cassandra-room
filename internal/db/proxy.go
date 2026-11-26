@@ -457,6 +457,41 @@ func nodeList(s *Schema) []cluster.Node {
 	return out
 }
 
+// setOwnedRanges tells each table's storage the token ranges this node
+// replicates for its keyspace, over which compaction measures densities
+// and cuts shards.
+func (p *proxy) setOwnedRanges(s *Schema) {
+	ring := p.ring.Load()
+	if ring.Empty() {
+		return
+	}
+	// The engine's token space flips the sign bit of Murmur3's tokens.
+	flip := func(t int64) uint64 { return uint64(t) ^ (1 << 63) }
+	for _, t := range p.d.userTables() {
+		k := s.Keyspaces[t.Keyspace]
+		lt, err := p.d.engine.Table(t.Storage)
+		if k == nil || err != nil {
+			continue
+		}
+		var owned []lsm.TokenRange
+		for _, r := range ring.Ranges() {
+			if !containsAddr(ring.Replicas(k.Replication, r[1]), p.self) {
+				continue
+			}
+			// (start, end]; one wrapping around the ring is two.
+			if r[0] < r[1] {
+				owned = append(owned, lsm.TokenRange{First: flip(r[0] + 1), Last: flip(r[1])})
+				continue
+			}
+			if r[0] < math.MaxInt64 {
+				owned = append(owned, lsm.TokenRange{First: flip(r[0] + 1), Last: flip(math.MaxInt64)})
+			}
+			owned = append(owned, lsm.TokenRange{First: flip(math.MinInt64), Last: flip(r[1])})
+		}
+		lt.SetOwnedRanges(owned)
+	}
+}
+
 // metadataChanged is called when a new metadata snapshot is installed.
 func (p *proxy) metadataChanged(s *Schema) {
 	replaced := map[string]bool{}
@@ -467,6 +502,7 @@ func (p *proxy) metadataChanged(s *Schema) {
 	}
 	p.replaced.Store(&replaced)
 	p.ring.Store(cluster.NewRing(nodeList(s)))
+	p.setOwnedRanges(s)
 	p.accordTopology(s)
 	p.g.Update(func(st *cluster.EndpointState) { st.Epoch = s.Epoch })
 }

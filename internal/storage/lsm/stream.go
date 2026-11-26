@@ -342,7 +342,7 @@ func (t *Table) rewriteImported(ext []*externalTable, alloc func() uint64, creat
 	}
 	var boundaries [][]byte
 	if t.o().TimeWindow <= 0 {
-		boundaries = shardBoundaries(t.o().numShards(float64(size)))
+		boundaries = t.own.Load().boundaries(t.o().numShards(float64(size)))
 	}
 	started := false
 	next := func() ([]byte, []byte, uint64, bool, error) {
