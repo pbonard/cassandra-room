@@ -452,7 +452,10 @@ func (m *modification) writeParams(e *execCtx) (ts int64, ttl int64, err error) 
 	}
 	if !ok {
 		ts = e.timestamp()
-	} else if ts == -1<<63 {
+	}
+	// The minimum is "no timestamp", and overwrites write a deletion at
+	// ts - 1: both bottom values are refused (also as a client default).
+	if ts <= -1<<63+1 {
 		return 0, 0, invalidf("Invalid timestamp value")
 	}
 	ttl, ok, err = bindInt(e, m.ttl, "TTL")

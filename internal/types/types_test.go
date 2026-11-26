@@ -270,8 +270,39 @@ func canonical(t *Type, v []byte) []byte {
 		r := reader{b: b}
 		out, _ := r.decimal()
 		return out
+	case Tuple, UDT:
+		// Keys drop trailing null fields.
+		fields, _ := SplitTuple(v)
+		for len(fields) > 0 && fields[len(fields)-1] == nil {
+			fields = fields[:len(fields)-1]
+		}
+		return BuildTuple(fields)
+	case Double:
+		// Every NaN is Java's canonical one in keys.
+		if math.IsNaN(math.Float64frombits(binary.BigEndian.Uint64(v))) {
+			return binary.BigEndian.AppendUint64(nil, canonicalNaN64)
+		}
 	}
 	return v
+}
+
+// TestNaNKeys: NaNs of any sign or payload are one key, above +Infinity;
+// the literal NaN is Java's; JSON shows null.
+func TestNaNKeys(t *testing.T) {
+	enc := func(bits uint64) []byte {
+		b, err := AppendComparable(nil, DoubleType, binary.BigEndian.AppendUint64(nil, bits))
+		require.NoError(t, err)
+		return b
+	}
+	inf := enc(math.Float64bits(math.Inf(1)))
+	for _, nan := range []uint64{0x7ff8000000000000, 0x7ff8000000000001, 0xfff8000000000000} {
+		require.Equal(t, enc(0x7ff8000000000000), enc(nan))
+		require.Positive(t, bytes.Compare(enc(nan), inf))
+	}
+	f, err := parseFloat("NaN", 64)
+	require.NoError(t, err)
+	require.Equal(t, uint64(0x7ff8000000000000), math.Float64bits(f))
+	require.Equal(t, "null", ToJSON(DoubleType, binary.BigEndian.AppendUint64(nil, math.Float64bits(math.Inf(-1)))))
 }
 
 // TestComparable checks that the byte-comparable encoding orders values as
@@ -342,4 +373,17 @@ func hexs(b []byte) string {
 		out = append(out, h[c>>4], h[c&15])
 	}
 	return string(out)
+}
+
+// TestTupleTrailingNulls: a tuple serialized without its last fields and
+// the same tuple with them null are one key.
+func TestTupleTrailingNulls(t *testing.T) {
+	typ := &Type{Kind: Tuple, Elems: []*Type{IntType, TextType, IntType}, Frozen: true}
+	short := BuildTuple([][]byte{{0, 0, 0, 1}, []byte("x")})
+	long := BuildTuple([][]byte{{0, 0, 0, 1}, []byte("x"), nil})
+	a, err := AppendComparable(nil, typ, short)
+	require.NoError(t, err)
+	b, err := AppendComparable(nil, typ, long)
+	require.NoError(t, err)
+	require.Equal(t, a, b)
 }

@@ -255,7 +255,7 @@ func (d *DB) newCtx(o *RequestOptions, st *prepState) (*execCtx, error) {
 	e := &execCtx{d: d, now: d.opts.Now(), page: int(o.PageSize), paging: o.PagingState, noMeta: o.SkipMeta, version: o.Version, user: o.User, cl: o.Consistency, serial: o.SerialConsistency, local: o.local, trace: o.Trace}
 	e.nowSec = e.now.Unix()
 	if o.NowInSec != nil {
-		e.nowSec = int64(*o.NowInSec)
+		e.nowSec = int64(uint32(*o.NowInSec)) // unsigned (CassandraUInt): past 2038
 	}
 	if o.Timestamp != nil {
 		e.ts = *o.Timestamp
@@ -364,7 +364,7 @@ func (d *DB) executeBatch(typ primitive.BatchType, children []BatchChild, o *Req
 		logged: typ == primitive.BatchTypeLogged}
 	ctx.nowSec = ctx.now.Unix()
 	if o.NowInSec != nil {
-		ctx.nowSec = int64(*o.NowInSec)
+		ctx.nowSec = int64(uint32(*o.NowInSec)) // unsigned (CassandraUInt)
 	}
 	if o.Timestamp != nil {
 		ctx.ts = *o.Timestamp
