@@ -52,7 +52,24 @@ ORDER BY (reversing the clustering), LIMIT, PER PARTITION LIMIT, DISTINCT,
 ALLOW FILTERING on any column (including CONTAINS on frozen collections),
 `writetime`, `ttl`, `token`, `cast`, aliases, and the aggregates `count`,
 `min`, `max`, `sum`, `avg`. A partition with static data and no rows
-returns one row of its static columns, as in Cassandra. Paging uses an
+returns one row of its static columns, as in Cassandra.
+
+A read in the reverse of the clustering order (ORDER BY ... DESC on an
+ascending table, or the other way) reads backwards, as Scylla's native
+reverse reads do, so it reads about the rows it returns (LIMIT 1 reads one
+row, not the partition):
+
+- the partition's static row, partition deletion and range tombstones come
+  first, with a short forward read (they are stored before its rows);
+- then the clustering ranges from the last to the first, each from its end
+  down, through the storage engine's reverse iterator (memtables by
+  skiplist searches, sstables by Pebble's `SeekLT`/`Prev`, merged with a
+  max-heap), in chunks sized to what the query still needs;
+- in a cluster, replicas answer `READ_RANGE_REVERSE` with a page from the
+  end down, and the coordinator merges them in reverse (the page cutoff and
+  read repair mirrored). A replica of an older version refuses the verb,
+  and the query then reads forward, as before;
+- paging resumes below the last row returned. Paging uses an
 opaque state holding the last row's storage key and the remaining LIMIT and
 PER PARTITION LIMIT counts.
 

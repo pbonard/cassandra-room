@@ -312,28 +312,12 @@ func (t *Table) newIterFromState(s *readState, seq uint64, lower, upper []byte) 
 	if len(s.files) > len(it.buf.tables) {
 		tables = make([]tableSource, 0, len(s.files))
 	}
-	// Both bounds in one partition: every key between them is of it, and
-	// sstables whose (partition) Bloom filter lacks it are skipped.
-	var partition []byte
-	if lower != nil && upper != nil && partitionPrefix.Load() != nil {
-		if n := splitPartition(lower); n < len(lower) && splitPartition(upper) == n && bytes.Equal(lower[:n], upper[:n]) {
-			partition = lower[:n]
-		}
+	files, err := t.readFiles(s, lower, upper)
+	if err != nil {
+		it.Close()
+		return nil, err
 	}
-	for _, f := range s.files {
-		if (upper != nil && bytes.Compare(f.smallest.UserKey, upper) >= 0) ||
-			(lower != nil && bytes.Compare(f.largest.UserKey, lower) < 0) {
-			continue
-		}
-		if partition != nil {
-			if ok, err := f.reader.mayHavePartition(partition, lower); err != nil {
-				it.Close()
-				return nil, err
-			} else if !ok {
-				t.e.bloomSkips.Add(1)
-				continue
-			}
-		}
+	for _, f := range files {
 		tables = append(tables, tableSource{})
 		src := &tables[len(tables)-1]
 		if err := src.init(f.reader, lower, upper, false); err != nil {
@@ -347,6 +331,35 @@ func (t *Table) newIterFromState(s *readState, seq uint64, lower, upper []byte) 
 		it.m.entries, it.m.h, it.m.cur = it.buf.entries[:n], it.buf.heap[:0], it.buf.cur[:0]
 	}
 	return it, nil
+}
+
+// readFiles returns the sstables of a read state a read of [lower, upper)
+// must merge: those overlapping it, less those whose (partition) Bloom
+// filter rules out the one partition both bounds are in, if they are.
+func (t *Table) readFiles(s *readState, lower, upper []byte) ([]*fileMeta, error) {
+	var partition []byte
+	if lower != nil && upper != nil && partitionPrefix.Load() != nil {
+		if n := splitPartition(lower); n < len(lower) && splitPartition(upper) == n && bytes.Equal(lower[:n], upper[:n]) {
+			partition = lower[:n]
+		}
+	}
+	var out []*fileMeta
+	for _, f := range s.files {
+		if (upper != nil && bytes.Compare(f.smallest.UserKey, upper) >= 0) ||
+			(lower != nil && bytes.Compare(f.largest.UserKey, lower) < 0) {
+			continue
+		}
+		if partition != nil {
+			if ok, err := f.reader.mayHavePartition(partition, lower); err != nil {
+				return nil, err
+			} else if !ok {
+				t.e.bloomSkips.Add(1)
+				continue
+			}
+		}
+		out = append(out, f)
+	}
+	return out, nil
 }
 
 // First moves to the first row at or after the lower bound.

@@ -45,12 +45,15 @@ const (
 	VerbStreamFile
 	VerbMetadataSync
 	VerbAccord
+	// VerbReadRangeReverse reads a key range from its end down (reversed
+	// queries); appended, so older nodes refuse it as unknown.
+	VerbReadRangeReverse
 	numVerbs
 )
 
 var verbNames = [numVerbs]string{"", "GOSSIP", "MUTATION", "READ_ROW", "READ_RANGE", "REPAIR", "PING", "PING_REQ", "BROADCAST",
 	"PAXOS_PREPARE", "PAXOS_ACCEPT", "METADATA_FETCH", "METADATA_PUSH", "STREAM_PUSH", "READ_DIGEST", "COUNTER_MUTATION",
-	"STREAM_FILE", "METADATA_SYNC", "ACCORD"}
+	"STREAM_FILE", "METADATA_SYNC", "ACCORD", "READ_RANGE_REVERSE"}
 
 // String names a verb.
 func (v Verb) String() string {
@@ -197,7 +200,7 @@ func classOf(v Verb, size int) int {
 	switch {
 	case size > largeMessage:
 		return classLarge
-	case v == VerbStreamPush || v == VerbStreamFile || v == VerbReadRange || v == VerbRepair:
+	case v == VerbStreamPush || v == VerbStreamFile || v == VerbReadRange || v == VerbReadRangeReverse || v == VerbRepair:
 		return classLarge
 	case v == VerbGossip || v == VerbPing || v == VerbPingReq || v == VerbBroadcast ||
 		v == VerbPaxosPrepare || v == VerbPaxosAccept || v == VerbMetadataFetch || v == VerbMetadataPush ||
@@ -223,7 +226,7 @@ var stageWorkers = [numStages]int{stageRead: 64, stageMutation: 64, stageGossip:
 
 func stageOf(v Verb) int {
 	switch v {
-	case VerbReadRow, VerbReadDigest, VerbReadRange:
+	case VerbReadRow, VerbReadDigest, VerbReadRange, VerbReadRangeReverse:
 		return stageRead
 	case VerbMutation, VerbCounterMutation:
 		return stageMutation
