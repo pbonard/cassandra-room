@@ -1427,7 +1427,7 @@ func (p *proxy) handleReadRow(ctx context.Context, _ string, payload []byte) ([]
 	if err != nil {
 		return nil, err
 	}
-	if v, err = (&shadower{lt: lt}).filter(parts[0], v); err != nil {
+	if v, err = p.newShadower(id, lt, false, nil).filter(parts[0], v); err != nil {
 		return nil, err
 	}
 	if v == nil {
@@ -1857,7 +1857,7 @@ func (p *proxy) handleReadRange(ctx context.Context, _ string, payload []byte) (
 	var out []byte
 	n := 0
 	more := byte(0)
-	sh := &shadower{lt: lt}
+	sh := p.newShadower(id, lt, true, lo)
 	for ok := it.First(); ok; ok = it.Next() {
 		if n == rangePage {
 			more = 1
@@ -1912,7 +1912,7 @@ func (p *proxy) handleReadRangeReverse(ctx context.Context, _ string, payload []
 	var out []byte
 	n := 0
 	more := byte(0)
-	sh := &shadower{lt: lt}
+	sh := p.newShadower(id, lt, false, nil)
 	for ok := it.Last(); ok; ok = it.Prev() {
 		if n == rangePage {
 			more = 1

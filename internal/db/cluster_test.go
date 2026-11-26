@@ -27,20 +27,20 @@ import (
 type testCluster struct {
 	dcs   []string // data center per node ("" for the default)
 	tweak func(*ClusterOptions)
-	t     *testing.T
+	t     testing.TB
 	fs    []vfs.FS
 	addrs []string
 	nodes []*DB
 }
 
-func freeAddr(t *testing.T) string {
+func freeAddr(t testing.TB) string {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer ln.Close()
 	return ln.Addr().String()
 }
 
-func newTestCluster(t *testing.T, n int, dcs ...string) *testCluster {
+func newTestCluster(t testing.TB, n int, dcs ...string) *testCluster {
 	c := &testCluster{t: t, dcs: dcs}
 	for i := 0; i < n; i++ {
 		c.fs = append(c.fs, vfs.NewMem())
@@ -117,7 +117,7 @@ func (c *testCluster) waitConverged() {
 
 func (c *testCluster) exec(node int, cl primitive.ConsistencyLevel, q string, args ...any) message.Message {
 	c.t.Helper()
-	s := &session{t: c.t, d: c.nodes[node]}
+	s := &session{d: c.nodes[node]}
 	p, err := s.d.Prepare("", q)
 	if err != nil {
 		return ErrorMessage(err)
@@ -245,7 +245,7 @@ func TestClusterReplication(t *testing.T) {
 	}
 }
 
-func mustPrepare(t *testing.T, d *DB, q string) *Prepared {
+func mustPrepare(t testing.TB, d *DB, q string) *Prepared {
 	p, err := d.Prepare("", q)
 	require.NoError(t, err)
 	return p
