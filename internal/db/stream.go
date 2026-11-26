@@ -70,8 +70,10 @@ func (p *proxy) handleStreamFile(ctx context.Context, _ string, payload []byte) 
 	}
 	d := p.d
 	dir := d.streamDir("out", r.Session)
+	p.touchStream(r.Session, r.Op == "done")
 	switch r.Op {
 	case "prepare":
+		p.expireStreams()
 		lt, err := d.engine.Table(lsm.TableID(r.Table))
 		if err != nil {
 			return nil, err
@@ -116,6 +118,41 @@ func (p *proxy) handleStreamFile(ctx context.Context, _ string, payload []byte) 
 		return nil, d.fs.RemoveAll(dir)
 	}
 	return nil, fmt.Errorf("db: unknown stream operation %q", r.Op)
+}
+
+// streamIdle is how long an outbound session may go unused before its
+// files (hard links pinning sstables) are removed: a receiver that crashed
+// never says "done".
+const streamIdle = 30 * time.Minute
+
+// touchStream records a session's use (or its end).
+func (p *proxy) touchStream(session string, done bool) {
+	p.streamMu.Lock()
+	defer p.streamMu.Unlock()
+	if p.streamUsed == nil {
+		p.streamUsed = map[string]time.Time{}
+	}
+	if done {
+		delete(p.streamUsed, session)
+		return
+	}
+	p.streamUsed[session] = time.Now()
+}
+
+// expireStreams removes the files of sessions idle past streamIdle.
+func (p *proxy) expireStreams() {
+	p.streamMu.Lock()
+	var stale []string
+	for s, at := range p.streamUsed {
+		if time.Since(at) > streamIdle {
+			stale = append(stale, s)
+			delete(p.streamUsed, s)
+		}
+	}
+	p.streamMu.Unlock()
+	for _, s := range stale {
+		_ = p.d.fs.RemoveAll(p.d.streamDir("out", s))
+	}
 }
 
 func isHex(s string) bool {

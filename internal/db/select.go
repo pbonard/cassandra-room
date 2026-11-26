@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/big"
 	"slices"
+	"sort"
 	"strings"
 
 	"github.com/datastax/go-cassandra-native-protocol/message"
@@ -171,7 +172,7 @@ func (d *DB) prepareSelect(s *Schema, session string, st *cql.Select, vs *vars) 
 			return nil, err
 		}
 	}
-	sel.pkIndices = pkIndices(t, vs)
+	sel.pkIndices = pkIndices(t, sel.where, vs)
 	sel.md = sel.metadata()
 	return sel, nil
 }
@@ -573,10 +574,11 @@ func (s *selectStmt) execute(e *execCtx) (message.Message, error) {
 				}
 				return res, nil
 			}
-			for _, k := range keys {
-				if err := d.proxy.accordBarrierKey(k); err != nil {
-					return nil, err
-				}
+			// One read-only transaction over every partition (not one
+			// each): every transaction decided before it is applied on all
+			// of them before the read.
+			if err := d.proxy.accordBarrierKeys(keys); err != nil {
+				return nil, err
 			}
 		} else if serial && d.proxy != nil && !e.local {
 			// A SERIAL read first runs an Accord read-only transaction on the
@@ -625,7 +627,8 @@ type query struct {
 	ranges              []keyRange // clustering ranges (nil: whole partitions)
 
 	rows      [][][]byte
-	count     int64 // rows counted for LIMIT
+	sortKeys  [][]byte // with sortIN: each row's clustering, as stored
+	count     int64    // rows counted for LIMIT
 	agg       *aggState
 	lastKey   []byte
 	lastStat  bool
@@ -664,6 +667,14 @@ func (q *query) run() (message.Message, error) {
 	}
 	if s.aggregate || len(s.groupBy) > 0 {
 		q.agg = newAggState(s.sels)
+	}
+	// ORDER BY over several partitions: every partition is read, then the
+	// rows sorted, and only then is LIMIT applied (stopping at LIMIT rows
+	// in partition order dropped rows that sort first).
+	limit := q.limit
+	sorting := s.sortIN && q.agg == nil
+	if sorting {
+		q.limit = math.MaxInt64
 	}
 	if len(e.paging) > 0 && q.pageSize > 0 {
 		if q.resume, err = decodePagingState(e.paging); err != nil {
@@ -713,8 +724,8 @@ func (q *query) run() (message.Message, error) {
 			return nil, err
 		}
 	}
-	if s.sortIN {
-		q.sortRows()
+	if sorting {
+		q.sortRows(limit)
 	}
 	return q.result()
 }
@@ -823,6 +834,14 @@ type kv struct{ k, v []byte }
 type deletions struct {
 	partition int64 // timestamp, or NoTimestamp
 	ranges    []rangeTombstone
+	// With many range tombstones, they are flattened once into disjoint
+	// segments [bounds[i], bounds[i+1]) with the newest covering deletion
+	// (segTS[i]), for a binary search per row instead of a scan of every
+	// tombstone (RangeTombstoneTracker's job). flat is len(ranges) when
+	// built.
+	bounds [][]byte
+	segTS  []int64
+	flat   int
 }
 
 type rangeTombstone struct {
@@ -830,15 +849,51 @@ type rangeTombstone struct {
 	ts         int64
 }
 
+// manyTombstones is when deletedAt flattens a partition's tombstones.
+const manyTombstones = 8
+
 // deletedAt returns the newest deletion covering a row (by key suffix).
 func (d *deletions) deletedAt(suffix []byte) int64 {
 	ts := d.partition
-	for _, r := range d.ranges {
-		if r.ts > ts && bytes.Compare(suffix, r.start) >= 0 && bytes.Compare(suffix, r.end) < 0 {
-			ts = r.ts
+	if len(d.ranges) <= manyTombstones {
+		for _, r := range d.ranges {
+			if r.ts > ts && bytes.Compare(suffix, r.start) >= 0 && bytes.Compare(suffix, r.end) < 0 {
+				ts = r.ts
+			}
 		}
+		return ts
+	}
+	if d.flat != len(d.ranges) {
+		d.flatten()
+	}
+	// The last bound at or below the suffix starts its segment.
+	i := sort.Search(len(d.bounds), func(i int) bool { return bytes.Compare(d.bounds[i], suffix) > 0 }) - 1
+	if i >= 0 && i < len(d.segTS) && d.segTS[i] > ts {
+		ts = d.segTS[i]
 	}
 	return ts
+}
+
+// flatten builds the disjoint segments of the range tombstones.
+func (d *deletions) flatten() {
+	d.bounds = d.bounds[:0]
+	for _, r := range d.ranges {
+		d.bounds = append(d.bounds, r.start, r.end)
+	}
+	slices.SortFunc(d.bounds, bytes.Compare)
+	d.bounds = slices.CompactFunc(d.bounds, bytes.Equal)
+	d.segTS = make([]int64, max(len(d.bounds)-1, 0))
+	for i := range d.segTS {
+		d.segTS[i] = row.NoTimestamp
+	}
+	for _, r := range d.ranges {
+		lo, _ := slices.BinarySearchFunc(d.bounds, r.start, bytes.Compare)
+		hi, _ := slices.BinarySearchFunc(d.bounds, r.end, bytes.Compare)
+		for i := lo; i < hi; i++ {
+			d.segTS[i] = max(d.segTS[i], r.ts)
+		}
+	}
+	d.flat = len(d.ranges)
 }
 
 // readPartitionIter reads the partition with prefix p from it, which is
@@ -969,7 +1024,7 @@ func (q *query) emitRows(p []byte, pk [][]byte, static []row.Cell, dels deletion
 			q.partLeft = q.resume.partRemain
 		}
 	}
-	liveStatic := liveCells(static, dels.partition, e.nowSec)
+	liveStatic := knownCells(t, liveCells(static, dels.partition, e.nowSec))
 	if s.reversed {
 		slices.Reverse(rows)
 	}
@@ -993,8 +1048,12 @@ func (q *query) emitRows(p []byte, pk [][]byte, static []row.Cell, dels deletion
 		}
 		return nil
 	}
+	grouping := len(s.groupBy) > 0
 	for _, r := range rows {
-		if q.done() || q.partLeft <= 0 {
+		// With GROUP BY, PER PARTITION LIMIT counts groups (output skips
+		// the rows of groups past it), so the rows of the last group
+		// counted still all fold into it.
+		if q.done() || q.partLeft <= 0 && !grouping {
 			return nil
 		}
 		if q.resume != nil && bytes.HasPrefix(q.resume.lastKey, p) {
@@ -1021,7 +1080,9 @@ func (q *query) emitRows(p []byte, pk [][]byte, static []row.Cell, dels deletion
 		if err := q.output(rd, r.k, false); err != nil {
 			return err
 		}
-		q.partLeft--
+		if !grouping {
+			q.partLeft--
+		}
 	}
 	// A partition with static data but no rows returns one row of its
 	// static columns when the clustering is unrestricted.
@@ -1037,6 +1098,18 @@ func (q *query) emitRows(p []byte, pk [][]byte, static []row.Cell, dels deletion
 		return q.output(rd, p, true)
 	}
 	return nil
+}
+
+// knownCells drops the cells of columns the table no longer has (the row
+// marker, column 0, is kept).
+func knownCells(t *Table, cells []row.Cell) []row.Cell {
+	out := cells[:0]
+	for _, c := range cells {
+		if c.Column == 0 || t.byID[c.Column] != nil {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // liveCells returns the live cells not shadowed by a deletion at delTS.
@@ -1063,7 +1136,9 @@ func (q *query) decodeRow(r kv, p []byte, pk [][]byte, statics []row.Cell, dels 
 	if len(t.Clustering) > 0 {
 		delTS = max(delTS, dels.deletedAt(suffix))
 	}
-	cells := liveCells(v.Cells, delTS, q.e.nowSec)
+	// Cells of dropped columns do not make a row (an UPDATE writes no row
+	// marker: its only cells may be of a column dropped since).
+	cells := knownCells(t, liveCells(v.Cells, delTS, q.e.nowSec))
 	if len(cells) == 0 {
 		return nil, nil
 	}
@@ -1189,9 +1264,22 @@ func (q *query) output(r *rowData, key []byte, staticOnly bool) error {
 	if len(q.s.groupBy) > 0 {
 		var gk []byte
 		for _, c := range q.s.groupBy {
+			// Null (a static-only row's clustering) apart from empty.
 			v := r.value(c)
+			if v == nil {
+				gk = append(gk, 0)
+				continue
+			}
+			gk = append(gk, 1)
 			gk = binary.AppendUvarint(gk, uint64(len(v)))
 			gk = append(gk, v...)
+		}
+		if q.groupKey == nil || !bytes.Equal(gk, q.groupKey) {
+			// A new group: PER PARTITION LIMIT counts groups.
+			if q.partLeft <= 0 {
+				return nil
+			}
+			q.partLeft--
 		}
 		if q.groupKey != nil && !bytes.Equal(gk, q.groupKey) {
 			if err := q.flushGroup(); err != nil {
@@ -1218,6 +1306,17 @@ func (q *query) output(r *rowData, key []byte, staticOnly bool) error {
 		out[i] = v
 	}
 	q.rows = append(q.rows, out)
+	if q.s.sortIN {
+		// The clustering part of the key (none for a static-only row): it
+		// sorts in clustering order, every column, selected or not.
+		ck := []byte{}
+		if !staticOnly {
+			if _, _, rest, err := parsePartition(key); err == nil {
+				ck = rest
+			}
+		}
+		q.sortKeys = append(q.sortKeys, ck)
+	}
 	if q.pageSize > 0 && len(q.rows) >= q.pageSize {
 		q.full = true
 	}
@@ -1269,32 +1368,29 @@ func (q *query) evaluate(s *selector, r *rowData) ([]byte, error) {
 	return nil, nil
 }
 
-func (q *query) sortRows() {
-	// Sort by clustering order: the selection may not include the
-	// clustering columns, so sort before projection is not possible here;
-	// rows from several partitions are concatenated in partition order,
-	// which Cassandra also returns for IN without ORDER BY. With ORDER BY,
-	// the clustering columns must be selected for a meaningful sort.
-	idx := -1
-	for i, s := range q.s.sels {
-		if s.kind == selColumn && s.col.Kind == Clustering && s.col.Position == 0 {
-			idx = i
-		}
+func (q *query) sortRows(limit int64) {
+	// By the stored clustering of each row (every clustering column, in
+	// the table's order, whether selected or not); rows of the same
+	// clustering keep their partition order.
+	idx := make([]int, len(q.rows))
+	for i := range idx {
+		idx[i] = i
 	}
-	if idx < 0 {
-		return
-	}
-	c := q.s.sels[idx].col
-	slices.SortStableFunc(q.rows, func(a, b [][]byte) int {
-		r := types.Compare(c.Type, a[idx], b[idx])
-		if c.Desc != q.s.reversed {
+	slices.SortStableFunc(idx, func(a, b int) int {
+		r := bytes.Compare(q.sortKeys[a], q.sortKeys[b])
+		if q.s.reversed {
 			r = -r
 		}
 		return r
 	})
-	if q.limit < int64(len(q.rows)) {
-		q.rows = q.rows[:q.limit]
+	rows := make([][][]byte, 0, len(idx))
+	for _, i := range idx {
+		rows = append(rows, q.rows[i])
 	}
+	if limit < int64(len(rows)) {
+		rows = rows[:limit]
+	}
+	q.rows, q.sortKeys = rows, nil
 }
 
 // flushGroup outputs the current GROUP BY group.

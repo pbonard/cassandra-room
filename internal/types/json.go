@@ -47,13 +47,9 @@ func ToJSON(t *Type, v []byte) string {
 		} else {
 			f = math.Float64frombits(binary.BigEndian.Uint64(v))
 		}
-		switch {
-		case math.IsNaN(f):
-			return "NaN"
-		case math.IsInf(f, 1):
-			return "Infinity"
-		case math.IsInf(f, -1):
-			return "-Infinity"
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			// JSON has no NaN or infinities (DoubleType.toJSONString).
+			return "null"
 		}
 		return JavaFloatString(f, bits)
 	case Varint:

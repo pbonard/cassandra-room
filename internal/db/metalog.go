@@ -265,11 +265,15 @@ func (d *DB) appendLocked(e cluster.Entry) error {
 	if err != nil {
 		return err
 	}
-	d.metaLog = append(d.metaLog, e)
+	// The log in memory changes only once saved: a failed save leaves it
+	// as it was, and the entry can be appended again.
+	prev := d.metaLog
+	d.metaLog = append(slices.Clip(prev), e)
 	if len(d.metaLog) > maxLog {
 		d.metaLog = slices.Clone(d.metaLog[len(d.metaLog)-maxLog:])
 	}
 	if err := d.saveMetadataLog(); err != nil {
+		d.metaLog = prev
 		return err
 	}
 	return d.installLocked(next)

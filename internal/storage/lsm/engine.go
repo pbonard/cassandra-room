@@ -20,6 +20,8 @@ import (
 //
 // Lock order: commitMu, then manifestMu, then mu.
 type Engine struct {
+	// bloomSkips counts sstables a partition read skipped by their filter.
+	bloomSkips atomic.Int64
 	opts       Options
 	fs         vfs.FS
 	dir        string
@@ -653,6 +655,8 @@ func (e *Engine) periodicSync(period time.Duration) {
 
 // Metrics reports flush and compaction activity.
 type Metrics struct {
+	// BloomSkips counts sstables partition reads skipped by their filter.
+	BloomSkips                   int64
 	Flushes, Compactions         int64
 	BytesFlushed, BytesCompacted int64
 	// TombstoneCompactions counts single-sstable compactions run for
@@ -670,6 +674,7 @@ type Metrics struct {
 // Metrics returns the engine's flush and compaction counters.
 func (e *Engine) Metrics() Metrics {
 	m := Metrics{
+		BloomSkips:     e.bloomSkips.Load(),
 		Flushes:        e.metrics.flushes.Load(),
 		Compactions:    e.metrics.compactions.Load(),
 		BytesFlushed:   e.metrics.bytesFlushed.Load(),

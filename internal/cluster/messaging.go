@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -262,7 +263,10 @@ func newBudget(c int64) *budget {
 func (b *budget) tryAcquire(n int64) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.used+n > b.cap {
+	// A message larger than the whole budget is admitted when nothing else
+	// holds it, alone: otherwise it could never be (frames may reach
+	// maxFrame, above the endpoint reserve), and its connection would stop.
+	if b.used+n > b.cap && b.used > 0 {
 		return false
 	}
 	b.used += n
@@ -497,6 +501,24 @@ type frame struct {
 	size     int // bytes on the wire
 }
 
+// maxInflightPerConn bounds the requests of one inbound connection being
+// processed or waiting for their stage (Cassandra pairs its byte limits
+// with a count).
+const maxInflightPerConn = 4096
+
+// writeTimeout bounds writing a frame of n bytes: a peer that stops
+// reading must not hold the connection's writers forever. Generous: 30
+// seconds, plus a second per MiB.
+func writeTimeout(n int) time.Duration { return 30*time.Second + time.Duration(n>>20)*time.Second }
+
+// writeFrameTo writes a frame to a connection within writeTimeout.
+func writeFrameTo(c net.Conn, kind byte, verb Verb, id uint64, deadline int64, payload []byte) error {
+	_ = c.SetWriteDeadline(time.Now().Add(writeTimeout(len(payload))))
+	err := writeFrame(c, kind, verb, id, deadline, payload)
+	_ = c.SetWriteDeadline(time.Time{})
+	return err
+}
+
 func writeFrame(w io.Writer, kind byte, verb Verb, id uint64, deadline int64, payload []byte) error {
 	b := make([]byte, headerLen, headerLen+len(payload))
 	binary.BigEndian.PutUint32(b, uint32(headerLen-4+len(payload)))
@@ -573,6 +595,29 @@ func negotiate(peerVersion, peerMin uint16) (uint16, error) {
 
 // ---- inbound ----
 
+// verifyPeer checks, with hostname verification on, that an inbound
+// connection's certificate names the address its hello claims (outbound
+// connections check the name they dial): otherwise any holder of a
+// certificate from the CA could speak as any node.
+func (m *Messaging) verifyPeer(c net.Conn, from string) error {
+	if m.opts.TLS == nil || m.opts.TLS.InsecureSkipVerify {
+		return nil
+	}
+	tc, ok := c.(*tls.Conn)
+	if !ok {
+		return nil
+	}
+	certs := tc.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return errors.New("no certificate")
+	}
+	host, _, err := net.SplitHostPort(from)
+	if err != nil {
+		host = from
+	}
+	return certs[0].VerifyHostname(host)
+}
+
 func (m *Messaging) serve(c net.Conn) {
 	defer m.wg.Done()
 	defer func() {
@@ -585,6 +630,10 @@ func (m *Messaging) serve(c net.Conn) {
 	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
 	version, minVersion, _, from, err := readHello(r)
 	if err != nil {
+		return
+	}
+	if err := m.verifyPeer(c, from); err != nil {
+		log.Printf("cluster: refusing a connection from %s claiming to be %s: %v", c.RemoteAddr(), from, err)
 		return
 	}
 	v, err := negotiate(version, minVersion)
@@ -603,6 +652,10 @@ func (m *Messaging) serve(c net.Conn) {
 
 	own := newBudget(m.opts.QueueCapacity)
 	endpoint := m.endpointBudget(m.inEndpoint, from, true)
+	// Requests in flight on this connection, by count as well as bytes:
+	// tiny frames within the byte budget could otherwise park any number
+	// of goroutines waiting for their stage.
+	inflight := make(chan struct{}, maxInflightPerConn)
 	var wmu sync.Mutex
 	for {
 		f, err := readFrame(r)
@@ -619,13 +672,15 @@ func (m *Messaging) serve(c net.Conn) {
 			continue
 		}
 		if f.deadline != 0 && time.Now().UnixNano() > f.deadline {
-			m.dropped[f.verb%numVerbs].Add(1)
+			m.dropCount(f.verb)
 			continue
 		}
 		reply := func(kind byte, resp []byte) {
 			flag, resp := m.pack(resp)
 			wmu.Lock()
-			_ = writeFrame(c, kind|flag, f.verb, f.id, 0, resp)
+			if err := writeFrameTo(c, kind|flag, f.verb, f.id, 0, resp); err != nil {
+				c.Close() // the requester times out, or reconnects
+			}
 			wmu.Unlock()
 		}
 		handlerFrom := from
@@ -659,7 +714,26 @@ func (m *Messaging) serve(c net.Conn) {
 		if release == nil {
 			return // closing
 		}
+		inflight <- struct{}{} // past the limit, stop reading
+		free := release
+		release = func() { free(); <-inflight }
 		go m.dispatch(handlerFrom, f, release, reply)
+	}
+}
+
+// handler is a verb's handler: nil for one this node does not know (a
+// newer node's), which used to wrap around to another verb's.
+func (m *Messaging) handler(v Verb) Handler {
+	if v >= numVerbs {
+		return nil
+	}
+	return m.handlers[v]
+}
+
+// dropCount counts a dropped request of a verb (unknown ones not).
+func (m *Messaging) dropCount(v Verb) {
+	if v < numVerbs {
+		m.dropped[v].Add(1)
 	}
 }
 
@@ -702,19 +776,19 @@ func (m *Messaging) dispatch(from string, f frame, release func(), reply func(ki
 	select {
 	case stage <- struct{}{}:
 	case <-ctx.Done():
-		m.dropped[f.verb%numVerbs].Add(1)
+		m.dropCount(f.verb)
 		return
 	}
 	defer func() { <-stage }()
 	// (The deadline itself, not ctx.Err: the context's timer may not have
 	// fired yet when a worker frees up right at the deadline.)
 	if f.deadline != 0 && time.Now().UnixNano() >= f.deadline {
-		m.dropped[f.verb%numVerbs].Add(1)
+		m.dropCount(f.verb)
 		return
 	}
 	var resp []byte
 	var herr error
-	if h := m.handlers[f.verb%numVerbs]; h == nil {
+	if h := m.handler(f.verb); h == nil {
 		herr = fmt.Errorf("cluster: no handler for verb %d", f.verb)
 	} else {
 		resp, herr = h(ctx, from, f.payload)
@@ -881,7 +955,7 @@ func (e errNotSent) Unwrap() error { return e.err }
 
 func (m *Messaging) request(ctx context.Context, to string, verb Verb, kind byte, payload []byte) ([]byte, error) {
 	if to == m.addr {
-		h := m.handlers[verb%numVerbs]
+		h := m.handler(verb)
 		if h == nil {
 			return nil, fmt.Errorf("cluster: no handler for verb %d", verb)
 		}
@@ -914,7 +988,7 @@ func (m *Messaging) request(ctx context.Context, to string, verb Verb, kind byte
 	oc.pending[id] = ch
 	oc.mu.Unlock()
 	oc.wmu.Lock()
-	err = writeFrame(oc.c, kind|flag, verb, id, deadline, packed)
+	err = writeFrameTo(oc.c, kind|flag, verb, id, deadline, packed)
 	oc.wmu.Unlock()
 	if err != nil {
 		oc.close(err)

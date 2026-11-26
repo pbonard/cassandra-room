@@ -79,10 +79,13 @@ type accordUpdate struct {
 	// Mode is what the statements are: "" conditional statements (CAS),
 	// "txn" a BEGIN TRANSACTION statement, "write" plain modifications,
 	// "read" a plain SELECT.
-	Mode   string `json:",omitempty"`
-	Stmts  []accordStmt
-	Now    int64 // unix nanoseconds
-	NowSec int64
+	Mode  string `json:",omitempty"`
+	Stmts []accordStmt
+	// Timestamp, if not zero, is the cells' timestamp in "write" mode (a
+	// logged batch's client timestamp) instead of the executeAt's.
+	Timestamp int64 `json:",omitempty"`
+	Now       int64 // unix nanoseconds
+	NowSec    int64
 	// Page and Paging page a read ("read", "range"): the page size and
 	// the select's paging state.
 	Page   int    `json:",omitempty"`
@@ -649,9 +652,16 @@ func (a accordAgent) Execute(txn *accord.Txn, executeAt accord.Timestamp, reads 
 		if err != nil {
 			return nil, nil, err
 		}
+		var u struct{ Timestamp int64 }
+		if err := json.Unmarshal(txn.Update, &u); err != nil {
+			return nil, nil, err
+		}
 		mu := &mutation{}
 		for _, bm := range mods {
 			bm.e.ts = executeAt.HLC
+			if u.Timestamp != 0 {
+				bm.e.ts = u.Timestamp
+			}
 			if err := bm.m.addMutations(bm.e, mu); err != nil {
 				return nil, nil, err
 			}
@@ -729,13 +739,20 @@ func (p *proxy) accordBarrier(t *Table, pk []byte) error {
 }
 
 func (p *proxy) accordBarrierKey(k accord.Key) error {
-	if err := p.accordAvailable([]accord.Key{k}); err != nil {
+	return p.accordBarrierKeys([]accord.Key{k})
+}
+
+func (p *proxy) accordBarrierKeys(keys []accord.Key) error {
+	keys = slices.Clone(keys)
+	slices.SortFunc(keys, accord.Key.Compare)
+	keys = slices.CompactFunc(keys, func(a, b accord.Key) bool { return a.Compare(b) == 0 })
+	if err := p.accordAvailable(keys); err != nil {
 		return err
 	}
 	b, _ := json.Marshal(accordUpdate{})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*p.opts.ReadTimeout)
 	defer cancel()
-	_, err := p.accord.Coordinate(ctx, &accord.Txn{Kind: accord.Read, Keys: []accord.Key{k}, Update: b})
+	_, err := p.accord.Coordinate(ctx, &accord.Txn{Kind: accord.Read, Keys: keys, Update: b})
 	if err != nil {
 		return &timeoutError{cl: primitive.ConsistencyLevelSerial}
 	}
@@ -744,12 +761,20 @@ func (p *proxy) accordBarrierKey(k accord.Key) error {
 
 // groupWrites assigns writes to the transaction keys of their partitions.
 func groupWrites(keys []accord.Key, writes []write) accord.Writes {
+	// By partition, not just token: two keys of a table may share one.
+	prefixes := make([][]byte, len(keys))
+	for i, k := range keys {
+		if _, pk, err := splitAccordKey(k); err == nil {
+			prefixes[i] = partitionPrefix(pk)
+		}
+	}
 	per := map[string][]write{}
 	for _, w := range writes {
-		for _, k := range keys {
+		for i, k := range keys {
 			id, _, err := splitAccordKey(k)
-			if err == nil && id == w.table && k.Token == w.token {
+			if err == nil && id == w.table && k.Token == w.token && bytes.HasPrefix(w.key, prefixes[i]) {
 				per[accordKeyString(k)] = append(per[accordKeyString(k)], w)
+				break
 			}
 		}
 	}
@@ -826,10 +851,15 @@ func (p *proxy) accordCoordinate(u *accordUpdate, keys []accord.Key, kind accord
 // Accord, so writes are ordered with the transactions).
 func (p *proxy) accordWrite(mods []boundModification, batchCtx *execCtx) error {
 	u := &accordUpdate{Mode: "write", Now: batchCtx.now.UnixNano(), NowSec: batchCtx.nowSec}
+	if !mods[0].m.t.accordManaged() {
+		// A logged batch on ordinary tables: Accord only makes it atomic;
+		// its cells take the client's timestamp, as any write's.
+		u.Timestamp = batchCtx.ts
+	}
 	var keys []accord.Key
 	var last *stmtSource
 	for _, bm := range mods {
-		if bm.m.timestamp != nil {
+		if bm.m.timestamp != nil && bm.m.t.accordManaged() {
 			return invalidf("Custom timestamps are not supported on tables with transactional_mode 'full'")
 		}
 		ks, err := stmtPartitions(bm.e, bm.m.t, bm.m.where)

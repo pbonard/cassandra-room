@@ -12,6 +12,9 @@ import (
 // Table is one table's store: its memtables and sstables, in its own
 // directory. Writes go through Engine.Apply; reads go through the Table.
 type Table struct {
+	// own is the token space this node owns of the table, for densities
+	// and shards (nil: all of it).
+	own atomic.Pointer[ownership]
 	e   *Engine
 	id  TableID
 	dir string
@@ -57,7 +60,7 @@ func (t *Table) flushBoundaries(mem *memTable) [][]byte {
 	if t.o().TimeWindow > 0 {
 		return nil
 	}
-	return shardBoundaries(t.o().numShards(float64(mem.approximateSize())))
+	return t.own.Load().boundaries(t.o().numShards(float64(mem.approximateSize())))
 }
 
 // readState is an immutable view of a table's memtables and sstables. It is
@@ -309,10 +312,27 @@ func (t *Table) newIterFromState(s *readState, seq uint64, lower, upper []byte) 
 	if len(s.files) > len(it.buf.tables) {
 		tables = make([]tableSource, 0, len(s.files))
 	}
+	// Both bounds in one partition: every key between them is of it, and
+	// sstables whose (partition) Bloom filter lacks it are skipped.
+	var partition []byte
+	if lower != nil && upper != nil && partitionPrefix.Load() != nil {
+		if n := splitPartition(lower); n < len(lower) && splitPartition(upper) == n && bytes.Equal(lower[:n], upper[:n]) {
+			partition = lower[:n]
+		}
+	}
 	for _, f := range s.files {
 		if (upper != nil && bytes.Compare(f.smallest.UserKey, upper) >= 0) ||
 			(lower != nil && bytes.Compare(f.largest.UserKey, lower) < 0) {
 			continue
+		}
+		if partition != nil {
+			if ok, err := f.reader.mayHavePartition(partition, lower); err != nil {
+				it.Close()
+				return nil, err
+			} else if !ok {
+				t.e.bloomSkips.Add(1)
+				continue
+			}
 		}
 		tables = append(tables, tableSource{})
 		src := &tables[len(tables)-1]

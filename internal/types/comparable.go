@@ -99,6 +99,9 @@ func AppendComparable(dst []byte, t *Type, v []byte) ([]byte, error) {
 		return dst, nil
 	case Float:
 		u := binary.BigEndian.Uint32(v)
+		if math.IsNaN(float64(math.Float32frombits(u))) {
+			u = canonicalNaN32 // every NaN is one value, above +Infinity (Float.floatToIntBits)
+		}
 		if u&(1<<31) != 0 {
 			u = ^u
 		} else {
@@ -107,6 +110,9 @@ func AppendComparable(dst []byte, t *Type, v []byte) ([]byte, error) {
 		return binary.BigEndian.AppendUint32(dst, u), nil
 	case Double:
 		u := binary.BigEndian.Uint64(v)
+		if math.IsNaN(math.Float64frombits(u)) {
+			u = canonicalNaN64 // as Double.doubleToLongBits
+		}
 		if u&(1<<63) != 0 {
 			u = ^u
 		} else {
@@ -158,6 +164,12 @@ func AppendComparable(dst []byte, t *Type, v []byte) ([]byte, error) {
 		fields, err := SplitTuple(v)
 		if err != nil {
 			return nil, err
+		}
+		// Trailing nulls are dropped: a value serialized before fields were
+		// added (ALTER TYPE ... ADD) and the same value with the new fields
+		// null are equal, and must be one key.
+		for len(fields) > 0 && fields[len(fields)-1] == nil {
+			fields = fields[:len(fields)-1]
 		}
 		for i, f := range fields {
 			if dst, err = AppendComponent(dst, t.Elems[i], f, false); err != nil {
@@ -535,3 +547,9 @@ func compareBytes(a, b []byte) int {
 	}
 	return len(a) - len(b)
 }
+
+// Java's canonical NaNs (Float.floatToIntBits, Double.doubleToLongBits).
+const (
+	canonicalNaN32 = 0x7fc00000
+	canonicalNaN64 = 0x7ff8000000000000
+)

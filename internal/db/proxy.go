@@ -78,10 +78,15 @@ type ClusterOptions struct {
 // by timestamp, so the merge is reconciliation) and repair the replicas
 // that were behind.
 type proxy struct {
-	d   *DB
-	m   *cluster.Messaging
-	g   *cluster.Gossiper
-	cms *cluster.CMS
+	// testRefuseMutations makes the node refuse MUTATION messages (tests).
+	testRefuseMutations atomic.Pointer[bool]
+	// streamUsed is when each outbound stream session was last used.
+	streamMu   sync.Mutex
+	streamUsed map[string]time.Time
+	d          *DB
+	m          *cluster.Messaging
+	g          *cluster.Gossiper
+	cms        *cluster.CMS
 	// accord runs Accord transactions (transactional_mode tables).
 	accord *accord.Node
 	lats   sync.Map // lsm.TableID -> *readLatency, for speculative retry
@@ -452,6 +457,41 @@ func nodeList(s *Schema) []cluster.Node {
 	return out
 }
 
+// setOwnedRanges tells each table's storage the token ranges this node
+// replicates for its keyspace, over which compaction measures densities
+// and cuts shards.
+func (p *proxy) setOwnedRanges(s *Schema) {
+	ring := p.ring.Load()
+	if ring.Empty() {
+		return
+	}
+	// The engine's token space flips the sign bit of Murmur3's tokens.
+	flip := func(t int64) uint64 { return uint64(t) ^ (1 << 63) }
+	for _, t := range p.d.userTables() {
+		k := s.Keyspaces[t.Keyspace]
+		lt, err := p.d.engine.Table(t.Storage)
+		if k == nil || err != nil {
+			continue
+		}
+		var owned []lsm.TokenRange
+		for _, r := range ring.Ranges() {
+			if !containsAddr(ring.Replicas(k.Replication, r[1]), p.self) {
+				continue
+			}
+			// (start, end]; one wrapping around the ring is two.
+			if r[0] < r[1] {
+				owned = append(owned, lsm.TokenRange{First: flip(r[0] + 1), Last: flip(r[1])})
+				continue
+			}
+			if r[0] < math.MaxInt64 {
+				owned = append(owned, lsm.TokenRange{First: flip(r[0] + 1), Last: flip(math.MaxInt64)})
+			}
+			owned = append(owned, lsm.TokenRange{First: flip(math.MinInt64), Last: flip(r[1])})
+		}
+		lt.SetOwnedRanges(owned)
+	}
+}
+
 // metadataChanged is called when a new metadata snapshot is installed.
 func (p *proxy) metadataChanged(s *Schema) {
 	replaced := map[string]bool{}
@@ -462,6 +502,7 @@ func (p *proxy) metadataChanged(s *Schema) {
 	}
 	p.replaced.Store(&replaced)
 	p.ring.Store(cluster.NewRing(nodeList(s)))
+	p.setOwnedRanges(s)
 	p.accordTopology(s)
 	p.g.Update(func(st *cluster.EndpointState) { st.Epoch = s.Epoch })
 }
@@ -722,6 +763,9 @@ func decodeWrites(b []byte) ([]write, error) {
 }
 
 func (p *proxy) handleMutation(ctx context.Context, _ string, payload []byte) ([]byte, error) {
+	if f := p.testRefuseMutations.Load(); f != nil && *f {
+		return nil, errors.New("db: refusing mutations (test)")
+	}
 	ws, err := decodeWrites(payload)
 	if err != nil {
 		return nil, err
@@ -867,9 +911,10 @@ wait:
 	} else {
 		cancel()
 	}
-	p.storeHints(hints)
+	stored := p.storeHints(hints)
 	if !satisfied() {
-		if cl == primitive.ConsistencyLevelAny && len(hints) > 0 {
+		// ANY is met by a hint, if one was in fact stored.
+		if cl == primitive.ConsistencyLevelAny && stored > 0 {
 			return nil
 		}
 		minAcks, need := 1<<30, 0
@@ -932,9 +977,12 @@ type hint struct {
 	w      write
 }
 
-func (p *proxy) storeHints(hs []hint) {
+// storeHints stores hints for writes nodes missed, returning how many
+// writes were hinted (none when hints are disabled, or a node has been
+// down past the hint window).
+func (p *proxy) storeHints(hs []hint) int {
 	if len(hs) == 0 || p.opts.DisableHints {
-		return
+		return 0
 	}
 	dir := p.d.schema.Load().Nodes
 	by := map[string][]write{}
@@ -945,6 +993,7 @@ func (p *proxy) storeHints(hs []hint) {
 		by[h.hostID] = append(by[h.hostID], h.w)
 	}
 	var ws []write
+	hinted := 0
 	now := time.Now()
 	for host, writes := range by {
 		id, err := types.ParseUUID(host)
@@ -962,8 +1011,12 @@ func (p *proxy) storeHints(hs []hint) {
 		v := row.Append(nil, &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: row.NoTimestamp},
 			Cells: []row.Cell{{Column: 1, Timestamp: now.UnixMicro(), TTL: uint32(ttl), LocalDeletionTime: now.Unix() + ttl, Value: encodeWrites(writes)}}})
 		ws = append(ws, write{table: hintsStorage, key: key, value: v})
+		hinted += len(writes)
 	}
-	_ = p.d.applyLocal(ws)
+	if p.d.applyLocal(ws) != nil {
+		return 0
+	}
+	return hinted
 }
 
 // withinHintWindow reports whether a node has been down for less than
@@ -1500,30 +1553,54 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 			stale = append(stale, r.node.Addr)
 		}
 	}
-	if len(stale) > 0 {
+	if len(stale) > 0 && s.readRepair() {
+		// Blocking: the read returns once the replicas it read agree, or
+		// times out (BlockingReadRepair), so a later read at the same
+		// consistency sees at least as much.
 		s.trace.event("Read repair of %v", stale)
-		s.p.repair(stale, []write{{table: s.id, key: key, value: merged, token: tokenOf(key)}})
+		if err := s.p.repair(stale, []write{{table: s.id, key: key, value: merged, token: tokenOf(key)}}); err != nil {
+			s.trace.event("Read repair failed: %v", err)
+			return nil, timeout()
+		}
 	}
 	return merged, nil
 }
 
 // repair writes merged rows to replicas that were behind (ReadRepair).
-func (p *proxy) repair(addrs []string, ws []write) {
+func (p *proxy) repair(addrs []string, ws []write) error {
 	ctx, cancel := context.WithTimeout(context.Background(), p.opts.WriteTimeout)
 	defer cancel()
 	var wg sync.WaitGroup
+	errs := make(chan error, len(addrs))
 	for _, a := range addrs {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			if a == p.self {
-				_ = p.d.applyLocal(ws)
+				errs <- p.d.applyLocal(ws)
 				return
 			}
-			_, _ = p.m.Request(ctx, a, cluster.VerbMutation, encodeWrites(ws))
+			_, err := p.m.Request(ctx, a, cluster.VerbMutation, encodeWrites(ws))
+			errs <- err
 		}()
 	}
 	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readRepair reports whether reads of the table repair the replicas they
+// read (read_repair 'BLOCKING', the default) or not ('NONE').
+func (s *distSource) readRepair() bool {
+	if t := s.p.d.schema.Load().byStorage[s.id]; t != nil {
+		return t.Params.ReadRepair != "NONE"
+	}
+	return true
 }
 
 const rangePage = 512
@@ -1758,7 +1835,7 @@ func (it *distIter) fetch(reps []*cluster.Node, need ackNeed, from, to []byte) (
 	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i].k, out[j].k) < 0 })
 	// Blocking read repair: replicas that returned less get the merged rows
 	// (DataResolver).
-	if len(got) > 1 {
+	if len(got) > 1 && it.s.readRepair() {
 		for _, r := range got {
 			have := make(map[string][]byte, len(r.kvs))
 			for _, e := range r.kvs {
@@ -1771,7 +1848,10 @@ func (it *distIter) fetch(reps []*cluster.Node, need ackNeed, from, to []byte) (
 				}
 			}
 			if len(ws) > 0 {
-				p.repair([]string{r.node.Addr}, ws)
+				if err := p.repair([]string{r.node.Addr}, ws); err != nil {
+					it.s.trace.event("Read repair of %s failed: %v", r.node.Addr, err)
+					return nil, nil, timeout()
+				}
 			}
 		}
 	}

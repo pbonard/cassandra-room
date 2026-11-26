@@ -3,6 +3,8 @@ package db
 import (
 	"bytes"
 	"encoding/binary"
+	"hash/crc32"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -79,15 +81,62 @@ func (d *DB) applyLocal(writes []write) error {
 // result at cl (the leader's part of CounterMutation.apply). Deltas on the
 // same counter in one mutation build on each other.
 func (d *DB) applyCounterDeltas(ws []write, cl primitive.ConsistencyLevel) error {
-	d.counterMu.Lock()
-	defer d.counterMu.Unlock()
+	// Lock the cells' stripes (in order: no deadlock between mutations),
+	// read and update this node's shards, apply them here, then release
+	// the locks before replicating: a slow replica no longer holds up
+	// every counter update of the node (CounterMutation.apply).
+	type cellID struct {
+		w, c int
+		id   string
+	}
+	var cells []cellID
+	stripes := map[int]bool{}
+	for wi, w := range ws {
+		r, err := row.Decode(w.value)
+		if err != nil {
+			return err
+		}
+		for ci, c := range r.Cells {
+			if c.Counter && len(c.Value) == 8 {
+				id := strconv.FormatUint(uint64(w.table), 10) + "/" + string(w.key) + "/" + strconv.FormatUint(uint64(c.Column), 10) + "/" + string(c.Path)
+				cells = append(cells, cellID{wi, ci, id})
+				stripes[int(crc32.ChecksumIEEE([]byte(id))%uint32(len(d.counterLocks)))] = true
+			}
+		}
+	}
+	order := make([]int, 0, len(stripes))
+	for s := range stripes {
+		order = append(order, s)
+	}
+	slices.Sort(order)
+	for _, s := range order {
+		d.counterLocks[s].Lock()
+	}
+	out, err := d.counterShards(ws)
+	if err == nil && d.proxy != nil {
+		// Here first, under the locks, so the next update reads it; the
+		// replication below applies it here again (shards merge, so that
+		// is harmless).
+		err = d.applyLocal(out)
+	}
+	for _, s := range order {
+		d.counterLocks[s].Unlock()
+	}
+	if err != nil {
+		return err
+	}
+	return d.store.apply(&mutation{writes: out}, cl)
+}
+
+// counterShards turns counter deltas into this node's new shards.
+func (d *DB) counterShards(ws []write) ([]write, error) {
 	type shard struct{ clock, count int64 }
 	cur := map[string]shard{}
 	out := make([]write, 0, len(ws))
 	for _, w := range ws {
 		r, err := row.Decode(w.value)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		changed := false
 		for i := range r.Cells {
@@ -121,5 +170,5 @@ func (d *DB) applyCounterDeltas(ws []write, cl primitive.ConsistencyLevel) error
 		}
 		out = append(out, w)
 	}
-	return d.store.apply(&mutation{writes: out}, cl)
+	return out, nil
 }

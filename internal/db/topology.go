@@ -630,6 +630,21 @@ func (d *DB) ReconfigureCMS(members []string) error {
 	members = slices.Clone(members)
 	slices.Sort(members)
 	members = slices.Compact(members)
+	// This node may itself be behind the log: catch up first, so that new
+	// members are brought up to the service's epoch, not a stale one.
+	p.cms.CatchUpFromMembers()
+	upToDate := func(m string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		epoch, err := p.cms.Sync(ctx, m)
+		if err != nil {
+			return fmt.Errorf("db: bringing %s up to date with the metadata log: %w", m, err)
+		}
+		if epoch < d.schema.Load().Epoch {
+			return fmt.Errorf("db: %s is behind the metadata log (epoch %d)", m, epoch)
+		}
+		return nil
+	}
 	for {
 		cur := slices.Clone(p.cmsMembers())
 		slices.Sort(cur)
@@ -637,15 +652,19 @@ func (d *DB) ReconfigureCMS(members []string) error {
 		if !ok {
 			return nil
 		}
-		if step[0] == '+' {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			epoch, err := p.cms.Sync(ctx, step[1:])
-			cancel()
-			if err != nil {
-				return fmt.Errorf("db: bringing %s up to date with the metadata log: %w", step[1:], err)
+		switch step[0] {
+		case '+':
+			if err := upToDate(step[1:]); err != nil {
+				return err
 			}
-			if epoch < d.schema.Load().Epoch {
-				return fmt.Errorf("db: %s is behind the metadata log (epoch %d)", step[1:], epoch)
+		case '-':
+			// The members that remain must know the log up to here (the
+			// additions included) before one leaves: otherwise one could be
+			// left alone, believing the old members still serve.
+			for _, m := range next {
+				if err := upToDate(m); err != nil {
+					return err
+				}
 			}
 		}
 		_, err := d.change("RECONFIGURE_CMS", func(n *Schema) (message.Message, bool, error) {

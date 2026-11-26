@@ -467,3 +467,81 @@ func TestCMSPersistence(t *testing.T) {
 	require.False(t, prepare(restarted, 5), "a lower ballot than the one promised before the restart")
 	require.True(t, prepare(restarted, 11))
 }
+
+// TestCMSLaggingAcceptor: a member that misses epochs before the one being
+// decided does not vote on it (it catches up instead); and catching up
+// asks members until the epoch advances, not just until one answers.
+func TestCMSLaggingAcceptor(t *testing.T) {
+	_, stores, cmss := startCMS(t, 3)
+	for i := 0; i < 3; i++ {
+		_, err := cmss[0].Commit(context.Background(), addItem(fmt.Sprint(i), nil))
+		require.NoError(t, err)
+	}
+	require.Eventually(t, func() bool { e, _ := stores[2].items(); return e == 3 }, 5*time.Second, 10*time.Millisecond)
+	// Node 2 loses its state (epoch 0).
+	stores[2].mu.Lock()
+	stores[2].meta = memMeta{Members: stores[2].members}
+	stores[2].log = nil
+	stores[2].mu.Unlock()
+	req, _ := json.Marshal(paxosReq{Epoch: 4, Ballot: ballot{Round: 1, Node: cmss[0].self}})
+	out, err := cmss[2].handlePrepare(context.Background(), cmss[0].self, req)
+	require.NoError(t, err)
+	var r paxosResp
+	require.NoError(t, json.Unmarshal(out, &r))
+	require.True(t, r.Lagging, "no vote on epoch 4 from a node at epoch 0")
+	require.False(t, r.OK)
+	require.Eventually(t, func() bool { e, _ := stores[2].items(); return e == 3 }, 5*time.Second, 10*time.Millisecond, "it caught up")
+
+	// Node 1 falls behind node 0; node 2 is as far behind as node 1.
+	_, err = cmss[0].Commit(context.Background(), addItem("x", nil))
+	require.NoError(t, err)
+	stores[1].mu.Lock()
+	stores[1].meta.Epoch, stores[1].log = 3, stores[1].log[:3]
+	stores[1].meta.Items, stores[1].meta.IDs = stores[1].meta.Items[:3], stores[1].meta.IDs[:3]
+	stores[1].mu.Unlock()
+	stores[2].mu.Lock()
+	stores[2].meta.Epoch, stores[2].log = 3, stores[2].log[:3]
+	stores[2].meta.Items, stores[2].meta.IDs = stores[2].meta.Items[:3], stores[2].meta.IDs[:3]
+	stores[2].mu.Unlock()
+	// Node 1 asks node 2 first (no further), then node 0.
+	cmss[1].catchUpFromMembers([]string{cmss[2].self, cmss[0].self})
+	e, _ := stores[1].items()
+	require.EqualValues(t, 4, e, "caught up past a member as far behind")
+}
+
+// TestMergeDeadAndStaleState: a member another node reports dead, unknown
+// here, is not taken for up; and a dead member's newer state, relayed late,
+// does not bring it back (only a newer generation or incarnation does).
+func TestMergeDeadAndStaleState(t *testing.T) {
+	m, err := NewMessaging("127.0.0.1:0")
+	require.NoError(t, err)
+	defer m.Close()
+	g := NewGossiper(m, EndpointState{}, nil)
+	dead := EndpointState{Addr: "10.0.0.9:7000", Generation: 5, Epoch: 1}
+	b, _ := json.Marshal([]pushPullState{{State: dead, Liveness: stateDead, Incarnation: 2}})
+	g.mergeState(b)
+	require.False(t, g.IsAlive(dead.Addr), "reported dead")
+
+	later := dead
+	later.Epoch = 2
+	g.alive(message{Kind: kindState, Node: dead.Addr, Gen: later.Generation, Inc: 2, State: &later})
+	require.False(t, g.IsAlive(dead.Addr), "a newer state of the same life does not revive it")
+
+	g.alive(message{Kind: stateAlive, Node: dead.Addr, Gen: dead.Generation, Inc: 3})
+	require.True(t, g.IsAlive(dead.Addr), "it refuted with a higher incarnation")
+}
+
+// TestNetworkTopologyStrategyIdleRack: a rack whose only node owns no
+// tokens does not keep the skipped nodes of the other racks out: every
+// token still gets its data center's replication factor.
+func TestNetworkTopologyStrategyIdleRack(t *testing.T) {
+	r := NewRing([]Node{
+		{Addr: "a", DataCenter: "dc1", Rack: "r1", Tokens: RandomTokens(8), Status: StatusNormal},
+		{Addr: "b", DataCenter: "dc1", Rack: "r1", Tokens: RandomTokens(8), Status: StatusNormal},
+		{Addr: "c", DataCenter: "dc1", Rack: "r2", Status: StatusNormal},
+	})
+	repl := map[string]string{"class": "NetworkTopologyStrategy", "dc1": "2"}
+	for i := 0; i < 50; i++ {
+		require.Len(t, r.Replicas(repl, int64(i)*7919*1e12), 2)
+	}
+}

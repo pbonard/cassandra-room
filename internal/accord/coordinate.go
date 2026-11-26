@@ -443,21 +443,26 @@ func (n *Node) quorum(ctx context.Context, ts *Topologies, t msgType, req any) e
 func (n *Node) awaitOutcome(ctx context.Context, id TxnID, keys []Key) ([]byte, error) {
 	for {
 		ts := n.topologies(keys, id.Epoch, n.epoch())
+		truncated, answered := 0, 0
 		for _, to := range ts.nodes() {
 			var rep checkStatusReply
 			if err := n.send(ctx, to, mCheckStatus, &checkStatusReq{ID: id, Keys: keys}, &rep); err != nil {
 				continue
 			}
+			answered++
 			switch rep.Status {
 			case Applied, PreApplied:
 				return rep.Result, nil
 			case Invalidated:
 				return nil, ErrInvalidated
 			case Truncated:
-				// Erased: applied everywhere, or below the redundancy bound
-				// (applied, or never committed). The result is gone.
-				return nil, ErrTimeout
+				// Erased here: applied everywhere, or below the redundancy
+				// bound. Another replica may still hold the result.
+				truncated++
 			}
+		}
+		if answered > 0 && truncated == answered {
+			return nil, ErrTimeout // gone from every replica that answers
 		}
 		select {
 		case <-ctx.Done():

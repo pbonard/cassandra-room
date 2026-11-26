@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/datastax/go-cassandra-native-protocol/message"
+	"github.com/pbonard/cassandra-room/internal/accord"
 	"github.com/pbonard/cassandra-room/internal/cql"
 	"github.com/pbonard/cassandra-room/internal/storage/lsm"
 	"github.com/pbonard/cassandra-room/internal/storage/row"
@@ -279,7 +280,7 @@ func (d *DB) prepareModification(s *Schema, session string, raw cql.Statement, v
 			m.cond.read.sels = append(m.cond.read.sels, selector{kind: selColumn, name: col.Name, typ: col.Type, col: col})
 		}
 	}
-	m.pkIndices = pkIndices(t, vs)
+	m.pkIndices = pkIndices(t, m.where, vs)
 	return m, nil
 }
 
@@ -301,7 +302,21 @@ func operationString(op cql.Operation) string {
 // pkIndices returns the bind markers of the partition key columns, if each
 // is bound by one marker (the PK indices of the PREPARED result, which
 // drivers use for token-aware routing).
-func pkIndices(t *Table, vs *vars) []uint16 {
+func pkIndices(t *Table, w *where, vs *vars) []uint16 {
+	// The marker each partition key column is restricted to (by name or
+	// position: a named marker need not be named after its column, and a
+	// marker of the column's name may restrict another column).
+	if w != nil && len(w.pk) == len(t.PartitionKey) {
+		var out []uint16
+		for _, v := range w.pk {
+			m, ok := v.eqMarker()
+			if !ok {
+				return nil
+			}
+			out = append(out, uint16(m.idx))
+		}
+		return out
+	}
 	var out []uint16
 	for _, c := range t.PartitionKey {
 		found := false
@@ -329,6 +344,27 @@ func (m *modification) execute(e *execCtx) (message.Message, error) {
 	return &message.VoidResult{}, nil
 }
 
+// multiPartition reports whether statements write more than one partition.
+func multiPartition(mods []boundModification) (bool, error) {
+	var first accord.Key
+	n := 0
+	for _, bm := range mods {
+		ks, err := stmtPartitions(bm.e, bm.m.t, bm.m.where)
+		if err != nil {
+			return false, err
+		}
+		for _, k := range ks {
+			if n == 0 {
+				first = k
+			} else if k.Compare(first) != 0 {
+				return true, nil
+			}
+			n++
+		}
+	}
+	return false, nil
+}
+
 type boundModification struct {
 	m *modification
 	e *execCtx
@@ -341,6 +377,13 @@ func (d *DB) applyModifications(mods []boundModification, batchCtx *execCtx) err
 			return invalidf("A batch cannot mix tables with and without transactional_mode 'full'")
 		}
 		return d.proxy.accordWrite(mods, batchCtx)
+	}
+	if d.proxy != nil && batchCtx.logged && len(mods) > 1 && !mods[0].m.isCounter() {
+		if many, err := multiPartition(mods); err != nil {
+			return err
+		} else if many {
+			return d.proxy.accordWrite(mods, batchCtx)
+		}
 	}
 	if d.proxy != nil && mods[0].m.isCounter() {
 		// Counter deltas, applied by each partition's leader.
@@ -409,7 +452,10 @@ func (m *modification) writeParams(e *execCtx) (ts int64, ttl int64, err error) 
 	}
 	if !ok {
 		ts = e.timestamp()
-	} else if ts == -1<<63 {
+	}
+	// The minimum is "no timestamp", and overwrites write a deletion at
+	// ts - 1: both bottom values are refused (also as a client default).
+	if ts <= -1<<63+1 {
 		return 0, 0, invalidf("Invalid timestamp value")
 	}
 	ttl, ok, err = bindInt(e, m.ttl, "TTL")
@@ -952,10 +998,11 @@ func deletionCell(ts, nowSec int64) row.Cell {
 type batchStmt struct {
 	mods        []*modification
 	conditional bool
+	logged      bool
 }
 
 func (d *DB) prepareBatch(s *Schema, session string, st *cql.Batch, vs *vars) (*batchStmt, error) {
-	b := &batchStmt{}
+	b := &batchStmt{logged: st.Type == "LOGGED"}
 	for _, raw := range st.Statements {
 		m, err := d.prepareModification(s, session, raw, vs)
 		if err != nil {
@@ -995,6 +1042,7 @@ func (b *batchStmt) execute(e *execCtx) (message.Message, error) {
 	if b.conditional {
 		return e.d.executeCAS(mods, e)
 	}
+	e.logged = b.logged
 	if err := e.d.applyModifications(mods, e); err != nil {
 		return nil, err
 	}

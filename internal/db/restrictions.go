@@ -22,6 +22,15 @@ type valuesTerm struct {
 	list term // IN ?
 }
 
+// eqMarker returns the bind marker of an EQ restriction, if it is one.
+func (v *valuesTerm) eqMarker() (*markerTerm, bool) {
+	if v == nil || v.eq == nil {
+		return nil, false
+	}
+	m, ok := v.eq.(*markerTerm)
+	return m, ok
+}
+
 func (v *valuesTerm) values(e *execCtx) ([][]byte, error) {
 	check := func(b []byte, st valState) ([]byte, error) {
 		switch st {

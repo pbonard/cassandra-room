@@ -188,7 +188,9 @@ func appendInt(dst []byte, n int64, size int) []byte {
 func parseFloat(s string, bits int) (float64, error) {
 	switch s {
 	case "NaN", "-NaN":
-		return math.NaN(), nil
+		// Java's NaN (Go's math.NaN has other bits: a key written by a
+		// driver would not be found).
+		return math.Float64frombits(canonicalNaN64), nil
 	case "Infinity":
 		return math.Inf(1), nil
 	case "-Infinity":
