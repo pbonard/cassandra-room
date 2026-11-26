@@ -82,6 +82,9 @@ type proxy struct {
 	testRefuseMutations atomic.Pointer[bool]
 	// testMutationDelay delays answering MUTATION messages (tests).
 	testMutationDelay atomic.Int64
+	// testNoGossipCatchUp stops catching up with nodes that gossip a
+	// newer epoch (tests).
+	testNoGossipCatchUp atomic.Bool
 	// streamUsed is when each outbound stream session was last used.
 	streamMu   sync.Mutex
 	streamUsed map[string]time.Time
@@ -106,6 +109,9 @@ type proxy struct {
 	// place is ring and moving with their epoch, read together by
 	// coordinators to tag their requests (see fence.go).
 	place atomic.Pointer[placement]
+	// catchingTo is the highest epoch a catch-up was started for, from a
+	// request planned with it (see noteEpoch).
+	catchingTo atomic.Int64
 	// fence refuses requests planned with placements older than this
 	// node's; placeMu guards placeKey, what the placements were made of.
 	fence    fence
@@ -638,6 +644,9 @@ func (p *proxy) metadataChanged(s *Schema) {
 // membershipChanged catches up with a node that gossips a newer epoch
 // (TCM's peer log fetching).
 func (p *proxy) membershipChanged() {
+	if p.testNoGossipCatchUp.Load() {
+		return
+	}
 	epoch := p.d.schema.Load().Epoch
 	for _, s := range p.g.States() {
 		if s.Epoch > epoch && s.Addr != p.self && p.g.IsAlive(s.Addr) {
@@ -895,14 +904,14 @@ func decodeWrites(b []byte) ([]write, error) {
 	return out, nil
 }
 
-func (p *proxy) handleMutation(ctx context.Context, _ string, payload []byte) ([]byte, error) {
+func (p *proxy) handleMutation(ctx context.Context, from string, payload []byte) ([]byte, error) {
 	if f := p.testRefuseMutations.Load(); f != nil && *f {
 		return nil, errors.New("db: refusing mutations (test)")
 	}
 	if d := p.testMutationDelay.Load(); d > 0 {
 		time.Sleep(time.Duration(d))
 	}
-	payload, done, err := p.admit(payload)
+	payload, epoch, done, err := p.admit(from, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -911,6 +920,7 @@ func (p *proxy) handleMutation(ctx context.Context, _ string, payload []byte) ([
 	if err != nil {
 		return nil, err
 	}
+	p.knownTables(from, epoch, writeTables(ws)...)
 	return nil, p.d.applyLocal(ws)
 }
 
@@ -1406,8 +1416,8 @@ func decodeParts(b []byte, n int) (lsm.TableID, [][]byte, error) {
 	return lsm.TableID(id), out, nil
 }
 
-func (p *proxy) handleReadRow(ctx context.Context, _ string, payload []byte) ([]byte, error) {
-	payload, done, err := p.admit(payload)
+func (p *proxy) handleReadRow(ctx context.Context, from string, payload []byte) ([]byte, error) {
+	payload, epoch, done, err := p.admit(from, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -1416,6 +1426,7 @@ func (p *proxy) handleReadRow(ctx context.Context, _ string, payload []byte) ([]
 	if err != nil {
 		return nil, err
 	}
+	p.knownTables(from, epoch, id)
 	lt, err := p.d.engine.Table(id)
 	if err != nil {
 		return nil, err
@@ -1831,8 +1842,8 @@ func (s *distSource) readRepair() bool {
 
 const rangePage = 512
 
-func (p *proxy) handleReadRange(ctx context.Context, _ string, payload []byte) ([]byte, error) {
-	payload, done, err := p.admit(payload)
+func (p *proxy) handleReadRange(ctx context.Context, from string, payload []byte) ([]byte, error) {
+	payload, epoch, done, err := p.admit(from, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -1841,6 +1852,7 @@ func (p *proxy) handleReadRange(ctx context.Context, _ string, payload []byte) (
 	if err != nil {
 		return nil, err
 	}
+	p.knownTables(from, epoch, id)
 	lt, err := p.d.engine.Table(id)
 	if err != nil {
 		return nil, err
@@ -1883,8 +1895,8 @@ func (p *proxy) handleReadRange(ctx context.Context, _ string, payload []byte) (
 }
 
 // handleReadRangeReverse serves a page of a key range from its end down.
-func (p *proxy) handleReadRangeReverse(ctx context.Context, _ string, payload []byte) ([]byte, error) {
-	payload, done, err := p.admit(payload)
+func (p *proxy) handleReadRangeReverse(ctx context.Context, from string, payload []byte) ([]byte, error) {
+	payload, epoch, done, err := p.admit(from, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -1893,6 +1905,7 @@ func (p *proxy) handleReadRangeReverse(ctx context.Context, _ string, payload []
 	if err != nil {
 		return nil, err
 	}
+	p.knownTables(from, epoch, id)
 	lt, err := p.d.engine.Table(id)
 	if err != nil {
 		return nil, err
@@ -2457,11 +2470,12 @@ type counterRequest struct {
 	Epoch int64
 }
 
-func (p *proxy) handleCounterMutation(ctx context.Context, _ string, payload []byte) ([]byte, error) {
+func (p *proxy) handleCounterMutation(ctx context.Context, from string, payload []byte) ([]byte, error) {
 	var r counterRequest
 	if err := json.Unmarshal(payload, &r); err != nil {
 		return nil, err
 	}
+	p.noteEpoch(from, r.Epoch)
 	done, err := p.fence.enter(r.Epoch)
 	if err != nil {
 		return nil, err
@@ -2471,6 +2485,7 @@ func (p *proxy) handleCounterMutation(ctx context.Context, _ string, payload []b
 	if err != nil {
 		return nil, err
 	}
+	p.knownTables(from, r.Epoch, writeTables(ws)...)
 	if err := p.d.applyCounterDeltas(ws, primitive.ConsistencyLevel(r.CL)); err != nil {
 		return encodeMessage(ErrorMessage(err))
 	}

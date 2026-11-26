@@ -529,6 +529,59 @@ func (d *DB) Cleanup(keyspace string) (int, error) {
 	return cleaned, nil
 }
 
+// CancelMovement gives up the join (or replacement) of a node gone for
+// good: its ranges stay with their owners and it is LEFT (TCM's
+// CancelInProgressSequence). From JOINING one commit does it: reads never
+// moved to the node. From MID_JOIN the steps are undone in turn, as they
+// were made: back to JOINING (reads return to the old owners; writes still
+// reach both), a progress barrier, then LEFT. A node being replaced stays
+// NORMAL, to be replaced again. A dead node that is leaving is removed
+// with RemoveNode, which finishes its leave.
+func (d *DB) CancelMovement(target string) error {
+	p := d.proxy
+	if p == nil {
+		return errors.New("db: not a cluster node")
+	}
+	var n *cluster.Node
+	for _, m := range d.schema.Load().Nodes {
+		if (m.Addr == target || m.HostID == target) && m.Status != cluster.StatusLeft {
+			n = m
+		}
+	}
+	switch {
+	case n == nil:
+		return fmt.Errorf("db: no node %s in the cluster", target)
+	case n.HostID == d.local.HostID:
+		return errors.New("db: a node cannot cancel its own join")
+	case p.g.IsAlive(n.Addr):
+		return fmt.Errorf("db: node %s is alive; stop it first", target)
+	case n.Status == cluster.StatusLeaving || n.Status == cluster.StatusMidLeave:
+		return fmt.Errorf("db: node %s is %s; remove it with removenode, which finishes its leave", target, n.Status)
+	case n.Status != cluster.StatusJoining && n.Status != cluster.StatusMidJoin:
+		return fmt.Errorf("db: node %s is %s: no movement to cancel", target, n.Status)
+	}
+	if n.Status == cluster.StatusMidJoin {
+		if err := p.setNodeStatus("CANCEL_MID_JOIN", n.HostID, cluster.StatusJoining); err != nil {
+			return err
+		}
+		// LEFT once no read uses the placements of MID_JOIN, which read
+		// from the node: until then writes still reach it.
+		if err := p.progressBarrier(n.HostID); err != nil {
+			return err
+		}
+	}
+	_, err := d.change("CANCEL_JOIN", func(next *Schema) (message.Message, bool, error) {
+		m := next.Nodes[n.HostID]
+		if m == nil || m.Status != cluster.StatusJoining {
+			return nil, false, nil
+		}
+		m.Status, m.Replaces = cluster.StatusLeft, ""
+		next.logDetail = fmt.Sprintf("%s %s join cancelled", m.HostID, m.Addr)
+		return nil, true, nil
+	})
+	return err
+}
+
 // RemoveNode removes a dead node from the cluster (nodetool removenode):
 // it is marked LEAVING, the nodes that become replicas of its ranges get
 // their data from the surviving replicas, then it is LEFT.
@@ -552,6 +605,10 @@ func (d *DB) RemoveNode(target string) error {
 		return fmt.Errorf("db: node %s is alive; decommission it instead", target)
 	case slices.Contains(p.cmsMembers(), dead.Addr):
 		return fmt.Errorf("db: node %s is a member of the cluster metadata service; reconfigure it first", target)
+	case dead.Status == cluster.StatusJoining || dead.Status == cluster.StatusMidJoin:
+		// Removing it would make it LEAVING: an owner its ranges are read
+		// from, though it never had their data.
+		return fmt.Errorf("db: node %s is %s; cancel its join instead", target, dead.Status)
 	}
 	op := "removenode-" + dead.HostID
 	if dead.Status != cluster.StatusMidLeave {
@@ -772,10 +829,13 @@ func (p *proxy) startMovement(kind, hostID, status string) error {
 //
 // A node that does not answer is waited for, unless enough others did: a
 // node cut off or paused, not only a crashed one, may come back.
-func (p *proxy) progressBarrier() error {
+//
+// abandoned are nodes a cancelled movement gives up (gone for good): they
+// are not waited for, and a group needs at most its other hosts.
+func (p *proxy) progressBarrier(abandoned ...string) error {
 	s := p.d.schema.Load()
 	epoch := s.Epoch
-	groups := barrierGroups(s)
+	groups := barrierGroups(s, abandoned...)
 	if len(groups) == 0 {
 		return nil
 	}
@@ -874,7 +934,7 @@ type barrierGroup struct {
 }
 
 // barrierGroups lists the groups of the ranges whose owners change.
-func barrierGroups(s *Schema) []barrierGroup {
+func barrierGroups(s *Schema, abandoned ...string) []barrierGroup {
 	nodes := nodeList(s)
 	old, future := cluster.NewOldRing(nodes), cluster.NewFutureRing(nodes)
 	var toks []int64
@@ -914,6 +974,12 @@ func barrierGroups(s *Schema) []barrierGroup {
 					need := len(hosts) - (rf/2 + 1) + 1
 					if need <= 0 {
 						continue // too few for a quorum: no quorum request succeeds
+					}
+					if len(abandoned) > 0 {
+						hosts = slices.DeleteFunc(hosts, func(id string) bool { return slices.Contains(abandoned, id) })
+						if need = min(need, len(hosts)); need == 0 {
+							continue
+						}
 					}
 					slices.Sort(hosts)
 					key := fmt.Sprint(hosts, need)

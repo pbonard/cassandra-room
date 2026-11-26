@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/pbonard/cassandra-room/internal/cluster"
+	"github.com/pbonard/cassandra-room/internal/storage/lsm"
 )
 
 // Epoch fencing (TCM's coordinator/replica epoch checks): a coordinator
@@ -158,14 +159,65 @@ func fenced(epoch int64, payload []byte) []byte {
 }
 
 // admit reads a fenced request's epoch and admits it; the rest is the
-// request.
-func (p *proxy) admit(payload []byte) (rest []byte, done func(), err error) {
+// request. A request planned with newer metadata than this node's makes it
+// catch up, in the background (see knownTables for when it must wait).
+func (p *proxy) admit(from string, payload []byte) (rest []byte, epoch int64, done func(), err error) {
 	e, k := binary.Uvarint(payload)
 	if k <= 0 {
-		return nil, nil, errors.New("db: request without an epoch")
+		return nil, 0, nil, errors.New("db: request without an epoch")
 	}
-	done, err = p.fence.enter(int64(e))
-	return payload[k:], done, err
+	epoch = int64(e)
+	p.noteEpoch(from, epoch)
+	done, err = p.fence.enter(epoch)
+	return payload[k:], epoch, done, err
+}
+
+// noteEpoch starts catching up, from the node that sent it, with metadata
+// a request was planned with (TCM's replicas catch up with a coordinator
+// ahead of them); requests keep being served meanwhile. One catch-up runs
+// per epoch seen, however many requests carry it.
+func (p *proxy) noteEpoch(from string, epoch int64) {
+	if from == p.self || epoch <= p.d.schema.Load().Epoch {
+		return
+	}
+	for {
+		cur := p.catchingTo.Load()
+		if cur >= epoch {
+			return
+		}
+		if p.catchingTo.CompareAndSwap(cur, epoch) {
+			break
+		}
+	}
+	go p.catchUpTo(from, epoch)
+}
+
+// catchUpTo brings this node's metadata to epoch at least, from a node
+// that has it, or else from the metadata service (a forwarded request's
+// sender may be a node that forwarded it, no further ahead than this one).
+func (p *proxy) catchUpTo(from string, epoch int64) {
+	if from != p.self {
+		_ = p.cms.CatchUpTo(from, epoch)
+	}
+	if p.d.schema.Load().Epoch < epoch {
+		p.cms.CatchUpFromMembers()
+	}
+}
+
+// knownTables makes sure this node knows the tables a request planned at
+// epoch names, catching up first if it does not and the request is newer
+// than its metadata (a table created there, not yet pushed here): the
+// request is served instead of failing.
+func (p *proxy) knownTables(from string, epoch int64, ids ...lsm.TableID) {
+	if epoch <= p.d.schema.Load().Epoch {
+		return
+	}
+	for _, id := range ids {
+		if _, err := p.d.engine.Table(id); errors.Is(err, lsm.ErrUnknownTable) {
+			p.catchUpTo(from, epoch)
+			return
+		}
+	}
 }
 
 // synced answers a progress barrier once this node caught up: its epoch,
@@ -210,4 +262,15 @@ func (p *proxy) catchUpFrom(addr string) {
 		return
 	}
 	_ = p.cms.CatchUp(addr)
+}
+
+// writeTables lists the tables writes are to.
+func writeTables(ws []write) []lsm.TableID {
+	var ids []lsm.TableID
+	for _, w := range ws {
+		if !slices.Contains(ids, w.table) {
+			ids = append(ids, w.table)
+		}
+	}
+	return ids
 }

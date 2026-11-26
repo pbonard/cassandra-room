@@ -319,9 +319,16 @@ func (c *CMS) Sync(ctx context.Context, node string) (int64, error) {
 
 // CatchUp fetches what this node misses of the log from a node: the
 // entries after its epoch, replayed in order, or a snapshot.
-func (c *CMS) CatchUp(from string) error {
+func (c *CMS) CatchUp(from string) error { return c.CatchUpTo(from, 0) }
+
+// CatchUpTo is CatchUp, unless this node reached epoch min meanwhile:
+// concurrent requests that found it behind fetch the log once, not each.
+func (c *CMS) CatchUpTo(from string, min int64) error {
 	c.catchingUp.Lock()
 	defer c.catchingUp.Unlock()
+	if min > 0 && c.epoch() >= min {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	q, _ := json.Marshal(fetchRequest{Since: c.epoch()})
