@@ -1,6 +1,8 @@
 package db
 
 import (
+	"bytes"
+	"math/rand"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -99,4 +101,31 @@ func TestListPrependsInBatch(t *testing.T) {
 	require.Equal(t, []string{"[3, 4, 1, 2, 9]"}, s.rows("SELECT toJson(l) FROM ks.t WHERE k = 1"))
 	s.ok("UPDATE ks.t SET l = [5, 6] + l, l = l + [7] WHERE k = 1")
 	require.Equal(t, []string{"[5, 6, 3, 4, 1, 2, 9, 7]"}, s.rows("SELECT toJson(l) FROM ks.t WHERE k = 1"))
+}
+
+// TestDeletedAtFlattened: with many range tombstones, the flattened
+// lookup gives the newest covering deletion, as a scan of every one does.
+func TestDeletedAtFlattened(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	key := func() []byte { return []byte{byte(rng.Intn(40)), byte(rng.Intn(4))} }
+	for trial := 0; trial < 200; trial++ {
+		d := deletions{partition: int64(rng.Intn(5)) - 1}
+		for i := 0; i < 9+rng.Intn(30); i++ {
+			a, b := key(), key()
+			if bytes.Compare(a, b) > 0 {
+				a, b = b, a
+			}
+			d.ranges = append(d.ranges, rangeTombstone{start: a, end: b, ts: int64(rng.Intn(100))})
+		}
+		for i := 0; i < 50; i++ {
+			k := key()
+			want := d.partition
+			for _, r := range d.ranges {
+				if r.ts > want && bytes.Compare(k, r.start) >= 0 && bytes.Compare(k, r.end) < 0 {
+					want = r.ts
+				}
+			}
+			require.Equal(t, want, d.deletedAt(k), "%x", k)
+		}
+	}
 }

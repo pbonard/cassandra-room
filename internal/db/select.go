@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/big"
 	"slices"
+	"sort"
 	"strings"
 
 	"github.com/datastax/go-cassandra-native-protocol/message"
@@ -833,6 +834,14 @@ type kv struct{ k, v []byte }
 type deletions struct {
 	partition int64 // timestamp, or NoTimestamp
 	ranges    []rangeTombstone
+	// With many range tombstones, they are flattened once into disjoint
+	// segments [bounds[i], bounds[i+1]) with the newest covering deletion
+	// (segTS[i]), for a binary search per row instead of a scan of every
+	// tombstone (RangeTombstoneTracker's job). flat is len(ranges) when
+	// built.
+	bounds [][]byte
+	segTS  []int64
+	flat   int
 }
 
 type rangeTombstone struct {
@@ -840,15 +849,51 @@ type rangeTombstone struct {
 	ts         int64
 }
 
+// manyTombstones is when deletedAt flattens a partition's tombstones.
+const manyTombstones = 8
+
 // deletedAt returns the newest deletion covering a row (by key suffix).
 func (d *deletions) deletedAt(suffix []byte) int64 {
 	ts := d.partition
-	for _, r := range d.ranges {
-		if r.ts > ts && bytes.Compare(suffix, r.start) >= 0 && bytes.Compare(suffix, r.end) < 0 {
-			ts = r.ts
+	if len(d.ranges) <= manyTombstones {
+		for _, r := range d.ranges {
+			if r.ts > ts && bytes.Compare(suffix, r.start) >= 0 && bytes.Compare(suffix, r.end) < 0 {
+				ts = r.ts
+			}
 		}
+		return ts
+	}
+	if d.flat != len(d.ranges) {
+		d.flatten()
+	}
+	// The last bound at or below the suffix starts its segment.
+	i := sort.Search(len(d.bounds), func(i int) bool { return bytes.Compare(d.bounds[i], suffix) > 0 }) - 1
+	if i >= 0 && i < len(d.segTS) && d.segTS[i] > ts {
+		ts = d.segTS[i]
 	}
 	return ts
+}
+
+// flatten builds the disjoint segments of the range tombstones.
+func (d *deletions) flatten() {
+	d.bounds = d.bounds[:0]
+	for _, r := range d.ranges {
+		d.bounds = append(d.bounds, r.start, r.end)
+	}
+	slices.SortFunc(d.bounds, bytes.Compare)
+	d.bounds = slices.CompactFunc(d.bounds, bytes.Equal)
+	d.segTS = make([]int64, max(len(d.bounds)-1, 0))
+	for i := range d.segTS {
+		d.segTS[i] = row.NoTimestamp
+	}
+	for _, r := range d.ranges {
+		lo, _ := slices.BinarySearchFunc(d.bounds, r.start, bytes.Compare)
+		hi, _ := slices.BinarySearchFunc(d.bounds, r.end, bytes.Compare)
+		for i := lo; i < hi; i++ {
+			d.segTS[i] = max(d.segTS[i], r.ts)
+		}
+	}
+	d.flat = len(d.ranges)
 }
 
 // readPartitionIter reads the partition with prefix p from it, which is
