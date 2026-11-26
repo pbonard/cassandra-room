@@ -123,6 +123,13 @@ names, not its class structure.
     spans: with an older epoch in their place, a node behind the one that
     made it a pending replica of a key applied the transaction without
     that key, and the write was lost there once it learnt the epoch.
+  - **HLC order:** transactions execute in timestamp order (epoch
+    first), but their writes are cells timestamped with the HLC alone. An
+    execution timestamp therefore exceeds every conflicting one its
+    replicas witnessed in HLC too (`mergeMax`, as upstream's
+    `Timestamp.mergeMax`): with only the largest timestamp kept per key, a
+    transaction of a newer epoch could execute after one of an older epoch
+    at a lower HLC, and its writes lost to the older one's.
   - **Late ownership** (`late_owned`): a transaction applied here that
     gains a key this node owned at the epoch it executed at is counted.
     Gaining keys of a later epoch is normal (a range the node starts
@@ -418,6 +425,14 @@ names, not its class structure.
     tables reporting them.
 
 ## Not done
+
+- **A rare lost update during decommissions:** `TestClusterAccordDecommission`
+  ends with balances off by 5 in about one run in 50 under the race
+  detector, on main as well (2 in 120); the replicas agree, and
+  `late_owned` is 0. Not found yet.
+- **Durability rounds and pending replicas:** their universal sync points
+  apply at the read replicas only; a pending replica that missed a
+  transaction could adopt the others' redundancy bound and skip it.
 
 - **Range reads:** they are ephemeral, so they form a per-partition
   snapshot, not one across the range. Sync points are the only range
