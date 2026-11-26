@@ -55,21 +55,27 @@ func (t *Topology) shards(keys []Key) []*Shard {
 		nodes := slices.Clone(t.Replicas(k))
 		slices.Sort(nodes)
 		nodes = slices.Compact(nodes)
-		id := strings.Join(nodes, ",")
+		var pending []NodeID
+		if t.Pending != nil {
+			for _, p := range t.Pending(k) {
+				if !slices.Contains(pending, p) && !slices.Contains(nodes, p) {
+					pending = append(pending, p)
+				}
+			}
+			slices.Sort(pending)
+		}
+		// Keys share a shard only if they have the same replicas and the
+		// same pending ones: a node pending on one key only (a joining node
+		// taking over its range) must not own the shard's other keys, or it
+		// waits on their transactions, which never reach it.
+		id := strings.Join(nodes, ",") + "|" + strings.Join(pending, ",")
 		s := byNodes[id]
 		if s == nil {
-			s = &Shard{Epoch: t.Epoch, Nodes: nodes}
+			s = &Shard{Epoch: t.Epoch, Nodes: nodes, Pending: pending}
 			byNodes[id] = s
 			out = append(out, s)
 		}
 		s.Keys = append(s.Keys, k)
-		if t.Pending != nil {
-			for _, p := range t.Pending(k) {
-				if !slices.Contains(s.Pending, p) && !slices.Contains(s.Nodes, p) {
-					s.Pending = append(s.Pending, p)
-				}
-			}
-		}
 	}
 	return out
 }

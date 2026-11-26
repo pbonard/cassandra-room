@@ -201,3 +201,33 @@ func TestAwaitOutcomeApplies(t *testing.T) {
 	require.Equal(t, `"done"`, string(res))
 	require.GreaterOrEqual(t, holding(), 2, "applied at a quorum before answering")
 }
+
+// TestShardsByPending: keys with the same replicas but different pending
+// ones are different shards. A node pending on one key (taking over its
+// range) owned the other keys of that key's shard too, and waited for
+// their transactions, which never reached it.
+func TestShardsByPending(t *testing.T) {
+	k1, k2 := Key{Token: 1, ID: "a"}, Key{Token: 2, ID: "b"}
+	topo := &Topology{Epoch: 1, Nodes: []NodeID{"n0", "n1", "n2"},
+		Replicas: func(Key) []NodeID { return []NodeID{"n0", "n1"} },
+		Pending: func(k Key) []NodeID {
+			if k == k1 {
+				return []NodeID{"n2"}
+			}
+			return nil
+		}}
+	shards := topo.shards([]Key{k1, k2})
+	require.Len(t, shards, 2)
+	for _, s := range shards {
+		require.Len(t, s.Keys, 1)
+		if s.Keys[0] == k1 {
+			require.Equal(t, []NodeID{"n2"}, s.Pending)
+		} else {
+			require.Empty(t, s.Pending)
+		}
+	}
+	c := newSimCluster(t, 3, 3, 1)
+	n := c.node(2)
+	n.SetTopology(&Topology{Epoch: 2, Nodes: topo.Nodes, Replicas: topo.Replicas, Pending: topo.Pending})
+	require.Equal(t, []Key{k1}, n.owned([]Key{k1, k2}, 2), "pending on k1 only")
+}

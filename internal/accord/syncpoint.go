@@ -181,12 +181,21 @@ func (n *Node) rangeTopologies(r Range) *Topologies {
 // its id once it applied at a quorum of every shard (at every replica if
 // universal).
 func (n *Node) SyncPoint(ctx context.Context, r Range, universal bool) (TxnID, error) {
-	ts := n.rangeTopologies(r)
+	return n.syncPoint(ctx, []Range{r}, universal)
+}
+
+// syncPoint coordinates one exclusive sync point over ranges: every
+// transaction on any of them with a lower id is one of its dependencies.
+func (n *Node) syncPoint(ctx context.Context, ranges []Range, universal bool) (TxnID, error) {
+	ts := &Topologies{}
+	for _, r := range ranges {
+		ts.Shards = append(ts.Shards, n.rangeTopologies(r).Shards...)
+	}
 	if len(ts.Shards) == 0 {
 		return TxnID{}, errors.New("accord: no topology for the range")
 	}
 	id := n.newTxnID(SyncPoint)
-	txn := &Txn{Kind: SyncPoint, Ranges: []Range{r}}
+	txn := &Txn{Kind: SyncPoint, Ranges: slices.Clone(ranges)}
 	nodes := ts.nodes()
 	ch := broadcast[syncReply](ctx, n, nodes, mSyncPropose, func(NodeID) any { return &syncReq{ID: id, Txn: txn} })
 	tr := newTracker(ts, (*Shard).slowQuorum)
@@ -310,28 +319,61 @@ func (b BootstrapPoints) For(ranges []Range) BootstrapPoints {
 	return out
 }
 
-// BootstrapPoints takes a sync point over each range, applied at every
-// replica if they all answer in time, otherwise (a replica is down, as when
-// replacing or removing it) at a quorum: the transactions some streaming
-// source may lack are then fetched before a node reads them. Ranges'
-// data streamed after their points holds every transaction before them;
-// the nodes receiving it learn so with SendBootstrapped (or Bootstrap for
-// this node).
+// BootstrapPoints takes one sync point over all the ranges, applied at
+// every replica if they all answer in time, otherwise (a replica is down,
+// as when replacing or removing it) at a quorum: the transactions some
+// streaming source may lack are then fetched before a node reads them. The
+// ranges' data streamed after it holds every transaction on them before
+// it; the nodes receiving the data learn so with SendBootstrapped (or
+// Bootstrap for this node). One sync point, not one per range: a
+// transaction on a range with an id between that range's point and a later
+// one's would be covered by neither, though a node-wide point skipped it.
 func (n *Node) BootstrapPoints(ctx context.Context, ranges []Range) (BootstrapPoints, error) {
-	var out BootstrapPoints
+	if len(ranges) == 0 {
+		return nil, nil
+	}
+	// First, the epoch this node learnt the movement in must be
+	// synchronised: until then, a transaction of an earlier epoch (whose
+	// replicas do not include the nodes receiving the ranges) may still
+	// commit with an id above the sync point, which would neither be one of
+	// its dependencies nor reach them. Once it is, replicas refuse those,
+	// and they are coordinated again in an epoch that includes them.
+	n.awaitSynced(ctx, n.epoch())
+	uctx, cancel := context.WithTimeout(ctx, 4*n.cfg.RequestTimeout)
+	id, err := n.syncPoint(uctx, ranges, true)
+	cancel()
+	if err != nil {
+		id, err = n.syncPoint(ctx, ranges, false)
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := make(BootstrapPoints, 0, len(ranges))
 	for _, r := range ranges {
-		uctx, cancel := context.WithTimeout(ctx, 4*n.cfg.RequestTimeout)
-		id, err := n.SyncPoint(uctx, r, true)
-		cancel()
-		if err != nil {
-			id, err = n.SyncPoint(ctx, r, false)
-		}
-		if err != nil {
-			return nil, err
-		}
 		out = append(out, bound{R: r, TS: id.Timestamp})
 	}
 	return out, nil
+}
+
+// awaitSynced waits until epoch is synchronised (every transaction of an
+// earlier epoch on the ranges that changed is done, and the later ones are
+// refused), for at most half of ctx's time: the epoch synchronisation runs
+// on the leader, and the caller goes on without it if it lags.
+func (n *Node) awaitSynced(ctx context.Context, epoch int64) {
+	limit := 10 * n.cfg.RequestTimeout
+	if d, ok := ctx.Deadline(); ok {
+		limit = min(limit, time.Until(d)/2)
+	}
+	deadline := time.Now().Add(limit)
+	for n.synced.Load() < epoch && time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return
+		case <-n.stop:
+			return
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 type bootstrappedReq struct {
