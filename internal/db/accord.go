@@ -84,7 +84,7 @@ type accordUpdate struct {
 	// Timestamp, if set, is the cells' timestamp in "write" mode (a logged
 	// batch's client timestamp, which may be 0) instead of the executeAt's.
 	Timestamp *int64 `json:",omitempty"`
-	Now       int64 // unix nanoseconds
+	Now       int64  // unix nanoseconds
 	NowSec    int64
 	// Page and Paging page a read ("read", "range"): the page size and
 	// the select's paging state.
