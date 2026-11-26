@@ -86,6 +86,9 @@ type DB struct {
 	// counterMu serializes counter updates, which read the node's shard
 	// before writing it (Cassandra's counter locks).
 	counterMu sync.Mutex
+	// counterLocks are the leader's locks on counter cells, striped by
+	// cell (Cassandra's counter lock stripes).
+	counterLocks [1024]sync.Mutex
 	// traces keeps recent traced requests (system_traces).
 	traces traces
 	// prog records the progress of resumable streaming operations.
