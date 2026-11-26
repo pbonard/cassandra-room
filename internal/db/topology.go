@@ -299,9 +299,6 @@ func (p *proxy) unbootstrap() error {
 	}
 	cur := p.ring.Load()
 	future := cluster.NewFutureRing(nodeList(d.schema.Load()))
-	// Accord: the nodes taking over this node's ranges learn, once they
-	// have the data, the sync points it holds every transaction before.
-	handoff := p.accordHandoff(p.gainedAccordRanges(cur, future, func(reps []*cluster.Node) bool { return containsAddr(reps, p.self) }), []string{p.self})
 	for _, t := range d.userTables() {
 		k := d.schema.Load().Keyspaces[t.Keyspace]
 		for _, r := range cur.Ranges() {
@@ -331,7 +328,6 @@ func (p *proxy) unbootstrap() error {
 			}
 		}
 	}
-	handoff()
 	return p.setStatus("MID_LEAVE", cluster.StatusMidLeave)
 }
 
@@ -661,27 +657,6 @@ func (p *proxy) removeRanges(dead *cluster.Node, op string) error {
 	}
 	cur := p.ring.Load()
 	future := cluster.NewFutureRing(nodeList(d.schema.Load()))
-	// Accord, as for a decommission: sync points before the streaming.
-	// The data is streamed from a live replica of each range: they must
-	// all have applied the sync points.
-	var sources []string
-	for _, t := range d.userTables() {
-		k := d.schema.Load().Keyspaces[t.Keyspace]
-		for _, r := range cur.Ranges() {
-			reps := cur.Replicas(k.Replication, r[1])
-			if !slices.ContainsFunc(reps, func(n *cluster.Node) bool { return n.HostID == dead.HostID }) {
-				continue
-			}
-			for _, n := range reps {
-				if n.HostID != dead.HostID && p.up(n) && !slices.Contains(sources, n.Addr) {
-					sources = append(sources, n.Addr)
-				}
-			}
-		}
-	}
-	handoff := p.accordHandoff(p.gainedAccordRanges(cur, future, func(reps []*cluster.Node) bool {
-		return slices.ContainsFunc(reps, func(n *cluster.Node) bool { return n.HostID == dead.HostID })
-	}), sources)
 	for _, t := range d.userTables() {
 		k := d.schema.Load().Keyspaces[t.Keyspace]
 		for _, r := range cur.Ranges() {
@@ -718,7 +693,6 @@ func (p *proxy) removeRanges(dead *cluster.Node, op string) error {
 			}
 		}
 	}
-	handoff()
 	return p.setNodeStatus("MID_REMOVE", dead.HostID, cluster.StatusMidLeave)
 }
 

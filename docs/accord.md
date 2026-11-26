@@ -182,13 +182,17 @@ names, not its class structure.
     replicated all along, it waits for each one. A single node-wide point,
     raised by a later bootstrap, let a transaction on such a range execute,
     and read, before a dependency's writes had applied there.
-  - **Leaving and removed nodes' ranges** (`BootstrapPoints`,
-    `SendBootstrapped`): the node driving a decommission or removenode
-    takes the sync points of the ranges the other nodes take over, after
-    the movement's first barrier and before streaming them their data. Once
-    streamed, it sends each node the points of its ranges. Best effort, as
-    a join's: a node without them fetches the earlier transactions it
-    lacks.
+  - **Sources:** the point is only valid where the data comes from: the
+    live current replicas it may be streamed from must have applied the
+    sync point (when not every replica answers in time, the quorum must
+    include them).
+  - **Leaving and removed nodes' ranges:** the nodes taking over them get
+    no bootstrap point: they wait for (and fetch) every earlier transaction
+    they do not know. `BootstrapPoints` and `SendBootstrapped` let the node
+    driving the movement hand them points, but doing so after streaming
+    lost a transfer's update in about one decommission in ten under the
+    race detector (`TestClusterAccordDecommission`), for a reason not found
+    yet; it is not used.
   - **Persisted:** the bootstrap points are journaled and restored on
     restart.
   - **Streamed data:** it then holds every transaction before the sync
@@ -358,8 +362,8 @@ names, not its class structure.
     records forgotten, late messages refused);
   - bootstrap at a sync point, kept across a restart;
   - per-range bootstrap points: a later bootstrap leaves earlier ranges'
-    points alone, and points sent by another node are kept across a
-    restart;
+    points alone, and points sent by another node (`SendBootstrapped`) are
+    kept across a restart;
   - an unknown earlier dependency skipped on a bootstrapped range and
     waited for on another;
   - shards split by pending replicas (`review_test.go`);
@@ -369,8 +373,7 @@ names, not its class structure.
 - `TestTransactionSchemaPinned` (`internal/db`): a table changed under a
   transaction.
 - `TestClusterAccordDecommission` (`internal/db`): transfers while a node
-  leaves; the nodes taking over its ranges get their bootstrap points,
-  balances are conserved, and the replicas converge.
+  leaves; balances are conserved, and the replicas converge.
 - `TestPrivilegedRestrictions`: the two cassandra-accord `fc4a769`
   restrictions.
 - `internal/db` cluster tests:
