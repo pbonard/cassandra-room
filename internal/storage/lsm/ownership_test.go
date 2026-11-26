@@ -73,7 +73,7 @@ func TestPartitionFiltersAndOldFiles(t *testing.T) {
 	require.NoError(t, err)
 	for p := 2; p <= 5; p++ {
 		put(e, key(p, 1))
-		put(e, key(9, p)) // so the files' key ranges overlap
+		put(e, key(9, p))               // so the files' key ranges overlap
 		require.NoError(t, tbl.Flush()) // new files
 	}
 	for p := 1; p <= 5; p++ {
