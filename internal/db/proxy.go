@@ -101,10 +101,18 @@ type proxy struct {
 	// moving holds the placements of the range movements in progress (nil
 	// when none): writes go to their old and future owners.
 	moving atomic.Pointer[movingRings]
-	self   string
-	stopCh chan struct{}
-	wg     sync.WaitGroup
-	hintMu sync.Mutex
+	// place is ring and moving with their epoch, read together by
+	// coordinators to tag their requests (see fence.go).
+	place atomic.Pointer[placement]
+	// fence refuses requests planned with placements older than this
+	// node's; placeMu guards placeKey, what the placements were made of.
+	fence    fence
+	placeMu  sync.Mutex
+	placeKey string
+	self     string
+	stopCh   chan struct{}
+	wg       sync.WaitGroup
+	hintMu   sync.Mutex
 	// downSince is when each node was last seen going down.
 	downSince sync.Map // addr -> time.Time
 	started   time.Time
@@ -220,6 +228,7 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 		return err
 	}
 	p.cms = cluster.NewCMS(m, metaStore{p})
+	p.cms.SetSynced(p.synced)
 	saved, err := d.readFile(cmsStateFileName)
 	if err != nil {
 		m.Close()
@@ -244,7 +253,16 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	})
 	d.proxy = p
 	d.store = p
-	p.ring.Store(cluster.NewRing(nodeList(d.schema.Load())))
+	{
+		s := d.schema.Load()
+		pl := placementOf(s)
+		p.moving.Store(pl.moving)
+		p.ring.Store(pl.ring)
+		p.place.Store(pl)
+		// Requests planned before this node restarted are refused.
+		p.placeKey = placementKey(s)
+		p.fence.advance(s.Epoch)
+	}
 	m.Start()
 	// A restarted node also contacts the peers it knew: seeds' addresses
 	// may have changed (pods), or be down.
@@ -587,21 +605,24 @@ func (p *proxy) setOwnedRanges(s *Schema) {
 // metadataChanged is called when a new metadata snapshot is installed.
 func (p *proxy) metadataChanged(s *Schema) {
 	replaced := map[string]bool{}
-	movement := false
 	for _, n := range s.Nodes {
 		if (n.Status == cluster.StatusJoining || n.Status == cluster.StatusMidJoin) && n.Replaces != "" {
 			replaced[n.Replaces] = true
 		}
-		movement = movement || cluster.Moving(n.Status)
 	}
 	p.replaced.Store(&replaced)
-	nodes := nodeList(s)
-	if movement {
-		p.moving.Store(&movingRings{old: cluster.NewOldRing(nodes), future: cluster.NewFutureRing(nodes)})
-	} else {
-		p.moving.Store(nil)
+	pl := placementOf(s)
+	p.moving.Store(pl.moving)
+	p.ring.Store(pl.ring)
+	p.place.Store(pl)
+	// Placements changed: requests planned before are refused from now on
+	// (this node's own, planned again with the placements just stored).
+	p.placeMu.Lock()
+	if key := placementKey(s); key != p.placeKey {
+		p.placeKey = key
+		p.fence.advance(s.Epoch)
 	}
-	p.ring.Store(cluster.NewRing(nodes))
+	p.placeMu.Unlock()
 	p.setOwnedRanges(s)
 	p.accordTopology(s)
 	p.g.Update(func(st *cluster.EndpointState) { st.Epoch = s.Epoch })
@@ -668,7 +689,12 @@ func (p *proxy) background() {
 // liveReplicas returns a partition's replicas, this node first, then the
 // live ones, then the down ones; n is the number of live replicas.
 func (p *proxy) replicas(k *Keyspace, token int64, cl primitive.ConsistencyLevel) (reps []*cluster.Node, live int) {
-	all := p.ring.Load().Replicas(k.Replication, token)
+	return p.replicasIn(p.place.Load(), k, token, cl)
+}
+
+// replicasIn is replicas in the placements pl.
+func (p *proxy) replicasIn(pl *placement, k *Keyspace, token int64, cl primitive.ConsistencyLevel) (reps []*cluster.Node, live int) {
+	all := pl.ring.Replicas(k.Replication, token)
 	local := cl == primitive.ConsistencyLevelLocalOne || cl == primitive.ConsistencyLevelLocalQuorum || cl == primitive.ConsistencyLevelLocalSerial
 	var up, down []*cluster.Node
 	for _, r := range all {
@@ -866,6 +892,11 @@ func (p *proxy) handleMutation(ctx context.Context, _ string, payload []byte) ([
 	if f := p.testRefuseMutations.Load(); f != nil && *f {
 		return nil, errors.New("db: refusing mutations (test)")
 	}
+	payload, done, err := p.admit(payload)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
 	ws, err := decodeWrites(payload)
 	if err != nil {
 		return nil, err
@@ -881,6 +912,22 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 	if len(m.writes) == 0 {
 		return nil
 	}
+	for attempt := 0; ; attempt++ {
+		behind, err := p.applyOnce(m, cl, p.place.Load())
+		if err == nil || behind == "" || attempt == fencedRetries {
+			return err
+		}
+		// A replica's placements are newer than the ones the write was
+		// planned with: catch up and plan it again (writes are
+		// idempotent).
+		m.trace.event("%s refused the write as planned with older placements: catching up", behind)
+		p.catchUpFrom(behind)
+	}
+}
+
+// applyOnce writes m with the placements pl; behind is a replica that
+// refused it as planned with older placements.
+func (p *proxy) applyOnce(m *mutation, cl primitive.ConsistencyLevel, pl *placement) (behind string, _ error) {
 	type group struct {
 		need ackNeed
 		acks acks
@@ -894,20 +941,20 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 	for _, w := range m.writes {
 		k := p.keyspaceOf(w.table)
 		if k == nil {
-			return invalidf("a table was dropped while it was written")
+			return "", invalidf("a table was dropped while it was written")
 		}
 		gk := k.Name + "/" + strconv.FormatInt(w.token, 10)
 		g := groups[gk]
 		if g == nil {
 			// Every replica gets the write, in every data center; cl only
 			// decides whose acknowledgements are awaited (need).
-			reps, _ := p.replicas(k, w.token, primitive.ConsistencyLevelAll)
+			reps, _ := p.replicasIn(pl, k, w.token, primitive.ConsistencyLevelAll)
 			// Nodes joining or taking over the range get the write too, and
 			// must acknowledge it on top of the consistency level.
-			pending := p.pendingReplicas(k, w.token, reps)
+			pending := p.pendingIn(pl, k, w.token, reps)
 			g = &group{need: p.need(cl, k, pending), reps: append(reps, pending...)}
 			if live := p.liveAcks(g.reps); !g.need.met(live) && cl != primitive.ConsistencyLevelAny {
-				return &unavailableError{cl: cl, required: g.need.count(), alive: live.total}
+				return "", &unavailableError{cl: cl, required: g.need.count(), alive: live.total}
 			}
 			groups[gk] = g
 			for _, r := range g.reps {
@@ -934,7 +981,7 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 	}
 	acks := make(chan ack, len(perNode))
 	m.trace.event("Writing %d partitions at %s to %d replicas", len(groups), clName(cl), len(perNode))
-	for _, sg := range p.sendGroups(perNode, nodes) {
+	for _, sg := range p.sendGroups(perNode, nodes, pl.epoch) {
 		if len(sg.forward) > 0 {
 			m.trace.event("Sending MUTATION (%d writes) to %s, to forward to %s", len(sg.ws), sg.via, strings.Join(sg.forward, ", "))
 			go func() {
@@ -950,9 +997,13 @@ func (p *proxy) apply(m *mutation, cl primitive.ConsistencyLevel) error {
 		go func() {
 			var err error
 			if sg.via == p.self {
-				err = p.d.applyLocal(sg.ws)
+				var done func()
+				if done, err = p.fence.enter(pl.epoch); err == nil {
+					err = p.d.applyLocal(sg.ws)
+					done()
+				}
 			} else {
-				_, err = p.m.Request(ctx, sg.via, cluster.VerbMutation, encodeWrites(sg.ws))
+				_, err = p.m.Request(ctx, sg.via, cluster.VerbMutation, fenced(pl.epoch, encodeWrites(sg.ws)))
 			}
 			acks <- ack{sg.via, err}
 		}()
@@ -974,6 +1025,13 @@ wait:
 		select {
 		case a := <-acks:
 			delete(pending, a.addr)
+			if isBehind(a.err) {
+				// Not hinted: the write is planned again if it needs this
+				// replica.
+				m.trace.event("MUTATION to %s refused: %v", a.addr, a.err)
+				behind = a.addr
+				continue
+			}
 			if a.err != nil {
 				m.trace.event("MUTATION to %s failed (%v): storing a hint", a.addr, a.err)
 			} else {
@@ -999,7 +1057,7 @@ wait:
 			defer cancel()
 			for i := 0; i < n; i++ {
 				a := <-acks
-				if a.err != nil {
+				if a.err != nil && !isBehind(a.err) {
 					var hs []hint
 					for _, w := range perNode[a.addr] {
 						hs = append(hs, hint{hostID: nodes[a.addr].HostID, w: w})
@@ -1015,7 +1073,7 @@ wait:
 	if !satisfied() {
 		// ANY is met by a hint, if one was in fact stored.
 		if cl == primitive.ConsistencyLevelAny && stored > 0 {
-			return nil
+			return "", nil
 		}
 		minAcks, need := 1<<30, 0
 		for _, g := range groups {
@@ -1023,9 +1081,9 @@ wait:
 				minAcks, need = g.acks.total, g.need.count()
 			}
 		}
-		return &timeoutError{write: true, cl: cl, received: minAcks, blockFor: need, batch: len(groups) > 1}
+		return behind, &timeoutError{write: true, cl: cl, received: minAcks, blockFor: need, batch: len(groups) > 1}
 	}
-	return nil
+	return "", nil
 }
 
 // sendGroup is one message of a write: to via, which forwards it to the
@@ -1042,7 +1100,7 @@ type sendGroup struct {
 // replicas receiving the same writes, sent to a random one of them, which
 // forwards it to the others (sendMessagesToNonlocalDC), so the write
 // crosses to each data center once.
-func (p *proxy) sendGroups(perNode map[string][]write, nodes map[string]*cluster.Node) []sendGroup {
+func (p *proxy) sendGroups(perNode map[string][]write, nodes map[string]*cluster.Node, epoch int64) []sendGroup {
 	var out []sendGroup
 	remote := map[string][]string{} // by data center and writes
 	encs := map[string][]byte{}
@@ -1053,7 +1111,7 @@ func (p *proxy) sendGroups(perNode map[string][]write, nodes map[string]*cluster
 			out = append(out, sendGroup{via: addr, ws: ws})
 			continue
 		}
-		enc := encodeWrites(ws)
+		enc := fenced(epoch, encodeWrites(ws))
 		key := n.DataCenter + "\x00" + string(enc)
 		if remote[key] == nil {
 			keys = append(keys, key)
@@ -1208,7 +1266,9 @@ func (p *proxy) replayHints() {
 		}
 		start := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), p.opts.WriteTimeout)
-		_, err = p.m.Request(ctx, n.Addr, cluster.VerbMutation, payload)
+		// Not fenced: a hint goes to the node it was for, whatever the
+		// placements.
+		_, err = p.m.Request(ctx, n.Addr, cluster.VerbMutation, fenced(0, payload))
 		cancel()
 		if err != nil {
 			if strings.Contains(err.Error(), "was dropped while it was written") {
@@ -1326,6 +1386,11 @@ func decodeParts(b []byte, n int) (lsm.TableID, [][]byte, error) {
 }
 
 func (p *proxy) handleReadRow(ctx context.Context, _ string, payload []byte) ([]byte, error) {
+	payload, done, err := p.admit(payload)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
 	id, parts, err := decodeParts(payload, 1)
 	if err != nil {
 		return nil, err
@@ -1347,8 +1412,8 @@ func (p *proxy) handleReadRow(ctx context.Context, _ string, payload []byte) ([]
 // readTargets returns the live replicas to read token from, this node
 // first (for EACH_QUORUM, a quorum of each data center first), and what
 // the consistency level needs of them.
-func (s *distSource) readTargets(token int64) ([]*cluster.Node, ackNeed, error) {
-	reps, live := s.p.replicas(s.k, token, s.cl)
+func (s *distSource) readTargets(pl *placement, token int64) ([]*cluster.Node, ackNeed, error) {
+	reps, live := s.p.replicasIn(pl, s.k, token, s.cl)
 	reps = reps[:live]
 	need := s.p.need(s.cl, s.k, nil)
 	if a := s.p.liveAcks(reps); !need.met(a) {
@@ -1494,9 +1559,22 @@ func (p *proxy) handleReadDigest(ctx context.Context, from string, payload []byt
 // replica slower than the usual 99th percentile, or failing, gets another
 // replica asked in its place (speculative retry).
 func (s *distSource) get(key []byte) ([]byte, error) {
-	reps, need, err := s.readTargets(tokenOf(key))
+	for attempt := 0; ; attempt++ {
+		v, behind, err := s.getOnce(s.p.place.Load(), key)
+		if err == nil || behind == "" || attempt == fencedRetries {
+			return v, err
+		}
+		s.trace.event("%s refused the read as planned with older placements: catching up", behind)
+		s.p.catchUpFrom(behind)
+	}
+}
+
+// getOnce is get with the placements pl; behind is a replica that refused
+// the read as planned with older ones.
+func (s *distSource) getOnce(pl *placement, key []byte) (_ []byte, behind string, _ error) {
+	reps, need, err := s.readTargets(pl, tokenOf(key))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), s.p.opts.ReadTimeout)
 	defer cancel()
@@ -1509,7 +1587,7 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 		digest []byte
 	}
 	ch := make(chan resp, len(reps))
-	payload := encodeKey(s.id, key)
+	payload := fenced(pl.epoch, encodeKey(s.id, key))
 	lat := s.p.latency(s.id)
 	ask := func(r *cluster.Node, data bool) {
 		start := time.Now()
@@ -1555,6 +1633,9 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 		select {
 		case r := <-ch:
 			outstanding--
+			if isBehind(r.err) {
+				behind = r.node.Addr
+			}
 			if r.err != nil {
 				// Ask another replica in its place (of the same data center
 				// for EACH_QUORUM).
@@ -1569,7 +1650,7 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 					continue
 				}
 				if outstanding == 0 {
-					return nil, timeout()
+					return nil, behind, timeout()
 				}
 				continue
 			}
@@ -1584,7 +1665,7 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 				outstanding++
 			}
 		case <-ctx.Done():
-			return nil, timeout()
+			return nil, behind, timeout()
 		}
 	}
 	var data *resp
@@ -1601,9 +1682,9 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 	}
 	if match {
 		if !data.found {
-			return nil, errNotFound
+			return nil, "", errNotFound
 		}
-		return data.v, nil
+		return data.v, "", nil
 	}
 	// Digest mismatch: full rows from everyone who answered.
 	s.trace.event("Digest mismatch: reading full rows from %d replicas", len(got))
@@ -1622,13 +1703,16 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 			rows = append(rows, r)
 		case r := <-ch:
 			if r.err != nil {
-				return nil, timeout()
+				if isBehind(r.err) {
+					behind = r.node.Addr
+				}
+				return nil, behind, timeout()
 			}
 			if r.data {
 				rows = append(rows, r)
 			}
 		case <-ctx.Done():
-			return nil, timeout()
+			return nil, behind, timeout()
 		}
 	}
 	var merged []byte
@@ -1641,11 +1725,11 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 			continue
 		}
 		if merged, err = row.Merge(nil, merged, r.v); err != nil {
-			return nil, err
+			return nil, behind, err
 		}
 	}
 	if merged == nil {
-		return nil, errNotFound
+		return nil, "", errNotFound
 	}
 	var stale []string
 	for _, r := range rows {
@@ -1658,40 +1742,55 @@ func (s *distSource) get(key []byte) ([]byte, error) {
 		// times out (BlockingReadRepair), so a later read at the same
 		// consistency sees at least as much.
 		s.trace.event("Read repair of %v", stale)
-		if err := s.p.repair(stale, []write{{table: s.id, key: key, value: merged, token: tokenOf(key)}}); err != nil {
+		if a, err := s.p.repair(pl.epoch, stale, []write{{table: s.id, key: key, value: merged, token: tokenOf(key)}}); err != nil {
 			s.trace.event("Read repair failed: %v", err)
-			return nil, timeout()
+			return nil, a, timeout()
 		}
 	}
-	return merged, nil
+	return merged, "", nil
 }
 
 // repair writes merged rows to replicas that were behind (ReadRepair).
-func (p *proxy) repair(addrs []string, ws []write) error {
+// It is fenced with the epoch of the read's placements; behind is a replica
+// that refused it as planned with older ones.
+func (p *proxy) repair(epoch int64, addrs []string, ws []write) (behind string, _ error) {
 	ctx, cancel := context.WithTimeout(context.Background(), p.opts.WriteTimeout)
 	defer cancel()
+	type result struct {
+		addr string
+		err  error
+	}
 	var wg sync.WaitGroup
-	errs := make(chan error, len(addrs))
+	errs := make(chan result, len(addrs))
 	for _, a := range addrs {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			if a == p.self {
-				errs <- p.d.applyLocal(ws)
+				done, err := p.fence.enter(epoch)
+				if err == nil {
+					err = p.d.applyLocal(ws)
+					done()
+				}
+				errs <- result{a, err}
 				return
 			}
-			_, err := p.m.Request(ctx, a, cluster.VerbMutation, encodeWrites(ws))
-			errs <- err
+			_, err := p.m.Request(ctx, a, cluster.VerbMutation, fenced(epoch, encodeWrites(ws)))
+			errs <- result{a, err}
 		}()
 	}
 	wg.Wait()
 	close(errs)
-	for err := range errs {
-		if err != nil {
-			return err
+	var first error
+	for r := range errs {
+		if isBehind(r.err) {
+			behind = r.addr
+		}
+		if r.err != nil && first == nil {
+			first = r.err
 		}
 	}
-	return nil
+	return behind, first
 }
 
 // readRepair reports whether reads of the table repair the replicas they
@@ -1706,6 +1805,11 @@ func (s *distSource) readRepair() bool {
 const rangePage = 512
 
 func (p *proxy) handleReadRange(ctx context.Context, _ string, payload []byte) ([]byte, error) {
+	payload, done, err := p.admit(payload)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
 	id, parts, err := decodeParts(payload, 2)
 	if err != nil {
 		return nil, err
@@ -1745,6 +1849,11 @@ func (p *proxy) handleReadRange(ctx context.Context, _ string, payload []byte) (
 
 // handleReadRangeReverse serves a page of a key range from its end down.
 func (p *proxy) handleReadRangeReverse(ctx context.Context, _ string, payload []byte) ([]byte, error) {
+	payload, done, err := p.admit(payload)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
 	id, parts, err := decodeParts(payload, 2)
 	if err != nil {
 		return nil, err
@@ -1807,12 +1916,7 @@ type revDistIter struct {
 func (it *revDistIter) load(bound []byte) bool {
 	it.buf, it.i, it.below = nil, 0, nil
 	for {
-		reps, need, err := it.s.readTargets(keyToken(it.lo))
-		if err != nil {
-			it.err = err
-			return false
-		}
-		kvs, cutoff, err := it.s.fetch(reps, need, it.lo, bound, true)
+		kvs, cutoff, err := it.s.fetchRetrying(keyToken(it.lo), it.lo, bound, true)
 		if err != nil {
 			it.err = err
 			return false
@@ -1916,23 +2020,36 @@ func (it *distIter) load(from []byte) bool {
 		if from == nil {
 			tok = -1 << 63
 		}
-		endTok, wraps := it.s.p.ring.Load().RangeEnd(tok)
-		var segEnd []byte
-		if !wraps && endTok != 1<<63-1 {
-			segEnd = appendToken(nil, endTok+1)
-		}
-		if it.hi != nil && (segEnd == nil || bytes.Compare(it.hi, segEnd) < 0) {
-			segEnd = it.hi
-		}
-		reps, need, err := it.s.readTargets(tok)
-		if err != nil {
-			it.err = err
-			return false
-		}
-		kvs, cutoff, err := it.fetch(reps, need, from, segEnd)
-		if err != nil {
-			it.err = err
-			return false
+		var kvs []kv
+		var cutoff, segEnd []byte
+		for attempt := 0; ; attempt++ {
+			// The segment's end and replicas, from the same placements.
+			pl := it.s.p.place.Load()
+			endTok, wraps := pl.ring.RangeEnd(tok)
+			segEnd = nil
+			if !wraps && endTok != 1<<63-1 {
+				segEnd = appendToken(nil, endTok+1)
+			}
+			if it.hi != nil && (segEnd == nil || bytes.Compare(it.hi, segEnd) < 0) {
+				segEnd = it.hi
+			}
+			reps, need, err := it.s.readTargets(pl, tok)
+			if err != nil {
+				it.err = err
+				return false
+			}
+			var behind string
+			kvs, cutoff, behind, err = it.s.fetch(pl, reps, need, from, segEnd, false)
+			if err != nil && behind != "" && attempt < fencedRetries {
+				it.s.trace.event("%s refused the read as planned with older placements: catching up", behind)
+				it.s.p.catchUpFrom(behind)
+				continue
+			}
+			if err != nil {
+				it.err = err
+				return false
+			}
+			break
 		}
 		it.start = from
 		if cutoff != nil {
@@ -1952,10 +2069,22 @@ func (it *distIter) load(from []byte) bool {
 	}
 }
 
-// fetch reads [from, to) from need replicas and merges their rows; cutoff
-// is the last complete key when a replica's page was cut.
-func (it *distIter) fetch(reps []*cluster.Node, need ackNeed, from, to []byte) ([]kv, []byte, error) {
-	return it.s.fetch(reps, need, from, to, false)
+// fetchRetrying fetches [from, to) within the range of token, planned
+// again with newer placements when a replica refuses it.
+func (s *distSource) fetchRetrying(token int64, from, to []byte, reverse bool) ([]kv, []byte, error) {
+	for attempt := 0; ; attempt++ {
+		pl := s.p.place.Load()
+		reps, need, err := s.readTargets(pl, token)
+		if err != nil {
+			return nil, nil, err
+		}
+		kvs, cutoff, behind, err := s.fetch(pl, reps, need, from, to, reverse)
+		if err == nil || behind == "" || attempt == fencedRetries {
+			return kvs, cutoff, err
+		}
+		s.trace.event("%s refused the read as planned with older placements: catching up", behind)
+		s.p.catchUpFrom(behind)
+	}
 }
 
 // fetch reads [from, to) from need replicas and merges their rows, in key
@@ -1963,7 +2092,7 @@ func (it *distIter) fetch(reps []*cluster.Node, need ackNeed, from, to []byte) (
 // every replica answers in reverse order, and the merge, cutoff and read
 // repair are mirrored). cutoff is the last complete key when a replica's
 // page was cut (the smallest one, reversed: rows below it may be missing).
-func (s *distSource) fetch(reps []*cluster.Node, need ackNeed, from, to []byte, reverse bool) ([]kv, []byte, error) {
+func (s *distSource) fetch(pl *placement, reps []*cluster.Node, need ackNeed, from, to []byte, reverse bool) (_ []kv, _ []byte, behind string, _ error) {
 	it := &distIter{s: s}
 	p := it.s.p
 	verb := cluster.VerbReadRange
@@ -1980,7 +2109,7 @@ func (s *distSource) fetch(reps []*cluster.Node, need ackNeed, from, to []byte, 
 	}
 	ch := make(chan resp, len(reps))
 	ask := func(r *cluster.Node) {
-		b, err := p.m.Request(ctx, r.Addr, verb, encodeKey(it.s.id, from, to))
+		b, err := p.m.Request(ctx, r.Addr, verb, fenced(pl.epoch, encodeKey(it.s.id, from, to)))
 		if err != nil {
 			ch <- resp{node: r, err: err}
 			return
@@ -2007,6 +2136,9 @@ func (s *distSource) fetch(reps []*cluster.Node, need ackNeed, from, to []byte, 
 		select {
 		case r := <-ch:
 			outstanding--
+			if isBehind(r.err) {
+				behind = r.node.Addr
+			}
 			if r.err != nil {
 				// Another replica in its place, of the same data center
 				// for EACH_QUORUM.
@@ -2019,14 +2151,14 @@ func (s *distSource) fetch(reps []*cluster.Node, need ackNeed, from, to []byte, 
 					}
 				}
 				if outstanding == 0 {
-					return nil, nil, timeout()
+					return nil, nil, behind, timeout()
 				}
 				continue
 			}
 			got = append(got, r)
 			answered.add(r.node)
 		case <-ctx.Done():
-			return nil, nil, timeout()
+			return nil, nil, behind, timeout()
 		}
 	}
 	// Rows past the first truncated page are not complete everywhere.
@@ -2048,7 +2180,7 @@ func (s *distSource) fetch(reps []*cluster.Node, need ackNeed, from, to []byte, 
 			if cur, ok := merged[string(e.k)]; ok {
 				m, err := row.Merge(nil, cur, e.v)
 				if err != nil {
-					return nil, nil, err
+					return nil, nil, behind, err
 				}
 				merged[string(e.k)] = m
 			} else {
@@ -2076,14 +2208,14 @@ func (s *distSource) fetch(reps []*cluster.Node, need ackNeed, from, to []byte, 
 				}
 			}
 			if len(ws) > 0 {
-				if err := p.repair([]string{r.node.Addr}, ws); err != nil {
+				if a, err := p.repair(pl.epoch, []string{r.node.Addr}, ws); err != nil {
 					it.s.trace.event("Read repair of %s failed: %v", r.node.Addr, err)
-					return nil, nil, timeout()
+					return nil, nil, a, timeout()
 				}
 			}
 		}
 	}
-	return out, cutoff, nil
+	return out, cutoff, "", nil
 }
 
 func (it *distIter) First() bool {
@@ -2160,8 +2292,8 @@ func (m *modification) isCounter() bool {
 
 // counterLeader is the node that applies a partition's counter updates:
 // its first live replica (StorageProxy.findSuitableReplica).
-func (p *proxy) counterLeader(k *Keyspace, token int64) (*cluster.Node, error) {
-	reps, live := p.replicas(k, token, primitive.ConsistencyLevelAll)
+func (p *proxy) counterLeader(pl *placement, k *Keyspace, token int64) (*cluster.Node, error) {
+	reps, live := p.replicasIn(pl, k, token, primitive.ConsistencyLevelAll)
 	if live == 0 {
 		return nil, &unavailableError{cl: primitive.ConsistencyLevelOne, required: 1, alive: 0}
 	}
@@ -2176,29 +2308,63 @@ func (p *proxy) counterLeader(k *Keyspace, token int64) (*cluster.Node, error) {
 // applyCounters sends counter deltas to each partition's leader, which
 // turns them into its shard and replicates them.
 func (p *proxy) applyCounters(m *mutation, cl primitive.ConsistencyLevel) error {
+	ws := m.writes
+	var first error
+	for attempt := 0; ; attempt++ {
+		refused, behind, err := p.applyCountersOnce(ws, cl, p.place.Load())
+		if first == nil {
+			first = err
+		}
+		if len(refused) == 0 {
+			return first
+		}
+		if attempt == fencedRetries {
+			return &timeoutError{write: true, cl: cl, blockFor: 1}
+		}
+		// A leader refused its deltas, before applying them, as planned
+		// with older placements: send them again with newer ones (only
+		// those: counter deltas are not idempotent).
+		m.trace.event("%s refused counter deltas as planned with older placements: catching up", behind)
+		p.catchUpFrom(behind)
+		ws = refused
+	}
+}
+
+// applyCountersOnce sends ws to their leaders in the placements pl;
+// refused are the deltas a leader refused as planned with older ones (err
+// is about the others).
+func (p *proxy) applyCountersOnce(writes []write, cl primitive.ConsistencyLevel, pl *placement) (refused []write, behind string, _ error) {
 	byLeader := map[string][]write{}
-	for _, w := range m.writes {
+	for _, w := range writes {
 		k := p.keyspaceOf(w.table)
 		if k == nil {
-			return invalidf("a table was dropped while it was written")
+			return nil, "", invalidf("a table was dropped while it was written")
 		}
-		l, err := p.counterLeader(k, w.token)
+		l, err := p.counterLeader(pl, k, w.token)
 		if err != nil {
-			return err
+			return nil, "", err
 		}
 		byLeader[l.Addr] = append(byLeader[l.Addr], w)
 	}
-	errs := make(chan error, len(byLeader))
+	type result struct {
+		addr string
+		err  error
+	}
+	errs := make(chan result, len(byLeader))
 	for addr, ws := range byLeader {
 		go func() {
 			if addr == p.self {
-				errs <- p.d.applyCounterDeltas(ws, cl)
+				errs <- result{addr, p.d.applyCounterDeltas(ws, cl)}
 				return
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), p.opts.WriteTimeout*2)
 			defer cancel()
-			b, _ := json.Marshal(counterRequest{CL: uint16(cl), Writes: encodeWrites(ws)})
+			b, _ := json.Marshal(counterRequest{CL: uint16(cl), Writes: encodeWrites(ws), Epoch: pl.epoch})
 			resp, err := p.m.Request(ctx, addr, cluster.VerbCounterMutation, b)
+			if isBehind(err) {
+				errs <- result{addr, err}
+				return
+			}
 			if err == nil && len(resp) > 0 {
 				m, derr := decodeMessage(resp)
 				if derr == nil {
@@ -2214,21 +2380,29 @@ func (p *proxy) applyCounters(m *mutation, cl primitive.ConsistencyLevel) error 
 			} else if err != nil {
 				err = &timeoutError{write: true, cl: cl, blockFor: 1}
 			}
-			errs <- err
+			errs <- result{addr, err}
 		}()
 	}
 	var first error
 	for range byLeader {
-		if err := <-errs; err != nil && first == nil {
-			first = err
+		r := <-errs
+		if isBehind(r.err) {
+			refused = append(refused, byLeader[r.addr]...)
+			behind = r.addr
+			continue
+		}
+		if r.err != nil && first == nil {
+			first = r.err
 		}
 	}
-	return first
+	return refused, behind, first
 }
 
 type counterRequest struct {
 	CL     uint16
 	Writes []byte
+	// Epoch is that of the placements the leader was chosen with.
+	Epoch int64
 }
 
 func (p *proxy) handleCounterMutation(ctx context.Context, _ string, payload []byte) ([]byte, error) {
@@ -2236,6 +2410,11 @@ func (p *proxy) handleCounterMutation(ctx context.Context, _ string, payload []b
 	if err := json.Unmarshal(payload, &r); err != nil {
 		return nil, err
 	}
+	done, err := p.fence.enter(r.Epoch)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
 	ws, err := decodeWrites(r.Writes)
 	if err != nil {
 		return nil, err

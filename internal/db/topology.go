@@ -8,7 +8,6 @@ import (
 	"math"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/datastax/go-cassandra-native-protocol/message"
@@ -153,7 +152,12 @@ type movingRings struct{ old, future *cluster.Ring }
 // owners and the future ones together (see cluster's placements), so a
 // read at any step of the movement meets a write at any neighbouring one.
 func (p *proxy) pendingReplicas(k *Keyspace, token int64, current []*cluster.Node) []*cluster.Node {
-	m := p.moving.Load()
+	return p.pendingIn(p.place.Load(), k, token, current)
+}
+
+// pendingIn is pendingReplicas in the placements pl.
+func (p *proxy) pendingIn(pl *placement, k *Keyspace, token int64, current []*cluster.Node) []*cluster.Node {
+	m := pl.moving
 	if m == nil {
 		return nil
 	}
@@ -755,53 +759,102 @@ func (p *proxy) startMovement(kind, hostID, status string) error {
 	return err
 }
 
-// progressBarrier waits until every live node knows the metadata up to
-// this node's epoch, then until the requests coordinated with the
-// placements before it are over (TCM's progress barrier, which waits for
-// the epoch at the nodes of the ranges moved). A step of a range movement
-// begins only after the barrier of the step before it: the placements of
-// any two requests are then at most one step apart, and each step's read
+// progressBarrier waits until the step just committed is known where it
+// matters (TCM's ProgressBarrier): for every range whose owners change,
+// enough of its old owners and of its new ones, in each data center, have
+// reached this epoch, and finished the requests they admitted before it,
+// that any quorum of them includes one. Those refuse requests planned
+// with older placements (see fence.go), so a request planned before the
+// step reaches no quorum, however late it arrives; a coordinator planning
+// it again does so with this step's placements. So the placements of the
+// requests that succeed are at most one step apart, and each step's read
 // and write placements intersect at a quorum with its neighbours'.
+//
+// A node that does not answer is waited for, unless enough others did: a
+// node cut off or paused, not only a crashed one, may come back.
 func (p *proxy) progressBarrier() error {
 	s := p.d.schema.Load()
 	epoch := s.Epoch
-	var waiting []string
+	groups := barrierGroups(s)
+	if len(groups) == 0 {
+		return nil
+	}
+	byID := map[string]*cluster.Node{}
 	for _, n := range s.Nodes {
-		if n.Addr != p.self && n.Status != cluster.StatusLeft && !slices.Contains(waiting, n.Addr) {
-			waiting = append(waiting, n.Addr)
+		byID[n.HostID] = n
+	}
+	replaced := map[string]bool{}
+	for _, n := range s.Nodes {
+		if n.Replaces != "" {
+			replaced[n.Replaces] = true // dead: its address may be its replacement's
 		}
 	}
-	deadline := time.Now().Add(time.Minute)
-	for len(waiting) > 0 {
-		var behind []string
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-		for _, addr := range waiting {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				e, err := p.cms.Sync(ctx, addr)
-				cancel()
-				// A node that is down (and does not answer) catches up
-				// with the log before it serves again. A new node's view
-				// of who is up may lag: a node that answers is waited for.
-				if err != nil && !p.g.IsAlive(addr) || err == nil && e >= epoch {
-					return
+	acked := map[string]bool{} // by host id
+	met := func() bool {
+		for _, g := range groups {
+			n := 0
+			for _, id := range g.hosts {
+				if acked[id] {
+					n++
 				}
-				mu.Lock()
-				behind = append(behind, addr)
-				mu.Unlock()
-			}()
+			}
+			if n < g.need {
+				return false
+			}
 		}
-		wg.Wait()
-		waiting = behind
-		if len(waiting) == 0 {
-			break
+		return true
+	}
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		// Ask every host of a group not met yet.
+		type answer struct {
+			id    string
+			epoch int64
+			err   error
+		}
+		asking := map[string]bool{}
+		ch := make(chan answer, len(byID))
+		for _, g := range groups {
+			for _, id := range g.hosts {
+				n := byID[id]
+				if acked[id] || asking[id] || n == nil || replaced[id] {
+					continue
+				}
+				asking[id] = true
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					e, err := p.cms.Sync(ctx, n.Addr)
+					ch <- answer{id, e, err}
+				}()
+			}
+		}
+		for range len(asking) {
+			var a answer
+			select {
+			case a = <-ch:
+			case <-p.stopCh:
+				return errors.New("db: stopped")
+			}
+			if a.err == nil && a.epoch >= epoch {
+				acked[a.id] = true
+				if met() {
+					return nil
+				}
+			}
+		}
+		if met() {
+			return nil
 		}
 		if time.Now().After(deadline) {
-			slices.Sort(waiting)
-			return fmt.Errorf("db: nodes have not reached metadata epoch %d: %s", epoch, strings.Join(waiting, ", "))
+			var missing []string
+			for id, n := range byID {
+				if !acked[id] && !replaced[id] && n.Status != cluster.StatusLeft {
+					missing = append(missing, n.Addr)
+				}
+			}
+			slices.Sort(missing)
+			return fmt.Errorf("db: too few replicas of the moving ranges reached metadata epoch %d (not: %s)", epoch, strings.Join(missing, ", "))
 		}
 		select {
 		case <-time.After(200 * time.Millisecond):
@@ -809,12 +862,80 @@ func (p *proxy) progressBarrier() error {
 			return errors.New("db: stopped")
 		}
 	}
-	// Requests begun with the placements before the epoch time out by
-	// then.
-	select {
-	case <-time.After(max(p.opts.ReadTimeout, p.opts.WriteTimeout)):
-	case <-p.stopCh:
-		return errors.New("db: stopped")
+}
+
+// barrierGroup is a set of a range's replicas (old or new owners, in a
+// data center under NetworkTopologyStrategy) and how many of them must
+// acknowledge a progress barrier: one more than may be left out of a
+// quorum of them.
+type barrierGroup struct {
+	hosts []string
+	need  int
+}
+
+// barrierGroups lists the groups of the ranges whose owners change.
+func barrierGroups(s *Schema) []barrierGroup {
+	nodes := nodeList(s)
+	old, future := cluster.NewOldRing(nodes), cluster.NewFutureRing(nodes)
+	var toks []int64
+	for _, r := range []*cluster.Ring{old, future} {
+		for _, rg := range r.Ranges() {
+			toks = append(toks, rg[1])
+		}
 	}
-	return nil
+	slices.Sort(toks)
+	toks = slices.Compact(toks)
+	seen := map[string]bool{}
+	var out []barrierGroup
+	for _, k := range s.Keyspaces {
+		if k.virtual || len(k.Replication) == 0 {
+			continue
+		}
+		total, perDC := cluster.ReplicationFactor(k.Replication)
+		for _, tok := range toks {
+			o, f := old.Replicas(k.Replication, tok), future.Replicas(k.Replication, tok)
+			if sameHosts(o, f) {
+				continue
+			}
+			for _, set := range [][]*cluster.Node{o, f} {
+				byDC := map[string][]string{}
+				for _, n := range set {
+					dc := ""
+					if len(perDC) > 0 {
+						dc = n.DataCenter
+					}
+					byDC[dc] = append(byDC[dc], n.HostID)
+				}
+				for dc, hosts := range byDC {
+					rf := total
+					if len(perDC) > 0 {
+						rf = perDC[dc]
+					}
+					need := len(hosts) - (rf/2 + 1) + 1
+					if need <= 0 {
+						continue // too few for a quorum: no quorum request succeeds
+					}
+					slices.Sort(hosts)
+					key := fmt.Sprint(hosts, need)
+					if !seen[key] {
+						seen[key] = true
+						out = append(out, barrierGroup{hosts: hosts, need: need})
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+func sameHosts(a, b []*cluster.Node) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for _, n := range a {
+		if !slices.ContainsFunc(b, func(m *cluster.Node) bool { return m.HostID == n.HostID }) {
+			return false
+		}
+	}
+	return true
 }

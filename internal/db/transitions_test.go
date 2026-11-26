@@ -51,7 +51,9 @@ func TestClusterTransitionSteps(t *testing.T) {
 	})
 	require.NoError(t, err)
 	c.nodes[n] = d
-	require.Equal(t, []string{cluster.StatusJoining, cluster.StatusJoining}, during, "the barrier waits for every node to know the join")
+	// RF 2: of the two old owners of each moving range, any quorum
+	// includes one that knows the join before streaming starts.
+	require.Contains(t, during, cluster.StatusJoining, "the barrier waits for the old owners to know the join")
 	require.ErrorIs(t, refused, errRangeMovement)
 	require.Equal(t, cluster.StatusNormal, c.nodes[1].schema.Load().Nodes[c.nodes[1].local.HostID].Status)
 	require.Equal(t, []string{"REGISTER", "MID_JOIN", "FINISH_JOIN"}, logKinds(c.nodes[0], d.local.HostID))
