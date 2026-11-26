@@ -7,17 +7,19 @@ import (
 	"io"
 	"math"
 	"slices"
+	"sync/atomic"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/colblk"
 	"github.com/cockroachdb/pebble/sstable/tablefilters/bloom"
 	"github.com/cockroachdb/pebble/vfs"
 )
 
 func makeWriterOptions(o *Options) sstable.WriterOptions {
-	return sstable.WriterOptions{
+	w := sstable.WriterOptions{
 		TableFormat:  tableFormat,
 		BlockSize:    o.BlockSize,
 		FilterPolicy: bloom.FilterPolicy(o.BloomBitsPerKey),
@@ -25,12 +27,79 @@ func makeWriterOptions(o *Options) sstable.WriterOptions {
 		// them the reader needs no value-block provider.
 		DisableValueBlocks: true,
 	}
+	if o.PartitionPrefix != nil {
+		// Bloom filters of partitions, not keys: the filter holds each
+		// key's partition prefix, so a read of one partition of a table
+		// with clustering columns (a range of keys) can skip sstables
+		// without it. Files written so carry this comparer's name.
+		partitionPrefix.Store(&o.PartitionPrefix)
+		w.Comparer, w.KeySchema = &partitionComparer, &partitionKeySchema
+	}
+	return w
 }
 
 func makeReaderOptions() sstable.ReaderOptions {
 	var o sstable.ReaderOptions
 	o.FilterDecoders = append(o.FilterDecoders, bloom.Decoder)
+	// Files of either comparer (those before partition filters).
+	o.Comparers = sstable.Comparers{partitionComparer.Name: &partitionComparer}
+	o.KeySchemas = sstable.MakeKeySchemas(&defaultKeySchema, &partitionKeySchema)
 	return o
+}
+
+// partitionPrefix is the length of a key's partition prefix (set from
+// Options.PartitionPrefix; the whole key if unset).
+var partitionPrefix atomic.Pointer[func([]byte) int]
+
+func splitPartition(k []byte) int {
+	if f := partitionPrefix.Load(); f != nil {
+		if n := (*f)(k); n > 0 && n <= len(k) {
+			return n
+		}
+	}
+	return len(k)
+}
+
+// partitionComparer orders keys bytewise, as the default comparer does,
+// but splits them at the partition prefix (the filter's keys).
+var partitionComparer = func() pebble.Comparer {
+	c := *pebble.DefaultComparer
+	c.Name = "cassandra-room.partition-prefix.v1"
+	c.Split = splitPartition
+	return c
+}()
+
+var (
+	defaultKeySchema   = colblk.DefaultKeySchema(pebble.DefaultComparer, 16)
+	partitionKeySchema = colblk.DefaultKeySchema(&partitionComparer, 16)
+)
+
+// filterPrefix is the prefix of key a table's Bloom filter holds.
+func (t *tableReader) filterPrefix(key []byte) []byte {
+	return key[:t.r.Comparer.Split(key)]
+}
+
+// mayHavePartition reports whether the table may hold keys of the
+// partition prefix p in [lower, upper), by its Bloom filter (always true
+// for tables whose filter holds whole keys).
+func (t *tableReader) mayHavePartition(p, lower []byte) (bool, error) {
+	if t.r.Comparer.Name != partitionComparer.Name {
+		return true, nil
+	}
+	it, err := t.r.NewPointIter(context.Background(), sstable.IterOptions{
+		FilterBlockSizeLimit: sstable.AlwaysUseFilterBlock,
+		Env:                  sstable.NoReadEnv,
+		ReaderProvider:       sstable.MakeTrivialReaderProvider(t.r),
+	})
+	if err != nil {
+		return false, err
+	}
+	kv := it.SeekPrefixGE(p, lower, 0)
+	err = it.Error()
+	if cerr := it.Close(); err == nil {
+		err = cerr
+	}
+	return kv != nil, err
 }
 
 // setFileNum stores num into a field of Pebble's DiskFileNum type, which the
@@ -423,7 +492,7 @@ func (t *tableReader) getMerged(merger Merger, key, acc []byte) (_ []byte, found
 	if err != nil {
 		return nil, false, err
 	}
-	if kv := it.SeekPrefixGE(key, key, 0); kv != nil && bytes.Equal(kv.K.UserKey, key) {
+	if kv := it.SeekPrefixGE(t.filterPrefix(key), key, 0); kv != nil && bytes.Equal(kv.K.UserKey, key) {
 		v, _, verr := kv.Value(nil)
 		if verr == nil {
 			acc, verr = mergeInto(merger, acc, v)

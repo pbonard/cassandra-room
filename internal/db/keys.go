@@ -247,6 +247,36 @@ func parsePartition(key []byte) (tok int64, pk, rest []byte, err error) {
 	return 0, nil, nil, errBadKey
 }
 
+// partitionPrefixLen returns the length of a key's partition prefix (token
+// and escaped partition key), as parsePartition finds it, without
+// allocating: the storage engine's Bloom filters hold partitions. Keys
+// that are not of a partition return their whole length.
+func partitionPrefixLen(key []byte) int {
+	if len(key) < 9 {
+		return len(key)
+	}
+	b := key[8:]
+	for i := 0; i < len(b); {
+		c := b[i]
+		i++
+		if c != 0 {
+			continue
+		}
+		for {
+			if i < len(b) && b[i] == 0xFE {
+				i++
+				continue
+			}
+			if i < len(b) && b[i] == 0xFF {
+				i++
+				break
+			}
+			return 8 + i
+		}
+	}
+	return len(key)
+}
+
 // clusteringKey appends the clustering components of a row and the
 // terminator.
 func appendClustering(dst []byte, t *Table, vals [][]byte) ([]byte, error) {

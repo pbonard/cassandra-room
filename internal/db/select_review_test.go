@@ -3,6 +3,7 @@ package db
 import (
 	"bytes"
 	"math/rand"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -128,4 +129,43 @@ func TestDeletedAtFlattened(t *testing.T) {
 			require.Equal(t, want, d.deletedAt(k), "%x", k)
 		}
 	}
+}
+
+// TestPartitionPrefixLen agrees with parsePartition.
+func TestPartitionPrefixLen(t *testing.T) {
+	for _, pk := range [][]byte{{}, {1}, {0}, {0, 0}, {0, 1, 0}, {5, 0, 0, 0, 7}, {0xff, 0}} {
+		p := partitionPrefix(pk)
+		for _, rest := range [][]byte{nil, {0x10}, {0x38}, {0x18, 1, 2}, {0x40, 0, 0x41}} {
+			k := append(slices.Clone(p), rest...)
+			_, _, r, err := parsePartition(k)
+			require.NoError(t, err)
+			require.Equal(t, len(k)-len(r), partitionPrefixLen(k), "%x", k)
+			require.Equal(t, len(p), partitionPrefixLen(k))
+		}
+	}
+	require.Equal(t, 3, partitionPrefixLen([]byte{1, 2, 3}))
+}
+
+// TestPartitionBloomFilters: reads of one partition of a clustered table
+// (a range of keys) skip the sstables whose filter lacks the partition,
+// and still return exactly its rows.
+func TestPartitionBloomFilters(t *testing.T) {
+	s := openTest(t, nil)
+	s.ok("CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+	s.ok("CREATE TABLE ks.t (p int, c int, v int, PRIMARY KEY (p, c)) WITH compaction = {'class': 'UnifiedCompactionStrategy', 'min_sstable_size': '1MiB'}")
+	for f := 0; f < 6; f++ { // six sstables, each of its own partitions
+		for p := f * 10; p < f*10+10; p++ {
+			for c := 0; c < 3; c++ {
+				s.ok("INSERT INTO ks.t (p, c, v) VALUES (?, ?, ?)", p, c, p*10+c)
+			}
+		}
+		require.NoError(t, s.d.engine.Flush())
+	}
+	before := s.d.engine.Metrics().BloomSkips
+	for p := 0; p < 60; p += 7 {
+		rows := s.rows("SELECT c FROM ks.t WHERE p = ?", p)
+		require.Equal(t, []string{"0", "1", "2"}, rows, "partition %d", p)
+	}
+	require.Empty(t, s.rows("SELECT c FROM ks.t WHERE p = 1000"))
+	require.Positive(t, s.d.engine.Metrics().BloomSkips-before, "sstables skipped by their partition filter")
 }
