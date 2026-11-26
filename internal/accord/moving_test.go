@@ -241,3 +241,158 @@ func TestMergeMax(t *testing.T) {
 	require.False(t, m.Less(b))
 	require.Equal(t, m, mergeMax(b, a))
 }
+
+// TestUniqueHLC: when an earlier transaction (by timestamp: an older epoch
+// whose slow path chose a higher HLC after the newer transaction took the
+// fast path, or the same HLC on an earlier node) applied at HLC >=
+// ExecuteAt.HLC, the later transaction executes and persists with a
+// UniqueHLC strictly above it so its cells win in storage without changing
+// the SSTable format.
+func TestUniqueHLC(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		early, later Timestamp
+	}{
+		{
+			name:  "across_epochs",
+			early: Timestamp{Epoch: 1, HLC: 5_000_000, Node: "n2"},
+			later: Timestamp{Epoch: 2, HLC: 2_000_000, Node: "n1"},
+		},
+		{
+			name:  "same_hlc_tie",
+			early: Timestamp{Epoch: 1, HLC: 5_000_000, Node: "n0"},
+			later: Timestamp{Epoch: 1, HLC: 5_000_000, Node: "n1"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newSimCluster(t, 3, 3, 1)
+			k := c.keys[0]
+			for i := 0; i < 3; i++ {
+				c.node(i).SetTopology(&Topology{Epoch: 2, Replicas: c.replicas, Nodes: c.ids})
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			t0 := TxnID{Timestamp: Timestamp{Epoch: 1, HLC: 1_000_000, Node: "n0"}, Kind: Write}
+			txn0 := appendTxn(t, k, 10)
+			_, err := c.node(0).execute(ctx, Ballot{}, t0, txn0, tc.early, Deps{})
+			require.NoError(t, err)
+
+			t1 := TxnID{Timestamp: tc.later, Kind: Write}
+			txn1 := appendTxn(t, k, 20)
+			raw, err := c.node(1).execute(ctx, Ballot{}, t1, txn1, tc.later, Deps{keyString(k): {t0}})
+			require.NoError(t, err)
+			var res listResult
+			require.NoError(t, json.Unmarshal(raw, &res))
+			require.Equal(t, []int{10}, res.Reads[keyString(k)])
+			require.Greater(t, res.ExecuteAt.HLC, tc.early.HLC, "UniqueHLC exceeds earlier write HLC")
+
+			c.settle()
+			for _, r := range c.replicas(k) {
+				got := c.stores[r].data[keyString(k)]
+				require.Len(t, got, 2)
+				require.Equal(t, 10, got[0].Value)
+				require.Equal(t, 20, got[1].Value)
+				require.Greater(t, got[1].At.HLC, got[0].At.HLC)
+			}
+			st := c.node(0).s.checkStatus(t1, []Key{k})
+			require.Equal(t, res.ExecuteAt.HLC, st.UniqueHLC)
+		})
+	}
+}
+
+// TestProposeKeepsDeps: propose on the slow path preserves the dependencies
+// passed into it (from PreAccept or recovery's LatestDeps), even when the
+// replicas answering the Accept quorum did not witness a dependency locally.
+func TestProposeKeepsDeps(t *testing.T) {
+	c := newSimCluster(t, 3, 3, 1)
+	k := c.keys[0]
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Seed dep only on n2, then cut n2 off so the Accept quorum {n0, n1}
+	// has never seen dep locally.
+	dep := TxnID{Timestamp: Timestamp{Epoch: 1, HLC: 100, Node: "n2"}, Kind: Write}
+	depTxn := appendTxn(t, k, 1)
+	_, err := c.node(2).s.apply(ctx, &applyReq{ID: dep, ExecuteAt: dep.Timestamp, Deps: Deps{}, Txn: depTxn, Writes: Writes{keyString(k): []byte("1")}})
+	require.NoError(t, err)
+	c.net.mu.Lock()
+	c.net.down["n2"] = true
+	c.net.mu.Unlock()
+
+	// Also apply dep on n0 and n1 only after propose's Accept round? Even
+	// simpler: invalidated on n0/n1 after Commit, or apply dep on n0/n1
+	// once propose commits so execute unblocks, verifying Commit recorded
+	// dep in c.Deps!
+	id := TxnID{Timestamp: Timestamp{Epoch: 1, HLC: 200, Node: "n0"}, Kind: Write}
+	txn := appendTxn(t, k, 2)
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.node(0).propose(ctx, Ballot{}, id, txn, Timestamp{Epoch: 1, HLC: 300, Node: "n0"}, Deps{keyString(k): {dep}}, false)
+		done <- err
+	}()
+	// Wait until n0 committed id: if propose preserved dep, execution on n0
+	// blocks on dep (which n0 has not seen yet).
+	require.Eventually(t, func() bool {
+		c.node(0).s.mu.Lock()
+		defer c.node(0).s.mu.Unlock()
+		cmd := c.node(0).s.cmds[id]
+		return cmd != nil && cmd.Status >= Committed && cmd.Deps.contains(keyString(k), dep)
+	}, 2*time.Second, 10*time.Millisecond, "committed Deps kept input dependency")
+
+	// Unblock execution by applying dep on n0 and n1.
+	for _, i := range []int{0, 1} {
+		_, err := c.node(i).s.apply(ctx, &applyReq{ID: dep, ExecuteAt: dep.Timestamp, Deps: Deps{}, Txn: depTxn, Writes: Writes{keyString(k): []byte("1")}})
+		require.NoError(t, err)
+	}
+	require.NoError(t, <-done)
+}
+
+// TestDurabilityWaitsForPending: a universal sync point (and durability's
+// redundancy bound) waits for pending replicas too, so a pending replica
+// never adopts a redundancy bound while still missing a transaction below
+// it, and receives the bound once caught up.
+func TestDurabilityWaitsForPending(t *testing.T) {
+	c := newSimCluster(t, 3, 2, 1)
+	k := c.keys[0] // read replicas: n0, n1; n2 will be pending
+	whole := Range{Lo: math.MinInt64, Hi: math.MaxInt64}
+	topo := &Topology{
+		Epoch:    2,
+		Replicas: c.replicas,
+		Nodes:    c.ids,
+		Pending:  func(Key) []NodeID { return []NodeID{"n2"} },
+		RangeReplicas: func(r Range) []RangeShard {
+			return []RangeShard{{Range: r, Nodes: []NodeID{"n0", "n1"}, Pending: []NodeID{"n2"}}}
+		},
+	}
+	for i := 0; i < 3; i++ {
+		c.node(i).SetTopology(topo)
+		c.node(i).cfg.DurabilityRanges = func() []Range { return []Range{whole} }
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := c.node(0).Coordinate(ctx, appendTxn(t, k, 1))
+	require.NoError(t, err)
+	c.settle()
+
+	// While pending n2 is unreachable, a universal sync point must fail
+	// rather than succeed off the read replicas {n0, n1} alone.
+	c.net.mu.Lock()
+	c.net.down["n2"] = true
+	c.net.mu.Unlock()
+	uctx, ucancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	_, err = c.node(0).SyncPoint(uctx, whole, true)
+	ucancel()
+	require.Error(t, err)
+
+	// Once pending n2 is reachable again, durability advances Redundant on
+	// n0, n1, and pending n2.
+	c.net.mu.Lock()
+	delete(c.net.down, "n2")
+	c.net.mu.Unlock()
+	c.node(0).durability()
+	require.Equal(t, int64(1), c.node(0).Stats().DurabilityRounds)
+	for i := 0; i < 3; i++ {
+		require.Equal(t, 1, c.node(i).Stats().Redundant, "node n%d learnt the redundancy bound", i)
+	}
+}

@@ -171,7 +171,9 @@ func (n *Node) rangeTopologies(r Range) *Topologies {
 		for _, rs := range t.RangeReplicas(r) {
 			nodes := slices.Clone(rs.Nodes)
 			slices.Sort(nodes)
-			ts.Shards = append(ts.Shards, &Shard{Epoch: e, Nodes: slices.Compact(nodes)})
+			pending := slices.Clone(rs.Pending)
+			slices.Sort(pending)
+			ts.Shards = append(ts.Shards, &Shard{Epoch: e, Nodes: slices.Compact(nodes), Pending: slices.Compact(pending)})
 		}
 	}
 	return ts
@@ -181,21 +183,22 @@ func (n *Node) rangeTopologies(r Range) *Topologies {
 // its id once it applied at a quorum of every shard (at every replica if
 // universal).
 func (n *Node) SyncPoint(ctx context.Context, r Range, universal bool) (TxnID, error) {
-	id, _, err := n.syncPoint(ctx, []Range{r}, universal)
+	id, _, _, err := n.syncPoint(ctx, []Range{r}, universal)
 	return id, err
 }
 
 // syncPoint coordinates one exclusive sync point over ranges: every
 // transaction on any of them with a lower id is one of its dependencies.
-// It returns once it applied at a quorum of every shard (or every replica
-// if universal), with the nodes it applied at by then.
-func (n *Node) syncPoint(ctx context.Context, ranges []Range, universal bool) (TxnID, []NodeID, error) {
+// It returns once it applied at a quorum of every shard (or every replica,
+// pending ones included, if universal), with the nodes it applied at by
+// then and the largest HLC applied on their ranges.
+func (n *Node) syncPoint(ctx context.Context, ranges []Range, universal bool) (TxnID, []NodeID, int64, error) {
 	ts := &Topologies{}
 	for _, r := range ranges {
 		ts.Shards = append(ts.Shards, n.rangeTopologies(r).Shards...)
 	}
 	if len(ts.Shards) == 0 {
-		return TxnID{}, nil, errors.New("accord: no topology for the range")
+		return TxnID{}, nil, 0, errors.New("accord: no topology for the range")
 	}
 	id := n.newTxnID(SyncPoint)
 	txn := &Txn{Kind: SyncPoint, Ranges: slices.Clone(ranges)}
@@ -208,7 +211,7 @@ func (n *Node) syncPoint(ctx context.Context, ranges []Range, universal bool) (T
 		select {
 		case rep = <-ch:
 		case <-ctx.Done():
-			return TxnID{}, nil, ErrTimeout
+			return TxnID{}, nil, 0, ErrTimeout
 		}
 		if rep.err != nil || rep.reply.Outcome != ok {
 			tr.failure(rep.from)
@@ -217,44 +220,52 @@ func (n *Node) syncPoint(ctx context.Context, ranges []Range, universal bool) (T
 			deps = deps.with(rep.reply.Deps)
 		}
 		if tr.impossible() {
-			return TxnID{}, nil, ErrUnavailable
+			return TxnID{}, nil, 0, ErrUnavailable
 		}
 	}
 	if !tr.done() {
-		return TxnID{}, nil, ErrTimeout
+		return TxnID{}, nil, 0, ErrTimeout
 	}
 	n.metrics.syncPoints.Add(1)
-	// Applying it means every dependency applied at that replica.
+	// Applying it means every dependency applied at that replica. A
+	// universal sync point also waits for pending replicas, so a redundancy
+	// bound is never set before they applied the transactions it covers.
+	applyTargets := nodes
+	if universal {
+		applyTargets = ts.applyNodes()
+	}
 	req := &applyReq{ID: id, ExecuteAt: id.Timestamp, Deps: deps, Txn: txn, Writes: Writes{}}
 	applied := map[NodeID]bool{}
+	maxHLC := id.HLC
 	tr = newTracker(ts, (*Shard).slowQuorum)
 	backoff := 50 * time.Millisecond
 	for {
-		pending := slices.DeleteFunc(slices.Clone(nodes), func(x NodeID) bool { return applied[x] })
+		pending := slices.DeleteFunc(slices.Clone(applyTargets), func(x NodeID) bool { return applied[x] })
 		ach := broadcast[applyReply](ctx, n, pending, mApply, func(NodeID) any { return req })
 		for range pending {
 			var rep response[applyReply]
 			select {
 			case rep = <-ach:
 			case <-ctx.Done():
-				return TxnID{}, nil, ErrTimeout
+				return TxnID{}, nil, 0, ErrTimeout
 			}
 			if rep.err == nil && rep.reply.Outcome == ok {
 				applied[rep.from] = true
+				maxHLC = max(maxHLC, rep.reply.MaxHLC)
 				tr.success(rep.from)
 			}
 		}
-		if universal && len(applied) == len(nodes) || !universal && tr.done() {
+		if universal && len(applied) == len(applyTargets) || !universal && tr.done() {
 			var at []NodeID
 			for x := range applied {
 				at = append(at, x)
 			}
 			slices.Sort(at)
-			return id, at, nil
+			return id, at, maxHLC, nil
 		}
 		select {
 		case <-ctx.Done():
-			return TxnID{}, nil, ErrTimeout
+			return TxnID{}, nil, 0, ErrTimeout
 		case <-time.After(backoff):
 		}
 		backoff = min(2*backoff, time.Second)
@@ -288,7 +299,12 @@ func (n *Node) durability() {
 			id, err = n.SyncPoint(ctx, r, false)
 		}
 		if err == nil {
-			for _, to := range n.rangeTopologies(r).nodes() {
+			rts := n.rangeTopologies(r)
+			targets := rts.nodes()
+			if msg == mRedundant {
+				targets = rts.applyNodes()
+			}
+			for _, to := range targets {
 				_ = n.send(ctx, to, msg, &syncReq{ID: id, Txn: &Txn{Kind: SyncPoint, Ranges: []Range{r}}}, nil)
 			}
 			if msg == mRedundant {
@@ -350,17 +366,17 @@ func (n *Node) BootstrapPoints(ctx context.Context, ranges []Range) (BootstrapPo
 	// and they are coordinated again in an epoch that includes them.
 	n.awaitSynced(ctx, n.epoch())
 	uctx, cancel := context.WithTimeout(ctx, 4*n.cfg.RequestTimeout)
-	id, applied, err := n.syncPoint(uctx, ranges, true)
+	id, applied, maxHLC, err := n.syncPoint(uctx, ranges, true)
 	cancel()
 	if err != nil {
-		id, applied, err = n.syncPoint(ctx, ranges, false)
+		id, applied, maxHLC, err = n.syncPoint(ctx, ranges, false)
 	}
 	if err != nil {
 		return nil, nil, err
 	}
 	out := make(BootstrapPoints, 0, len(ranges))
 	for _, r := range ranges {
-		out = append(out, bound{R: r, TS: id.Timestamp})
+		out = append(out, bound{R: r, TS: id.Timestamp, MaxHLC: maxHLC})
 	}
 	return out, applied, nil
 }
@@ -407,8 +423,9 @@ func (s *store) setBootstrapped(pts BootstrapPoints) error {
 	s.mu.Lock()
 	changed := false
 	for _, p := range pts {
-		if !slices.ContainsFunc(s.bootstrapped, func(b bound) bool { return b.R == p.R && !b.TS.Less(p.TS) }) {
-			s.bootstrapped = addBound(s.bootstrapped, p.R, p.TS)
+		s.n.clock.Observe(max(p.TS.HLC, p.MaxHLC))
+		if !slices.ContainsFunc(s.bootstrapped, func(b bound) bool { return b.R == p.R && !b.TS.Less(p.TS) && b.MaxHLC >= p.MaxHLC }) {
+			s.bootstrapped = addBootstrapBound(s.bootstrapped, p)
 			changed = true
 		}
 	}

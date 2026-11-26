@@ -60,6 +60,10 @@ type Command struct {
 	Accepted Ballot
 	// ExecuteAt is the proposed (before Committed) or decided timestamp.
 	ExecuteAt Timestamp
+	// UniqueHLC, when above ExecuteAt.HLC, is the HLC the transaction's
+	// writes carry so they exceed every earlier write applied on its keys
+	// (TimestampWithUniqueHlc).
+	UniqueHLC int64 `json:",omitempty"`
 	// Deps are the proposed (Accepted) or decided (Committed and after)
 	// dependencies; LocalDeps those this replica computed at PreAccept.
 	Deps      Deps `json:",omitempty"`
@@ -111,11 +115,19 @@ type command struct {
 }
 
 // cfk is a key's conflict index (accord.local.CommandsForKey): every
-// command on the key, and the largest timestamp witnessed there.
+// command on the key, the largest timestamp witnessed there, and the
+// largest write HLC applied there.
 type cfk struct {
-	key   Key
-	ids   []TxnID
-	maxTS Timestamp
+	key           Key
+	ids           []TxnID
+	maxTS         Timestamp
+	maxAppliedHLC int64
+}
+
+func (c *command) writeHLC() int64 { return max(c.ExecuteAt.HLC, c.UniqueHLC) }
+
+func (c *command) writeAt() Timestamp {
+	return Timestamp{Epoch: c.ExecuteAt.Epoch, HLC: c.writeHLC(), Node: c.ExecuteAt.Node}
 }
 
 // store is a node's command store (accord.local.CommandStore): every
@@ -236,7 +248,10 @@ func (s *store) registerLocked(c *command, keys []Key) {
 			f.ids = slices.Insert(f.ids, i, c.ID)
 		}
 		if c.Status != NotDefined && c.Status != Truncated {
-			f.maxTS = mergeMax(f.maxTS, c.ExecuteAt)
+			f.maxTS = mergeMax(f.maxTS, c.writeAt())
+		}
+		if c.Status == Applied && c.ID.Kind != SyncPoint {
+			f.maxAppliedHLC = max(f.maxAppliedHLC, c.writeHLC())
 		}
 	}
 	if len(owned) > len(c.owned) {
@@ -461,7 +476,7 @@ func (s *store) commit(ctx context.Context, r *commitReq) (*commitReply, error) 
 	var skipped []TxnID
 	for {
 		if c.Status >= PreApplied && c.Status != Invalidated {
-			rep := &commitReply{Outcome: ok, Applied: true, Writes: c.Writes, Result: c.Result}
+			rep := &commitReply{Outcome: ok, Applied: true, UniqueHLC: c.UniqueHLC, Writes: c.Writes, Result: c.Result}
 			return rep, s.unlock()
 		}
 		var wait <-chan struct{}
@@ -491,6 +506,26 @@ func (s *store) commit(ctx context.Context, r *commitReq) (*commitReply, error) 
 	if s.missingLocked(skipped, readKeys) {
 		return &commitReply{Outcome: notReady}, s.unlock()
 	}
+	// Every earlier dependency on readKeys applied here: the transaction's
+	// writes must carry an HLC strictly above all of them (and above any
+	// streamed bootstrap bound), even when an older-epoch slow-path commit
+	// or a same-microsecond slow-path commit on another node wrote at >=
+	// ExecuteAt.HLC.
+	minHLC := c.ExecuteAt.HLC
+	for _, k := range readKeys {
+		ks := keyString(k)
+		if f := s.keys[ks]; f != nil && f.maxAppliedHLC >= minHLC {
+			minHLC = f.maxAppliedHLC + 1
+		}
+		for _, depID := range c.Deps[ks] {
+			if d := s.cmds[depID]; d != nil && d.Status == Applied && d.ID.Kind != SyncPoint && d.writeHLC() >= minHLC {
+				minHLC = d.writeHLC() + 1
+			}
+		}
+		if bHLC := boundMaxHLC(s.bootstrapped, k); bHLC > 0 && bHLC >= minHLC {
+			minHLC = bHLC + 1
+		}
+	}
 	// The read happens outside the lock: while it runs, the command's own
 	// writes (from another coordinator) are held back (reading), and no
 	// later conflicting transaction applies before them.
@@ -516,7 +551,7 @@ func (s *store) commit(ctx context.Context, r *commitReq) (*commitReply, error) 
 	if err != nil {
 		return nil, err
 	}
-	return &commitReply{Outcome: ok, Reads: reads}, nil
+	return &commitReply{Outcome: ok, Reads: reads, MinHLC: minHLC}, nil
 }
 
 func (s *store) commitLocked(c *command, executeAt Timestamp, deps Deps, txn *Txn, keys []Key, ballot Ballot, stable bool) error {
@@ -581,11 +616,11 @@ func (s *store) apply(ctx context.Context, r *applyReq) (*applyReply, error) {
 			c.Txn = r.Txn
 		}
 		s.registerLocked(c, r.Txn.Keys)
-		c.Status, c.ExecuteAt, c.Deps, c.Writes, c.Result = PreApplied, r.ExecuteAt, r.Deps, r.Writes, r.Result
+		c.Status, c.ExecuteAt, c.UniqueHLC, c.Deps, c.Writes, c.Result = PreApplied, r.ExecuteAt, r.UniqueHLC, r.Deps, r.Writes, r.Result
 		if r.Txn.Kind == SyncPoint {
 			s.syncOwnedLocked(c)
 		}
-		s.witnessLocked(c, r.ExecuteAt)
+		s.witnessLocked(c, c.writeAt())
 		if err := s.saveLocked(c); err != nil {
 			s.mu.Unlock()
 			return nil, err
@@ -604,7 +639,25 @@ func (s *store) apply(ctx context.Context, r *applyReq) (*applyReply, error) {
 		}
 		s.mu.Lock()
 	}
-	return &applyReply{Outcome: ok}, s.unlock()
+	var maxHLC int64
+	if r.Txn != nil && r.Txn.Kind == SyncPoint {
+		maxHLC = s.maxRangeHLCLocked(r.Txn.Ranges, c.ExecuteAt.HLC)
+	}
+	return &applyReply{Outcome: ok, MaxHLC: maxHLC}, s.unlock()
+}
+
+// maxRangeHLCLocked returns the largest HLC applied or witnessed on ranges.
+func (s *store) maxRangeHLCLocked(ranges []Range, floor int64) int64 {
+	m := floor
+	for _, rg := range ranges {
+		i := sort.Search(len(s.sorted), func(i int) bool { return s.sorted[i].key.Token >= rg.Lo })
+		for ; i < len(s.sorted) && s.sorted[i].key.Token <= rg.Hi; i++ {
+			if f := s.sorted[i]; rg.contains(f.key) {
+				m = max(m, f.maxAppliedHLC, f.maxTS.HLC)
+			}
+		}
+	}
+	return m
 }
 
 // maybeExecuteLocked checks whether a stable command can execute: every
@@ -637,7 +690,7 @@ func (s *store) maybeExecuteLocked(c *command) {
 		return
 	}
 	c.executing = true
-	go s.applyWrites(c.ID, c.Txn, c.ExecuteAt, c.owned, c.Writes)
+	go s.applyWrites(c.ID, c.Txn, c.writeAt(), c.owned, c.Writes)
 }
 
 // knowsEpochsLocked reports whether this node knows the epochs a command
@@ -707,6 +760,15 @@ func (s *store) applyWrites(id TxnID, txn *Txn, executeAt Timestamp, owned []Key
 		return
 	}
 	c.Status, c.appliedAt = Applied, s.n.cfg.Now()
+	wAt := c.writeAt()
+	s.witnessLocked(c, wAt)
+	if c.ID.Kind != SyncPoint {
+		for _, k := range c.owned {
+			if f := s.keys[keyString(k)]; f != nil {
+				f.maxAppliedHLC = max(f.maxAppliedHLC, wAt.HLC)
+			}
+		}
+	}
 	_ = s.saveLocked(c)
 	delete(s.waiters, id)
 }
@@ -747,7 +809,7 @@ func (s *store) beginRecoveryLocked2(r *recoverReq) (*recoverReply, error) {
 	} else if err := s.saveLocked(c); err != nil {
 		return nil, err
 	}
-	rep := &recoverReply{Outcome: ok, Status: c.Status, Accepted: c.Accepted, ExecuteAt: c.ExecuteAt, Deps: c.Deps,
+	rep := &recoverReply{Outcome: ok, Status: c.Status, Accepted: c.Accepted, ExecuteAt: c.ExecuteAt, UniqueHLC: c.UniqueHLC, Deps: c.Deps,
 		LocalDeps: c.LocalDeps, FastVote: c.FastVote, Txn: c.Txn, Writes: c.Writes, Result: c.Result, Rejects: refused}
 	if c.Status >= Accepted {
 		return rep, nil
@@ -802,7 +864,7 @@ func (s *store) checkStatus(id TxnID, keys []Key) *checkStatusReply {
 		}
 	}
 	return &checkStatusReply{Status: c.Status, Promised: c.Promised, Accepted: c.Accepted, ExecuteAt: c.ExecuteAt,
-		Deps: c.Deps, Txn: c.Txn, Keys: c.Keys, Writes: c.Writes, Result: c.Result}
+		UniqueHLC: c.UniqueHLC, Deps: c.Deps, Txn: c.Txn, Keys: c.Keys, Writes: c.Writes, Result: c.Result}
 }
 
 func (s *store) informDurable(id TxnID) error {
@@ -876,6 +938,9 @@ func (s *store) replay() error {
 		if saved.Bootstrap {
 			s.bootstrapRec = saved
 			s.bootstrapped = slices.Clone(saved.Bounds)
+			for _, b := range saved.Bounds {
+				s.n.clock.Observe(max(b.TS.HLC, b.MaxHLC))
+			}
 			continue
 		}
 		if saved.SyncedEpoch > 0 {
@@ -885,7 +950,7 @@ func (s *store) replay() error {
 		}
 		c := &command{Command: *saved, changed: make(chan struct{}), lastChange: now, appliedAt: now}
 		s.cmds[c.ID] = c
-		s.n.clock.Observe(max(c.ID.HLC, c.ExecuteAt.HLC))
+		s.n.clock.Observe(max(c.ID.HLC, c.ExecuteAt.HLC, c.UniqueHLC))
 		if c.Txn != nil && c.Txn.Kind == SyncPoint && c.Status != Invalidated {
 			for _, r := range c.Txn.Ranges {
 				s.barriers = addBound(s.barriers, r, c.ID.Timestamp)
@@ -906,7 +971,14 @@ func (s *store) rescanLocked() {
 		if len(c.Keys) > 0 && c.Status != Truncated {
 			s.registerLocked(c, nil)
 			s.witnessLocked(c, c.ID.Timestamp)
-			s.witnessLocked(c, c.ExecuteAt)
+			s.witnessLocked(c, c.writeAt())
+			if c.Status == Applied && c.ID.Kind != SyncPoint {
+				for _, k := range c.owned {
+					if f := s.keys[keyString(k)]; f != nil {
+						f.maxAppliedHLC = max(f.maxAppliedHLC, c.writeHLC())
+					}
+				}
+			}
 		}
 	}
 	for _, c := range s.cmds {
@@ -1126,7 +1198,8 @@ func (s *store) forgetLocked() {
 	// timestamp would have ordered.
 	if len(s.redundant) > 0 {
 		s.sorted = slices.DeleteFunc(s.sorted, func(f *cfk) bool {
-			if len(f.ids) == 0 && f.maxTS.Less(boundFor(s.redundant, f.key)) {
+			b := boundFor(s.redundant, f.key)
+			if len(f.ids) == 0 && f.maxTS.Less(b) && f.maxAppliedHLC < b.HLC {
 				delete(s.keys, keyString(f.key))
 				return true
 			}
