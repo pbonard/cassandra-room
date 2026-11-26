@@ -129,21 +129,7 @@ func (f *deletionFilter) Filter(key, value []byte, env *lsm.FilterEnv) ([]byte, 
 	if at == row.NoTimestamp {
 		return nil, false, nil
 	}
-	changed := false
-	if !r.Deletion.IsLive() && r.Deletion.MarkedForDeleteAt <= at {
-		r.Deletion = row.Deletion{MarkedForDeleteAt: row.NoTimestamp}
-		changed = true
-	}
-	kept := r.Cells[:0]
-	for _, c := range r.Cells {
-		if c.Timestamp <= at {
-			changed = true
-			continue
-		}
-		kept = append(kept, c)
-	}
-	r.Cells = kept
-	return rewrite(r, changed)
+	return shadowRow(r, at)
 }
 
 func rewrite(r *row.Row, changed bool) ([]byte, bool, error) {

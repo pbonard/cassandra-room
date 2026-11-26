@@ -939,3 +939,37 @@ func sameHosts(a, b []*cluster.Node) bool {
 	}
 	return true
 }
+
+// ownedRanges returns the ranges, (start, end], where self is a replica in
+// any of rings, split at every ring's boundaries and merged where
+// adjacent.
+func ownedRanges(rings []*cluster.Ring, replication map[string]string, self string) [][2]int64 {
+	var ends []int64
+	for _, r := range rings {
+		for _, rg := range r.Ranges() {
+			ends = append(ends, rg[1])
+		}
+	}
+	slices.Sort(ends)
+	ends = slices.Compact(ends)
+	var out [][2]int64
+	for i, end := range ends {
+		start := ends[(i+len(ends)-1)%len(ends)] // the first range wraps
+		owned := false
+		for _, r := range rings {
+			if !r.Empty() && containsAddr(r.Replicas(replication, end), self) {
+				owned = true
+				break
+			}
+		}
+		if !owned {
+			continue
+		}
+		if n := len(out); n > 0 && out[n-1][1] == start {
+			out[n-1][1] = end
+			continue
+		}
+		out = append(out, [2]int64{start, end})
+	}
+	return out
+}

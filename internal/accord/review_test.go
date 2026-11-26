@@ -161,3 +161,43 @@ func TestAdoptedBoundSurvivesRestart(t *testing.T) {
 	defer n0.s.mu.Unlock()
 	require.Equal(t, at, boundFor(n0.s.redundant, c.keys[0]))
 }
+
+// TestAwaitOutcomeApplies: a coordinator that finds the outcome of
+// another's transaction at a single replica applies it at a slow quorum
+// before answering, as the coordinator of a transaction does: a QUORUM
+// read outside Accord right after the answer must see its writes.
+func TestAwaitOutcomeApplies(t *testing.T) {
+	c := newSimCluster(t, 3, 3, 1)
+	k := c.keys[0]
+	n0 := c.node(0)
+	txn := appendTxn(t, k, 7)
+	id := n0.newTxnID(Write)
+	ctx := context.Background()
+	deps := Deps{}
+	for i := 0; i < 3; i++ {
+		var r preAcceptReply
+		require.NoError(t, n0.send(ctx, c.ids[i], mPreAccept, &preAcceptReq{ID: id, Txn: txn}, &r))
+		deps = deps.with(r.Deps)
+	}
+	// Decided and applied at n1 only (its coordinator stopped there).
+	w, _ := json.Marshal(7)
+	var ar applyReply
+	require.NoError(t, n0.send(ctx, "n1", mApply, &applyReq{ID: id, ExecuteAt: id.Timestamp, Deps: deps, Txn: txn,
+		Writes: Writes{keyString(k): w}, Result: []byte(`"done"`)}, &ar))
+	holding := func() int {
+		n := 0
+		for _, s := range c.stores {
+			s.mu.Lock()
+			if len(s.data[keyString(k)]) > 0 {
+				n++
+			}
+			s.mu.Unlock()
+		}
+		return n
+	}
+	require.Equal(t, 1, holding())
+	res, err := c.node(2).awaitOutcome(ctx, id, txn.Keys)
+	require.NoError(t, err)
+	require.Equal(t, `"done"`, string(res))
+	require.GreaterOrEqual(t, holding(), 2, "applied at a quorum before answering")
+}

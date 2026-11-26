@@ -86,3 +86,56 @@ func TestConsistencyAnyNeedsAHint(t *testing.T) {
 	_, failed := res.(message.Error)
 	require.True(t, failed, "no replica and no hint: the write is nowhere")
 }
+
+// TestConsistencyAnyHintsTimedOutReplicas: a write at ANY whose replicas
+// are up but do not answer in time is met by the hints stored for them.
+func TestConsistencyAnyHintsTimedOutReplicas(t *testing.T) {
+	c := newTestCluster(t, 2)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+	c.ok(0, quorum, "CREATE TABLE ks.kv (k int PRIMARY KEY, v text)")
+	time.Sleep(100 * time.Millisecond)
+	k := c.nodes[0].schema.Load().Keyspaces["ks"]
+	key := -1
+	for i := 0; i < 1000 && key < 0; i++ {
+		pk := []byte{byte(i >> 24), byte(i >> 16), byte(i >> 8), byte(i)}
+		if c.nodes[0].proxy.ring.Load().Replicas(k.Replication, Token(pk))[0].Addr == c.addrs[1] {
+			key = i
+		}
+	}
+	require.GreaterOrEqual(t, key, 0)
+	c.nodes[1].proxy.testMutationDelay.Store(int64(3 * time.Second)) // the write timeout is 1 s
+	res := c.exec(0, primitive.ConsistencyLevelAny, "INSERT INTO ks.kv (k, v) VALUES (?, 'x')", key)
+	if e, failed := res.(message.Error); failed {
+		t.Fatalf("ANY with a hint stored: %s", e.GetErrorMessage())
+	}
+	lt, err := c.nodes[0].engine.Table(hintsStorage)
+	require.NoError(t, err)
+	it, err := lt.NewIter(nil, nil)
+	require.NoError(t, err)
+	defer it.Close()
+	require.True(t, it.First(), "a hint for the replica that timed out")
+}
+
+// TestCounterLeaderLocalDC: a coordinator that does not replicate a
+// counter's partition picks a leader in its own data center, which
+// evaluates LOCAL_QUORUM there, not one in another data center.
+func TestCounterLeaderLocalDC(t *testing.T) {
+	c := newTestCluster(t, 4, "dc1", "dc1", "dc2", "dc2")
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': 1, 'dc2': 1}")
+	p := c.nodes[0].proxy
+	k := c.nodes[0].schema.Load().Keyspaces["ks"]
+	checked := 0
+	for i := 0; i < 2000 && checked < 20; i++ {
+		pk := []byte{byte(i >> 24), byte(i >> 16), byte(i >> 8), byte(i)}
+		tok := Token(pk)
+		reps, _ := p.replicas(k, tok, primitive.ConsistencyLevelAll)
+		if containsAddr(reps, c.addrs[0]) || reps[0].DataCenter == "dc1" {
+			continue // a replica itself, or the first replica is local anyway
+		}
+		l, err := p.counterLeader(p.place.Load(), k, tok)
+		require.NoError(t, err)
+		require.Equal(t, "dc1", l.DataCenter, "token %d", tok)
+		checked++
+	}
+	require.Positive(t, checked)
+}

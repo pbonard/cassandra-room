@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/datastax/go-cassandra-native-protocol/message"
+	"github.com/datastax/go-cassandra-native-protocol/primitive"
 	"github.com/stretchr/testify/require"
 )
 
@@ -65,4 +66,42 @@ func TestLoggedBatchAtomic(t *testing.T) {
 	_, failed := res.(message.Error)
 	require.True(t, failed)
 	require.Equal(t, []string{"unlogged"}, c.values(0, one, fmt.Sprintf("SELECT v FROM ks.kv WHERE k = %d", a)))
+}
+
+// TestClientTimestampZero: a client timestamp of 0 is a timestamp, not
+// "none" (it was replaced with the clock's), for a write and for a logged
+// batch over several partitions (run as an Accord transaction).
+func TestClientTimestampZero(t *testing.T) {
+	c := newTestCluster(t, 3)
+	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+	c.ok(0, quorum, "CREATE TABLE ks.kv (k int PRIMARY KEY, v text)")
+	k := c.nodes[0].schema.Load().Keyspaces["ks"]
+	owner := func(i int) string {
+		pk := []byte{byte(i >> 24), byte(i >> 16), byte(i >> 8), byte(i)}
+		return c.nodes[0].proxy.ring.Load().Replicas(k.Replication, Token(pk))[0].Addr
+	}
+	a, b := 0, -1
+	for i := 1; i < 1000 && b < 0; i++ {
+		if owner(i) != owner(a) {
+			b = i
+		}
+	}
+	require.GreaterOrEqual(t, b, 0)
+	d := c.nodes[0]
+	zero := int64(0)
+	ins := mustPrepare(t, d, "INSERT INTO ks.kv (k, v) VALUES (?, ?)")
+	val := func(i int, s string) []*primitive.Value {
+		return []*primitive.Value{primitive.NewValue([]byte{byte(i >> 24), byte(i >> 16), byte(i >> 8), byte(i)}), primitive.NewValue([]byte(s))}
+	}
+	res := d.Execute(ins, &RequestOptions{Values: val(1000, "single"), Consistency: quorum, Timestamp: &zero})
+	require.NotImplements(t, (*message.Error)(nil), res)
+	require.Eventually(t, func() bool {
+		res := d.ExecuteBatch(primitive.BatchTypeLogged, []BatchChild{{Prepared: ins, Values: val(a, "a")}, {Prepared: ins, Values: val(b, "b")}},
+			&RequestOptions{Consistency: quorum, Timestamp: &zero})
+		_, failed := res.(message.Error)
+		return !failed
+	}, 30*time.Second, 100*time.Millisecond)
+	for _, key := range []int{1000, a, b} {
+		require.Equal(t, []string{"\x00\x00\x00\x00\x00\x00\x00\x00"}, c.values(1, quorum, fmt.Sprintf("SELECT WRITETIME(v) FROM ks.kv WHERE k = %d", key)), "key %d", key)
+	}
 }

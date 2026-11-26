@@ -105,3 +105,36 @@ func TestClusterJoinWaitsForMovement(t *testing.T) {
 	require.Equal(t, cluster.StatusNormal, c.nodes[0].schema.Load().Nodes[c.nodes[n].local.HostID].Status)
 	c.checkReplicas(100)
 }
+
+// TestOwnedRangesWhileJoining: a joining node owns the ranges it will
+// replicate (compaction shards over them) though the read placement does
+// not include it yet; with every node a replica, a node owns the ring.
+func TestOwnedRangesWhileJoining(t *testing.T) {
+	var nodes []cluster.Node
+	for i := range 3 {
+		nodes = append(nodes, cluster.Node{Addr: fmt.Sprint("n", i), HostID: fmt.Sprint("h", i), Status: cluster.StatusNormal, Tokens: cluster.RandomTokens(4)})
+	}
+	nodes[2].Status = cluster.StatusJoining
+	repl := map[string]string{"class": "SimpleStrategy", "replication_factor": "1"}
+	read, future := cluster.NewRing(nodes), cluster.NewFutureRing(nodes)
+	require.Empty(t, ownedRanges([]*cluster.Ring{read}, repl, "n2"), "not in the read placement")
+	got := ownedRanges([]*cluster.Ring{read, future}, repl, "n2")
+	in := func(r [2]int64, tok int64) bool {
+		if r[0] < r[1] {
+			return r[0] < tok && tok <= r[1]
+		}
+		return tok > r[0] || tok <= r[1] // wraps
+	}
+	for _, tok := range nodes[2].Tokens {
+		require.True(t, slices.ContainsFunc(got, func(r [2]int64) bool { return in(r, tok) }), "the range ending at its token %d", tok)
+	}
+	for _, r := range got {
+		require.True(t, slices.Contains(nodes[2].Tokens, r[1]), "ranges end at its tokens (merged where adjacent)")
+	}
+	for _, tok := range nodes[0].Tokens {
+		require.False(t, slices.ContainsFunc(got, func(r [2]int64) bool { return in(r, tok) }), "not another node's range")
+	}
+	all := ownedRanges([]*cluster.Ring{read}, map[string]string{"class": "SimpleStrategy", "replication_factor": "3"}, "n0")
+	require.Len(t, all, 1)
+	require.Equal(t, all[0][0], all[0][1], "the whole ring: one range wrapping onto itself")
+}

@@ -394,7 +394,7 @@ func (d *DB) applyModifications(mods []boundModification, batchCtx *execCtx) err
 		for _, bm := range mods {
 			bm.e.counterDeltas = true
 			if len(mods) > 1 {
-				bm.e.ts = batchCtx.ts
+				bm.e.setTimestamp(batchCtx.ts)
 			}
 			if err := bm.m.addMutations(bm.e, b); err != nil {
 				return err
@@ -412,7 +412,7 @@ func (d *DB) applyModifications(mods []boundModification, batchCtx *execCtx) err
 				// previous ones updated.
 				batchCtx.timestamp()
 				for _, bm := range mods {
-					bm.e.ts = batchCtx.ts
+					bm.e.setTimestamp(batchCtx.ts)
 					if err := d.applyLocked([]boundModification{bm}); err != nil {
 						return err
 					}
@@ -433,7 +433,7 @@ func (d *DB) applyLocked(mods []boundModification) error {
 	if len(mods) > 1 {
 		batchCtx.timestamp() // one timestamp for the whole batch
 		for i := range mods {
-			mods[i].e.ts = batchCtx.ts
+			mods[i].e.setTimestamp(batchCtx.ts)
 		}
 	}
 	for _, bm := range mods {

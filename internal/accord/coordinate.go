@@ -452,6 +452,19 @@ func (n *Node) awaitOutcome(ctx context.Context, id TxnID, keys []Key) ([]byte, 
 			answered++
 			switch rep.Status {
 			case Applied, PreApplied:
+				if rep.Txn == nil {
+					continue
+				}
+				// The outcome is decided, but this replica may be the only
+				// one to have it: apply it at a slow quorum of each shard
+				// first, as persist does for the coordinator's own
+				// transactions, so that a QUORUM read outside Accord
+				// right after the answer sees it (on tables whose
+				// conditional statements or writes run on Accord and
+				// reads do not).
+				if err := n.persist(ctx, n.applyTopologies(keys, id, rep.ExecuteAt), id, rep.Txn, rep.ExecuteAt, rep.Deps, rep.Writes, rep.Result); err != nil {
+					return nil, err
+				}
 				return rep.Result, nil
 			case Invalidated:
 				return nil, ErrInvalidated

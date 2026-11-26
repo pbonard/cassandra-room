@@ -80,6 +80,8 @@ type ClusterOptions struct {
 type proxy struct {
 	// testRefuseMutations makes the node refuse MUTATION messages (tests).
 	testRefuseMutations atomic.Pointer[bool]
+	// testMutationDelay delays answering MUTATION messages (tests).
+	testMutationDelay atomic.Int64
 	// streamUsed is when each outbound stream session was last used.
 	streamMu   sync.Mutex
 	streamUsed map[string]time.Time
@@ -571,9 +573,17 @@ func nodeList(s *Schema) []cluster.Node {
 // replicates for its keyspace, over which compaction measures densities
 // and cuts shards.
 func (p *proxy) setOwnedRanges(s *Schema) {
-	ring := p.ring.Load()
+	pl := p.place.Load()
+	ring := pl.ring
 	if ring.Empty() {
 		return
+	}
+	// The ranges this node holds in any placement: a joining node owns
+	// none yet in the read placement, but receives its future ranges' data
+	// (and a leaving one keeps its own until it leaves).
+	rings := []*cluster.Ring{ring}
+	if pl.moving != nil {
+		rings = append(rings, pl.moving.old, pl.moving.future)
 	}
 	// The engine's token space flips the sign bit of Murmur3's tokens.
 	flip := func(t int64) uint64 { return uint64(t) ^ (1 << 63) }
@@ -584,10 +594,7 @@ func (p *proxy) setOwnedRanges(s *Schema) {
 			continue
 		}
 		var owned []lsm.TokenRange
-		for _, r := range ring.Ranges() {
-			if !containsAddr(ring.Replicas(k.Replication, r[1]), p.self) {
-				continue
-			}
+		for _, r := range ownedRanges(rings, k.Replication, p.self) {
 			// (start, end]; one wrapping around the ring is two.
 			if r[0] < r[1] {
 				owned = append(owned, lsm.TokenRange{First: flip(r[0] + 1), Last: flip(r[1])})
@@ -892,6 +899,9 @@ func (p *proxy) handleMutation(ctx context.Context, _ string, payload []byte) ([
 	if f := p.testRefuseMutations.Load(); f != nil && *f {
 		return nil, errors.New("db: refusing mutations (test)")
 	}
+	if d := p.testMutationDelay.Load(); d > 0 {
+		time.Sleep(time.Duration(d))
+	}
 	payload, done, err := p.admit(payload)
 	if err != nil {
 		return nil, err
@@ -1051,13 +1061,24 @@ wait:
 		}
 	}
 	// Replicas that have not answered yet get hints only if they fail;
-	// let them finish in the background.
+	// let them finish in the background. For ANY, a write no replica
+	// acknowledged in time is hinted for them now: the hint is what meets
+	// ANY (StorageProxy writes hints for the replicas that time out).
+	hintedLate := false
+	if cl == primitive.ConsistencyLevelAny && !satisfied() && len(pending) > 0 {
+		hintedLate = true
+		for a := range pending {
+			for _, w := range perNode[a] {
+				hints = append(hints, hint{hostID: nodes[a].HostID, w: w})
+			}
+		}
+	}
 	if n := len(pending); n > 0 {
 		go func() {
 			defer cancel()
 			for i := 0; i < n; i++ {
 				a := <-acks
-				if a.err != nil && !isBehind(a.err) {
+				if a.err != nil && !isBehind(a.err) && !hintedLate {
 					var hs []hint
 					for _, w := range perNode[a.addr] {
 						hs = append(hs, hint{hostID: nodes[a.addr].HostID, w: w})
@@ -1405,6 +1426,12 @@ func (p *proxy) handleReadRow(ctx context.Context, _ string, payload []byte) ([]
 	}
 	if err != nil {
 		return nil, err
+	}
+	if v, err = (&shadower{lt: lt}).filter(parts[0], v); err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return []byte{0}, nil // all shadowed by a deletion
 	}
 	return append([]byte{1}, v...), nil
 }
@@ -1830,6 +1857,7 @@ func (p *proxy) handleReadRange(ctx context.Context, _ string, payload []byte) (
 	var out []byte
 	n := 0
 	more := byte(0)
+	sh := &shadower{lt: lt}
 	for ok := it.First(); ok; ok = it.Next() {
 		if n == rangePage {
 			more = 1
@@ -1838,10 +1866,17 @@ func (p *proxy) handleReadRange(ctx context.Context, _ string, payload []byte) (
 		if n%64 == 0 && ctx.Err() != nil {
 			return nil, ctx.Err() // the coordinator gave up
 		}
+		v, err := sh.filter(it.Key(), it.Value())
+		if err != nil {
+			return nil, err
+		}
+		if v == nil {
+			continue // shadowed by a deletion
+		}
 		out = binary.AppendUvarint(out, uint64(len(it.Key())))
 		out = append(out, it.Key()...)
-		out = binary.AppendUvarint(out, uint64(len(it.Value())))
-		out = append(out, it.Value()...)
+		out = binary.AppendUvarint(out, uint64(len(v)))
+		out = append(out, v...)
 		n++
 	}
 	return append([]byte{more}, out...), it.Error()
@@ -1877,6 +1912,7 @@ func (p *proxy) handleReadRangeReverse(ctx context.Context, _ string, payload []
 	var out []byte
 	n := 0
 	more := byte(0)
+	sh := &shadower{lt: lt}
 	for ok := it.Last(); ok; ok = it.Prev() {
 		if n == rangePage {
 			more = 1
@@ -1885,10 +1921,17 @@ func (p *proxy) handleReadRangeReverse(ctx context.Context, _ string, payload []
 		if n%64 == 0 && ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		v, err := sh.filter(it.Key(), it.Value())
+		if err != nil {
+			return nil, err
+		}
+		if v == nil {
+			continue // shadowed by a deletion
+		}
 		out = binary.AppendUvarint(out, uint64(len(it.Key())))
 		out = append(out, it.Key()...)
-		out = binary.AppendUvarint(out, uint64(len(it.Value())))
-		out = append(out, it.Value()...)
+		out = binary.AppendUvarint(out, uint64(len(v)))
+		out = append(out, v...)
 		n++
 	}
 	return append([]byte{more}, out...), it.Error()
@@ -2291,7 +2334,8 @@ func (m *modification) isCounter() bool {
 // ---- counters (CounterMutation) ----
 
 // counterLeader is the node that applies a partition's counter updates:
-// its first live replica (StorageProxy.findSuitableReplica).
+// this node if it is a live replica, else a live one in this data center,
+// else the first live one (StorageProxy.findSuitableReplica).
 func (p *proxy) counterLeader(pl *placement, k *Keyspace, token int64) (*cluster.Node, error) {
 	reps, live := p.replicasIn(pl, k, token, primitive.ConsistencyLevelAll)
 	if live == 0 {
@@ -2299,6 +2343,14 @@ func (p *proxy) counterLeader(pl *placement, k *Keyspace, token int64) (*cluster
 	}
 	for _, r := range reps[:live] {
 		if r.Addr == p.self {
+			return r, nil
+		}
+	}
+	// A replica in this data center: the leader evaluates the consistency
+	// level, and LOCAL_QUORUM and LOCAL_ONE are this data center's
+	// (findSuitableReplica prefers the local data center too).
+	for _, r := range reps[:live] {
+		if r.DataCenter == p.d.opts.DataCenter {
 			return r, nil
 		}
 	}
