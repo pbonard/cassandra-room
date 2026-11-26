@@ -3,6 +3,9 @@ package db
 import (
 	"context"
 	"fmt"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -112,4 +115,66 @@ func TestClusterFencedCoordinator(t *testing.T) {
 	require.Greater(t, c.nodes[stale].schema.Load().Epoch, before, "it caught up when refused")
 	require.Equal(t, []string{"caught up"}, c.values(n, quorum, "SELECT v FROM ks.kv WHERE k = ?", 1001))
 	require.Equal(t, []string{"v1"}, c.values(stale, quorum, "SELECT v FROM ks.kv WHERE k = ?", 1))
+}
+
+// TestFenceConcurrent: whatever the interleaving of requests with the
+// fence advancing, once a drain for epoch k returns, no request planned
+// before k is in progress.
+func TestFenceConcurrent(t *testing.T) {
+	var f fence
+	f.advance(1)
+	var drained atomic.Int64 // the epoch drained up to
+	var violations atomic.Int64
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				// Some behind, some current (never 0: not fenced).
+				e := max(1, drained.Load()-1+int64((i+w)%3))
+				done, err := f.enter(e)
+				if err != nil {
+					continue
+				}
+				for range 3 {
+					if drained.Load() > e {
+						violations.Add(1)
+					}
+					runtime.Gosched()
+				}
+				done()
+			}
+		}()
+	}
+	for k := int64(2); k < 300; k++ {
+		f.advance(k)
+		require.NoError(t, f.drain(context.Background()))
+		drained.Store(k)
+	}
+	close(stop)
+	wg.Wait()
+	require.Zero(t, violations.Load())
+}
+
+// TestFenceAdvanceWhileEntering: a request checked against the fence
+// before it advances, but counted after the drain that followed, is
+// checked again and refused.
+func TestFenceAdvanceWhileEntering(t *testing.T) {
+	var f fence
+	f.advance(5)
+	fenceEnterHook = func() {
+		fenceEnterHook = nil
+		f.advance(6)
+		require.NoError(t, f.drain(context.Background()), "nothing counted yet")
+	}
+	t.Cleanup(func() { fenceEnterHook = nil })
+	_, err := f.enter(5)
+	require.True(t, isBehind(err), "checked again against the new fence: %v", err)
 }

@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pbonard/cassandra-room/internal/cluster"
@@ -55,14 +56,31 @@ func isBehind(err error) bool {
 // request again.
 const fencedRetries = 3
 
-// fence admits a replica's requests by the epoch of their placements.
+// fence admits a replica's requests by the epoch of their placements,
+// without a lock on their way: each admitted request counts in the
+// generation of the fence it was admitted under.
 type fence struct {
-	mu sync.Mutex
-	// epoch is the epoch this node's placements last changed at: requests
+	mu  sync.Mutex // serializes advances and drains' walks of gen.prev
+	gen atomic.Pointer[fenceGen]
+}
+
+// fenceGen is the fence between two changes of placements.
+type fenceGen struct {
+	// epoch is the epoch this node's placements changed at: requests
 	// planned before it are refused.
 	epoch int64
-	// inflight counts the admitted requests in progress, by epoch.
-	inflight map[int64]int
+	// n counts the requests admitted under this generation in progress.
+	n atomic.Int64
+	// prev is the generation before, until drained (guarded by mu).
+	prev *fenceGen
+}
+
+func (f *fence) current() *fenceGen {
+	if g := f.gen.Load(); g != nil {
+		return g
+	}
+	f.gen.CompareAndSwap(nil, &fenceGen{})
+	return f.gen.Load()
 }
 
 // enter admits a request planned at epoch e (0: not planned with
@@ -71,56 +89,66 @@ func (f *fence) enter(e int64) (done func(), err error) {
 	if e == 0 {
 		return func() {}, nil
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if e < f.epoch {
-		return nil, fmt.Errorf("db: %s (request epoch %d, placements of epoch %d)", coordinatorBehind, e, f.epoch)
-	}
-	if f.inflight == nil {
-		f.inflight = map[int64]int{}
-	}
-	f.inflight[e]++
-	return func() {
-		f.mu.Lock()
-		if f.inflight[e]--; f.inflight[e] == 0 {
-			delete(f.inflight, e)
+	for {
+		g := f.current()
+		if e < g.epoch {
+			return nil, fmt.Errorf("db: %s (request epoch %d, placements of epoch %d)", coordinatorBehind, e, g.epoch)
 		}
-		f.mu.Unlock()
-	}, nil
+		if h := fenceEnterHook; h != nil {
+			h()
+		}
+		g.n.Add(1)
+		if f.gen.Load() == g {
+			return func() { g.n.Add(-1) }, nil
+		}
+		// The fence advanced meanwhile, and a drain may have missed this
+		// request: check it against the new one.
+		g.n.Add(-1)
+	}
 }
+
+// fenceEnterHook, in tests, runs in enter between checking a request
+// against the fence and counting it.
+var fenceEnterHook func()
 
 // advance refuses from now on the requests planned before epoch e.
 func (f *fence) advance(e int64) {
 	f.mu.Lock()
-	f.epoch = max(f.epoch, e)
-	f.mu.Unlock()
+	defer f.mu.Unlock()
+	g := f.current()
+	if e <= g.epoch {
+		return
+	}
+	f.gen.Store(&fenceGen{epoch: e, prev: g})
 }
 
-// drain waits until no request planned before the fence's epoch (as it is
-// now) is in progress.
+// drain waits until no request admitted before the fence's last advance
+// is in progress (those admitted later were planned at its epoch or
+// after).
 func (f *fence) drain(ctx context.Context) error {
 	f.mu.Lock()
-	below := f.epoch
+	g := f.current()
+	var older []*fenceGen
+	for p := g.prev; p != nil; p = p.prev {
+		older = append(older, p)
+	}
 	f.mu.Unlock()
-	for {
-		f.mu.Lock()
-		busy := false
-		for e := range f.inflight {
-			if e < below {
-				busy = true
-				break
+	for _, p := range older {
+		for p.n.Load() > 0 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("db: requests planned before epoch %d still in progress: %w", g.epoch, ctx.Err())
+			case <-time.After(2 * time.Millisecond):
 			}
 		}
-		f.mu.Unlock()
-		if !busy {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("db: requests planned before epoch %d still in progress: %w", below, ctx.Err())
-		case <-time.After(2 * time.Millisecond):
-		}
 	}
+	// Drained: forget them.
+	f.mu.Lock()
+	if len(older) > 0 && older[0] == g.prev {
+		g.prev = nil
+	}
+	f.mu.Unlock()
+	return nil
 }
 
 // fenced prefixes a request's payload with the epoch it was planned at.
