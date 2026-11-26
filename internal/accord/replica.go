@@ -240,7 +240,25 @@ func (s *store) registerLocked(c *command, keys []Key) {
 		}
 	}
 	if len(owned) > len(c.owned) {
+		if c.Status == Applied || c.executing {
+			s.checkLateOwnedLocked(c, owned)
+		}
 		c.owned = owned
+	}
+}
+
+// checkLateOwnedLocked checks a command applied here gaining keys: that
+// can only be from an epoch after the one it executed at (a range this
+// node starts receiving, whose data, the command's writes included, it
+// streams). A key owned by the epoch it executed at would have been
+// applied then, had this node known that epoch: such writes are lost.
+func (s *store) checkLateOwnedLocked(c *command, owned []Key) {
+	then := s.n.ownedIn(c.Keys, c.ID.Epoch, c.ExecuteAt.Epoch)
+	for _, k := range owned {
+		if !slices.Contains(c.owned, k) && slices.ContainsFunc(then, func(o Key) bool { return o == k }) {
+			s.n.metrics.lateOwned.Add(1)
+			return
+		}
 	}
 }
 
@@ -435,15 +453,27 @@ func (s *store) commit(ctx context.Context, r *commitReq) (*commitReply, error) 
 	if !r.Read {
 		return &commitReply{Outcome: ok}, s.unlock()
 	}
-	// Wait until the command can execute; once its writes are known the
-	// outcome is answered instead.
+	// Wait until the command can read: every dependency on the keys this
+	// node reads for it applied (those it is only pending on, whose data
+	// may still be streaming to it, are neither read nor waited for); once
+	// its writes are known the outcome is answered instead.
+	var readKeys []Key
+	var skipped []TxnID
 	for {
 		if c.Status >= PreApplied && c.Status != Invalidated {
 			rep := &commitReply{Outcome: ok, Applied: true, Writes: c.Writes, Result: c.Result}
 			return rep, s.unlock()
 		}
-		if c.ready {
-			break
+		var wait <-chan struct{}
+		if c.Status == Stable && s.knowsEpochsLocked(c) {
+			readKeys, skipped = s.n.readOwned(c.Keys, c.ExecuteAt.Epoch), nil
+			id, blocked := s.blockerLocked(c, readKeys, &skipped)
+			if !blocked {
+				break
+			}
+			if d := s.cmds[id]; d != nil {
+				wait = d.changed
+			}
 		}
 		ch := c.changed
 		if err := s.unlock(); err != nil {
@@ -451,22 +481,24 @@ func (s *store) commit(ctx context.Context, r *commitReq) (*commitReply, error) 
 		}
 		select {
 		case <-ch:
+		case <-wait:
+		case <-time.After(50 * time.Millisecond):
 		case <-ctx.Done():
 			return &commitReply{Outcome: notReady}, nil
 		}
 		s.mu.Lock()
 	}
-	if s.missingLocked(c.skipped, c.Keys) {
+	if s.missingLocked(skipped, readKeys) {
 		return &commitReply{Outcome: notReady}, s.unlock()
 	}
 	// The read happens outside the lock: while it runs, the command's own
 	// writes (from another coordinator) are held back (reading), and no
 	// later conflicting transaction applies before them.
 	c.reading++
-	owned, executeAt, txn := slices.Clone(c.owned), c.ExecuteAt, c.Txn
+	executeAt, txn := c.ExecuteAt, c.Txn
 	err := s.unlock()
 	reads := map[string][]byte{}
-	for _, k := range owned {
+	for _, k := range readKeys {
 		if err != nil {
 			break
 		}
@@ -582,37 +614,20 @@ func (s *store) maybeExecuteLocked(c *command) {
 	if c.Status != Stable && c.Status != PreApplied || c.executing {
 		return
 	}
+	// Not before this node knows the epochs it was planned and executes
+	// at: its keys here are those it owns then (SetTopology rescans).
+	if !s.knowsEpochsLocked(c) {
+		return
+	}
 	if !c.ready {
-		for _, k := range c.owned {
-			ks := keyString(k)
-			for _, id := range c.Deps[ks] {
-				d := s.cmds[id]
-				if d != nil {
-					switch {
-					case d.Status == Applied || d.Status == Invalidated || d.Status == Truncated:
-						continue
-					case d.Status.decided() && c.ExecuteAt.Less(d.ExecuteAt) && (c.Txn == nil || c.Txn.Kind != SyncPoint):
-						continue // it executes after this one (a sync point waits for every dependency)
-					}
+		if id, blocked := s.blockerLocked(c, c.owned, &c.skipped); blocked {
+			if c.blockedOn == nil || *c.blockedOn != id {
+				c.blockedOn, c.blockedSince = &id, s.n.cfg.Now()
+				if !slices.Contains(s.waiters[id], c.ID) {
+					s.waiters[id] = append(s.waiters[id], c.ID)
 				}
-				if (d == nil || d.Status < PreAccepted) && id.Timestamp.Less(boundFor(s.redundant, k)) {
-					continue // forgotten: durable
-				}
-				if (d == nil || d.Status < PreAccepted) && id.Timestamp.Less(boundFor(s.bootstrapped, k)) {
-					if !slices.Contains(c.skipped, id) {
-						c.skipped = append(c.skipped, id)
-					}
-					continue
-				}
-				if c.blockedOn == nil || *c.blockedOn != id {
-					idc := id
-					c.blockedOn, c.blockedSince = &idc, s.n.cfg.Now()
-					if !slices.Contains(s.waiters[id], c.ID) {
-						s.waiters[id] = append(s.waiters[id], c.ID)
-					}
-				}
-				return
 			}
+			return
 		}
 		c.ready, c.blockedOn = true, nil
 		close(c.changed)
@@ -623,6 +638,45 @@ func (s *store) maybeExecuteLocked(c *command) {
 	}
 	c.executing = true
 	go s.applyWrites(c.ID, c.Txn, c.ExecuteAt, c.owned, c.Writes)
+}
+
+// knowsEpochsLocked reports whether this node knows the epochs a command
+// was planned and executes at.
+func (s *store) knowsEpochsLocked(c *command) bool {
+	return max(c.ID.Epoch, c.ExecuteAt.Epoch) <= s.n.epoch()
+}
+
+// blockerLocked returns a dependency on keys that a command still waits
+// for, if any: one that executes earlier and has not applied here.
+// Dependencies from before this node received the keys' data (its
+// bootstrap point) are added to skipped instead: they need not apply here,
+// but a read waits until they are known.
+func (s *store) blockerLocked(c *command, keys []Key, skipped *[]TxnID) (TxnID, bool) {
+	for _, k := range keys {
+		ks := keyString(k)
+		for _, id := range c.Deps[ks] {
+			d := s.cmds[id]
+			if d != nil {
+				switch {
+				case d.Status == Applied || d.Status == Invalidated || d.Status == Truncated:
+					continue
+				case d.Status.decided() && c.ExecuteAt.Less(d.ExecuteAt) && (c.Txn == nil || c.Txn.Kind != SyncPoint):
+					continue // it executes after this one (a sync point waits for every dependency)
+				}
+			}
+			if (d == nil || d.Status < PreAccepted) && id.Timestamp.Less(boundFor(s.redundant, k)) {
+				continue // forgotten: durable
+			}
+			if (d == nil || d.Status < PreAccepted) && id.Timestamp.Less(boundFor(s.bootstrapped, k)) {
+				if !slices.Contains(*skipped, id) {
+					*skipped = append(*skipped, id)
+				}
+				continue
+			}
+			return id, true
+		}
+	}
+	return TxnID{}, false
 }
 
 // applyWrites applies a ready command's writes, then marks it Applied.

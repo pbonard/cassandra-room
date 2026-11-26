@@ -73,9 +73,10 @@ func (p *proxy) bootstrap() error {
 	// transaction before it (later ones reach this node as a pending
 	// replica), and this node does not wait for the earlier ones it never
 	// saw.
-	// It is best effort: when a range has no quorum (a replica being
-	// replaced at RF 2), this node instead fetches the earlier transactions
-	// it does not know before using them.
+	// It must succeed (else the join fails, and can be retried), except
+	// where a range has no live quorum (a replica being replaced at RF 2):
+	// no Accord transaction can commit there meanwhile, and this node
+	// fetches the earlier transactions it does not know before using them.
 	if p.accord != nil && !cur.Empty() {
 		// The point is only valid where the data comes from: every live
 		// current replica it may be streamed from must apply it.
@@ -95,8 +96,11 @@ func (p *proxy) bootstrap() error {
 			}
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		_ = p.accord.Bootstrap(ctx, p.accordOwnedRanges(fut, false), sources...)
+		err := p.accord.Bootstrap(ctx, p.accordOwnedRanges(fut, false), sources...)
 		cancel()
+		if err != nil && !errors.Is(err, accord.ErrUnavailable) {
+			return fmt.Errorf("db: bootstrap: Accord sync point: %w", err)
+		}
 	}
 	future := cluster.NewFutureRing(nodeList(p.d.schema.Load()))
 	for _, t := range p.d.userTables() {
@@ -299,6 +303,14 @@ func (p *proxy) unbootstrap() error {
 	}
 	cur := p.ring.Load()
 	future := cluster.NewFutureRing(nodeList(d.schema.Load()))
+	// Accord: a sync point this node applies before streaming, so that the
+	// data streamed holds every transaction before it (later ones reach
+	// the nodes taking over as pending replicas); they learn it once they
+	// have the data, and then do not wait for the earlier ones.
+	handoff, err := p.accordHandoff(p.gainedAccordRanges(cur, future, func(reps []*cluster.Node) bool { return containsAddr(reps, p.self) }), []string{p.self})
+	if err != nil {
+		return fmt.Errorf("db: decommission: %w", err)
+	}
 	for _, t := range d.userTables() {
 		k := d.schema.Load().Keyspaces[t.Keyspace]
 		for _, r := range cur.Ranges() {
@@ -328,6 +340,7 @@ func (p *proxy) unbootstrap() error {
 			}
 		}
 	}
+	handoff()
 	return p.setStatus("MID_LEAVE", cluster.StatusMidLeave)
 }
 
@@ -657,6 +670,30 @@ func (p *proxy) removeRanges(dead *cluster.Node, op string) error {
 	}
 	cur := p.ring.Load()
 	future := cluster.NewFutureRing(nodeList(d.schema.Load()))
+	// Accord, as for a decommission. The data is streamed from a live
+	// replica of each range: the sync point must have applied at all of
+	// them.
+	var sources []string
+	for _, t := range d.userTables() {
+		k := d.schema.Load().Keyspaces[t.Keyspace]
+		for _, r := range cur.Ranges() {
+			reps := cur.Replicas(k.Replication, r[1])
+			if !slices.ContainsFunc(reps, func(n *cluster.Node) bool { return n.HostID == dead.HostID }) {
+				continue
+			}
+			for _, n := range reps {
+				if n.HostID != dead.HostID && p.up(n) && !slices.Contains(sources, n.Addr) {
+					sources = append(sources, n.Addr)
+				}
+			}
+		}
+	}
+	handoff, err := p.accordHandoff(p.gainedAccordRanges(cur, future, func(reps []*cluster.Node) bool {
+		return slices.ContainsFunc(reps, func(n *cluster.Node) bool { return n.HostID == dead.HostID })
+	}), sources)
+	if err != nil {
+		return fmt.Errorf("db: %s: %w", op, err)
+	}
 	for _, t := range d.userTables() {
 		k := d.schema.Load().Keyspaces[t.Keyspace]
 		for _, r := range cur.Ranges() {
@@ -693,6 +730,7 @@ func (p *proxy) removeRanges(dead *cluster.Node, op string) error {
 			}
 		}
 	}
+	handoff()
 	return p.setNodeStatus("MID_REMOVE", dead.HostID, cluster.StatusMidLeave)
 }
 

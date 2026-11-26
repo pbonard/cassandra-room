@@ -14,7 +14,10 @@ import (
 )
 
 // TestClusterAccordDecommission: transactions keep running while a node
-// leaves; balances are conserved, and every replica converges.
+// leaves; balances are conserved, and every replica converges. The nodes
+// taking over its ranges learn their bootstrap points (the sync point the
+// leaving node applied before streaming), and no transaction applied at
+// them misses a key they owned when it executed.
 func TestClusterAccordDecommission(t *testing.T) {
 	c := newTestCluster(t, 3)
 	c.ok(0, quorum, "CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}")
@@ -71,6 +74,13 @@ func TestClusterAccordDecommission(t *testing.T) {
 		total += b
 	}
 	require.Equal(t, accounts*100, total)
+	bootstrapped := 0
+	for i := 0; i < 2; i++ {
+		st := c.nodes[i].proxy.accord.Stats()
+		require.Zero(t, st.LateOwned, "node %d", i)
+		bootstrapped += st.Bootstrapped
+	}
+	require.Positive(t, bootstrapped, "the nodes taking over learnt the points")
 	ring := c.nodes[0].proxy.ring.Load()
 	repl := map[string]string{"class": "SimpleStrategy", "replication_factor": "2"}
 	require.Eventually(t, func() bool {

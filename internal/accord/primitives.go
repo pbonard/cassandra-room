@@ -239,6 +239,9 @@ func (r Range) String() string { return fmt.Sprintf("%x[%d,%d]", r.Prefix, r.Lo,
 type RangeShard struct {
 	Range
 	Nodes []NodeID
+	// Pending are the nodes the range is moving to or from, beyond Nodes
+	// (they receive its writes without voting).
+	Pending []NodeID
 }
 
 // bound is a timestamp over a range: a sync point's barrier, or the

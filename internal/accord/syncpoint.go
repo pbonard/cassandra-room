@@ -216,7 +216,7 @@ func (n *Node) syncPoint(ctx context.Context, ranges []Range, universal bool, mu
 			deps = deps.with(rep.reply.Deps)
 		}
 		if tr.impossible() {
-			return TxnID{}, ErrTimeout
+			return TxnID{}, ErrUnavailable
 		}
 	}
 	if !tr.done() {
@@ -412,6 +412,11 @@ func (s *store) setBootstrapped(pts BootstrapPoints) error {
 	if !changed {
 		s.mu.Unlock()
 		return nil
+	}
+	// Commands waiting on dependencies the point makes unnecessary (from
+	// before the data this node received) can execute now.
+	for _, c := range s.cmds {
+		s.maybeExecuteLocked(c)
 	}
 	// One fixed id (no real command has it), so the record replaces any
 	// earlier bootstrap record.
