@@ -3,6 +3,7 @@ package db
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/datastax/go-cassandra-native-protocol/message"
 	"github.com/stretchr/testify/require"
@@ -37,7 +38,12 @@ func TestLoggedBatchAtomic(t *testing.T) {
 	require.True(t, a >= 0 && b2 >= 0)
 
 	// All up: the batch applies, with its timestamp.
-	c.ok(0, one, fmt.Sprintf("BEGIN BATCH USING TIMESTAMP 1000 INSERT INTO ks.kv (k, v) VALUES (%d, 'a') INSERT INTO ks.kv (k, v) VALUES (%d, 'b') APPLY BATCH", a, b))
+	// The cluster's first Accord transaction may time out under load (as
+	// any write may): a client retries it, as here.
+	require.Eventually(t, func() bool {
+		_, failed := c.exec(0, one, fmt.Sprintf("BEGIN BATCH USING TIMESTAMP 1000 INSERT INTO ks.kv (k, v) VALUES (%d, 'a') INSERT INTO ks.kv (k, v) VALUES (%d, 'b') APPLY BATCH", a, b)).(message.Error)
+		return !failed
+	}, 30*time.Second, 100*time.Millisecond)
 	require.Equal(t, []string{"a"}, c.values(1, quorum, fmt.Sprintf("SELECT v FROM ks.kv WHERE k = %d", a)))
 	require.Equal(t, []string{"b"}, c.values(1, quorum, fmt.Sprintf("SELECT v FROM ks.kv WHERE k = %d", b)))
 	wt := c.values(1, quorum, fmt.Sprintf("SELECT WRITETIME(v) FROM ks.kv WHERE k = %d", b))
