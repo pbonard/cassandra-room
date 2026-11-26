@@ -175,6 +175,7 @@ func Open(dir string, opts Options) (*DB, error) {
 	eo.Merger = row.Merger{}
 	eo.Now = opts.Now
 	eo.TableOptions = d.engineTableOptions
+	eo.PartitionPrefix = partitionPrefixLen
 	e, err := lsm.Open(d.fs.PathJoin(dir, "data"), &eo)
 	if err != nil {
 		return nil, err
