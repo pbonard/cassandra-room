@@ -43,14 +43,16 @@ type Server struct {
 	listeners    map[net.Listener]struct{}
 	// tlsConfig encrypts client connections (nil: none); tlsOptional
 	// also accepts unencrypted ones.
-	tlsConfig    *tls.Config
-	tlsOptional  bool
-	conns        map[net.Conn]struct{}
-	closed       bool
-	shuttingDown bool
-	serverCtx    context.Context
-	serverCancel context.CancelFunc
-	connWG       sync.WaitGroup
+	tlsConfig   *tls.Config
+	tlsOptional bool
+	conns       map[net.Conn]struct{}
+	// eventSessions are the sessions registered for events.
+	eventSessions map[*Session]struct{}
+	closed        bool
+	shuttingDown  bool
+	serverCtx     context.Context
+	serverCancel  context.CancelFunc
+	connWG        sync.WaitGroup
 }
 
 // New creates a CQL protocol server executing statements on d.
@@ -60,7 +62,7 @@ func New(d *db.DB) *Server {
 		maxGlobal = 256
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Server{
+	s := &Server{
 		codec:             frame.NewRawCodec(),
 		db:                d,
 		maxStreamsPerConn: DefaultMaxConcurrentStreamsPerConn,
@@ -70,8 +72,38 @@ func New(d *db.DB) *Server {
 		writeTimeout:      DefaultWriteTimeout,
 		listeners:         make(map[net.Listener]struct{}),
 		conns:             make(map[net.Conn]struct{}),
+		eventSessions:     make(map[*Session]struct{}),
 		serverCtx:         ctx,
 		serverCancel:      cancel,
+	}
+	d.OnSchemaChange(s.pushSchemaChanges)
+	return s
+}
+
+// pushSchemaChanges pushes schema changes to the clients registered for
+// SCHEMA_CHANGE events (as each node does for the metadata versions it
+// installs).
+func (s *Server) pushSchemaChanges(evs []*message.SchemaChangeEvent) {
+	s.mu.RLock()
+	sessions := make([]*Session, 0, len(s.eventSessions))
+	for sess := range s.eventSessions {
+		sessions = append(sessions, sess)
+	}
+	s.mu.RUnlock()
+	for _, sess := range sessions {
+		if !sess.registered(primitive.EventTypeSchemaChange) {
+			continue
+		}
+		v := sess.protocolVersion()
+		for _, ev := range evs {
+			if !v.SupportsSchemaChangeTarget(ev.Target) {
+				continue
+			}
+			// Stream -1: an event, not a response.
+			if err := s.writeFrame(sess.conn, sess, frame.NewFrame(v, -1, ev)); err != nil {
+				break
+			}
+		}
 	}
 }
 
@@ -209,7 +241,12 @@ func (s *Server) serveConn(conn net.Conn) error {
 		s.connWG.Done()
 	}()
 
-	session := &Session{}
+	session := &Session{conn: conn}
+	defer func() {
+		s.mu.Lock()
+		delete(s.eventSessions, session)
+		s.mu.Unlock()
+	}()
 	reader := bufioReaderPool.Get().(*bufio.Reader)
 	reader.Reset(conn)
 	defer func() {
