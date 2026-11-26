@@ -41,9 +41,11 @@ func Moving(status string) bool {
 //
 // then NORMAL (or LEFT): new only. Old owners are NORMAL, LEAVING and
 // MID_LEAVE nodes, new owners NORMAL, JOINING and MID_JOIN ones (less the
-// nodes they replace). Between two steps, every live node learns the
-// first before the second is committed (a progress barrier), so reads at
-// any step meet the writes at any neighbouring step.
+// nodes they replace). Before the next step is committed, a quorum of
+// each moving range's replicas know the step, and refuse requests planned
+// with older placements (a progress barrier, and epoch fencing): the
+// requests that succeed are at most one step apart, so reads at any step
+// meet the writes at any neighbouring step.
 
 // Node is a node as the cluster metadata describes it (Directory): its
 // addresses, location, tokens and state.

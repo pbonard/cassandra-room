@@ -93,6 +93,9 @@ type Messaging struct {
 	ln       net.Listener
 	handlers [numVerbs]Handler
 	opts     MessagingOptions
+	// blocked, in tests, fails the verbs it reports, sent and received,
+	// as if the node were cut off for them.
+	blocked atomic.Pointer[func(Verb) bool]
 
 	mu      sync.Mutex
 	conns   map[outKey]*outConn
@@ -728,7 +731,27 @@ func (m *Messaging) handler(v Verb) Handler {
 	if v >= numVerbs {
 		return nil
 	}
+	if m.isBlocked(v) {
+		return func(context.Context, string, []byte) ([]byte, error) {
+			return nil, fmt.Errorf("cluster: verb %d blocked (test)", v)
+		}
+	}
 	return m.handlers[v]
+}
+
+// SetBlocked, in tests, makes the verbs f reports fail, sent and received
+// (nil: none).
+func (m *Messaging) SetBlocked(f func(Verb) bool) {
+	if f == nil {
+		m.blocked.Store(nil)
+		return
+	}
+	m.blocked.Store(&f)
+}
+
+func (m *Messaging) isBlocked(v Verb) bool {
+	f := m.blocked.Load()
+	return f != nil && (*f)(v)
 }
 
 // dropCount counts a dropped request of a verb (unknown ones not).
@@ -955,6 +978,9 @@ func (e errNotSent) Error() string { return e.err.Error() }
 func (e errNotSent) Unwrap() error { return e.err }
 
 func (m *Messaging) request(ctx context.Context, to string, verb Verb, kind byte, payload []byte) ([]byte, error) {
+	if to != m.addr && m.isBlocked(verb) {
+		return nil, errNotSent{fmt.Errorf("cluster: verb %d blocked (test)", verb)}
+	}
 	if to == m.addr {
 		h := m.handler(verb)
 		if h == nil {

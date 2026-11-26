@@ -246,14 +246,28 @@ container to set per-pod flags.
   | read   | old       | new       | old       | new       |
   | write  | old + new | old + new | old + new | old + new |
 
+  **Epoch fencing**: a coordinator tags each request to a replica
+  (mutations, counter updates, row, digest and range reads, read repairs)
+  with the epoch of the placements it planned it with. A replica refuses a
+  request planned before its own placements last changed; the
+  coordinator, refused, catches up with the log from that replica and
+  plans the request again (up to 3 times; refused replicas get no hints,
+  and counter deltas are only sent again to the leader that refused them,
+  which applied nothing). Hints and streaming are not fenced.
+
   After each commit the node driving the movement runs a **progress
-  barrier**: every live node must reach the epoch (`VerbMetadataSync`),
-  then it waits out the read and write timeouts so requests coordinated
-  with the placements before it are over. So coordinators are never more
-  than one step apart, and a quorum read at any step meets a quorum write
-  at any neighbouring one (jumping from old reads to new ones in one
-  step, as before, does not). Down nodes are not waited for: they catch
-  up with the log before serving.
+  barrier**: for every range whose owners change, enough of its old owners
+  and of its new ones (in each data center, under
+  NetworkTopologyStrategy) reach the epoch (`VerbMetadataSync`) and finish
+  the requests they admitted before it, that any quorum of them includes
+  one: n − (RF/2 + 1) + 1 of n. A node that does not answer is not
+  skipped (a node cut off or paused, not only a crashed one, may come
+  back), it just need not be one of them. From then on no request
+  planned before the step reaches a quorum, however late it arrives, so
+  the requests that succeed are at most one step apart, and a quorum read
+  at any step meets a quorum write at any neighbouring one (jumping from
+  old reads to new ones in one step, as before, does not). A barrier
+  takes a round trip, not a wait for request timeouts.
 - **One movement at a time** (TCM's locked ranges, for the whole ring):
   starting a join, a replace, a decommission or a removenode is refused
   while another node is in one of these states. A joining or replacing
@@ -311,10 +325,10 @@ container to set per-pod flags.
   in the metadata (TCM records it so any node can finish it).
 - Range movements: the lock is the whole ring, not the ranges moved (TCM
   locks only those, so movements of disjoint ranges run together); a
-  movement whose node is gone for good cannot be cancelled; the barrier waits for every live
-  node rather than a quorum of each range's replicas, and replicas do not
-  check a request's epoch (TCM refuses requests from coordinators behind
-  the replica's placements, which makes the drain wait unnecessary).
+  movement whose node is gone for good cannot be cancelled. Fencing is by
+  the epoch the node's placements last changed at, for every range (TCM
+  refuses only requests for the ranges whose placements changed), and a
+  replica behind a coordinator does not catch up from it on the spot.
 - Repair is full repair only (no incremental repair); streaming sends
   files through messages (no sendfile).
 
@@ -336,8 +350,12 @@ bootstrap streaming, repair of divergent replicas and decommission.
 intersect at every pair of neighbouring steps of a join, a leave and a
 replace, and fail to when a step is skipped;
 `internal/db/transitions_test.go` checks the steps' commits, that the
-barrier waits for every node, and that a second movement waits or is
-refused. The
+barrier waits for the nodes, and that a second movement waits or is
+refused; `internal/db/fence_test.go` checks the fence, the barrier's
+quorums, and a node cut off from the log during a join: the join does not
+wait for it, its writes and reads with the old placements are refused
+(they succeed without fencing), and once reconnected it catches up when
+refused and its requests succeed. The
 gocql test runs three nodes on 127.0.0.1-3 and checks token-aware routing
 to all of them. Three real processes were also checked with cqlsh: QUORUM
 with one node killed, Unavailable at ALL, hint delivery on restart, and

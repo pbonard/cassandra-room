@@ -40,6 +40,10 @@ type CMS struct {
 	// or acceptance is answered (TCM keeps it in system tables): a member
 	// that restarts must not forget what it promised.
 	persist func([]byte) error
+	// synced, if set, answers a sync once the node has caught up: the epoch
+	// it reached, once the requests planned before its placements are done
+	// (a progress barrier's acknowledgement).
+	synced func(ctx context.Context) (int64, error)
 	// catchingUp serializes catching up.
 	catchingUp sync.Mutex
 }
@@ -279,16 +283,29 @@ func (c *CMS) handlePush(_ context.Context, from string, payload []byte) ([]byte
 // handleSync catches up from the node named in the request and returns
 // the epoch reached: a node about to join the metadata service is brought
 // up to date first.
-func (c *CMS) handleSync(_ context.Context, _ string, payload []byte) ([]byte, error) {
+func (c *CMS) handleSync(ctx context.Context, _ string, payload []byte) ([]byte, error) {
 	if err := c.CatchUp(string(payload)); err != nil {
 		return nil, err
+	}
+	if c.synced != nil {
+		e, err := c.synced(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(e)
 	}
 	return json.Marshal(c.epoch())
 }
 
+// SetSynced sets what answers a sync once caught up (see CMS.synced).
+func (c *CMS) SetSynced(f func(ctx context.Context) (int64, error)) { c.synced = f }
+
 // Sync asks node to catch up from this one, and returns its epoch.
 func (c *CMS) Sync(ctx context.Context, node string) (int64, error) {
 	if node == c.self {
+		if c.synced != nil {
+			return c.synced(ctx)
+		}
 		return c.epoch(), nil
 	}
 	b, err := c.m.Request(ctx, node, VerbMetadataSync, []byte(c.self))
