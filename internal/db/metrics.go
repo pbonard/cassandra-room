@@ -216,7 +216,7 @@ func collectStruct(ch chan<- prometheus.Metric, prefix string, v any) {
 }
 
 // gaugeFields are the stats that are levels, not counts of events.
-var gaugeFields = map[string]bool{"Commands": true, "Keys": true, "Barriers": true, "Redundant": true, "Epoch": true, "SyncedEpoch": true}
+var gaugeFields = map[string]bool{"Commands": true, "Keys": true, "Barriers": true, "Redundant": true, "Bootstrapped": true, "Epoch": true, "SyncedEpoch": true}
 
 func snake(s string) string {
 	var b strings.Builder

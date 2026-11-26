@@ -1171,7 +1171,7 @@ func accordStatRows(d *DB) []map[string][]byte {
 		{"majority_rounds", st.MajorityRounds}, {"journal_errors", st.JournalErrors}, {"persist_shed", st.PersistShed},
 		{"epoch_syncs", st.EpochSyncs},
 		{"commands", int64(st.Commands)}, {"keys", int64(st.Keys)}, {"barriers", int64(st.Barriers)},
-		{"redundant_bounds", int64(st.Redundant)}, {"epoch", st.Epoch}, {"synced_epoch", st.SyncedEpoch},
+		{"redundant_bounds", int64(st.Redundant)}, {"bootstrapped_ranges", int64(st.Bootstrapped)}, {"epoch", st.Epoch}, {"synced_epoch", st.SyncedEpoch},
 	} {
 		out = append(out, map[string][]byte{"name": textV(kv.name), "value": bigintV(kv.v)})
 	}
@@ -1230,24 +1230,93 @@ func (p *proxy) accordOwnedRanges(ring *cluster.Ring, primary bool) []accord.Ran
 		if k == nil {
 			continue
 		}
-		prefix := string(binary.BigEndian.AppendUint64(nil, uint64(t.Storage)))
+		prefix := accordPrefix(t.Storage)
 		for _, r := range ring.Ranges() {
 			reps := ring.Replicas(k.Replication, r[1])
 			if primary && (len(reps) == 0 || reps[0].Addr != p.self) || !primary && !containsAddr(reps, p.self) {
 				continue
 			}
-			// (start, end]: a range wrapping around the token space is two.
-			if r[0] < r[1] {
-				out = append(out, accord.Range{Prefix: prefix, Lo: r[0] + 1, Hi: r[1]})
-				continue
-			}
-			if r[0] < math.MaxInt64 {
-				out = append(out, accord.Range{Prefix: prefix, Lo: r[0] + 1, Hi: math.MaxInt64})
-			}
-			out = append(out, accord.Range{Prefix: prefix, Lo: math.MinInt64, Hi: r[1]})
+			out = append(out, accordRangesOf(prefix, r)...)
 		}
 	}
 	return out
+}
+
+// accordRangesOf returns the Accord ranges of a ring range (start, end] of
+// a table (its prefix): a range wrapping around the token space is two.
+func accordRangesOf(prefix string, r [2]int64) []accord.Range {
+	if r[0] < r[1] {
+		return []accord.Range{{Prefix: prefix, Lo: r[0] + 1, Hi: r[1]}}
+	}
+	var out []accord.Range
+	if r[0] < math.MaxInt64 {
+		out = append(out, accord.Range{Prefix: prefix, Lo: r[0] + 1, Hi: math.MaxInt64})
+	}
+	return append(out, accord.Range{Prefix: prefix, Lo: math.MinInt64, Hi: r[1]})
+}
+
+// accordPrefix is a table's prefix in Accord keys and ranges.
+func accordPrefix(id lsm.TableID) string {
+	return string(binary.BigEndian.AppendUint64(nil, uint64(id)))
+}
+
+// gainedAccordRanges returns, per node, the Accord ranges of the user
+// tables it replicates in future and not in cur, among the ranges whose
+// current replicas from selects (a leaving or removed node's ranges).
+func (p *proxy) gainedAccordRanges(cur, future *cluster.Ring, from func(reps []*cluster.Node) bool) map[string][]accord.Range {
+	s := p.d.schema.Load()
+	out := map[string][]accord.Range{}
+	for _, t := range p.d.userTables() {
+		k := s.Keyspaces[t.Keyspace]
+		if k == nil {
+			continue
+		}
+		for _, r := range cur.Ranges() {
+			reps := cur.Replicas(k.Replication, r[1])
+			if !from(reps) {
+				continue
+			}
+			for _, n := range future.Replicas(k.Replication, r[1]) {
+				if !slices.ContainsFunc(reps, func(c *cluster.Node) bool { return c.HostID == n.HostID }) {
+					out[n.Addr] = append(out[n.Addr], accordRangesOf(accordPrefix(t.Storage), r)...)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// accordHandoff takes Accord's bootstrap points of the ranges nodes take
+// over (before their data is streamed to them), and returns what tells them
+// once it is (Accord's bootstrap for nodes that do not stream themselves:
+// they then do not wait for the transactions before the points, which the
+// streamed data holds). Best effort, as a join's bootstrap: without the
+// points, the nodes fetch the earlier transactions they lack.
+func (p *proxy) accordHandoff(gained map[string][]accord.Range) (done func()) {
+	if p.accord == nil || len(gained) == 0 {
+		return func() {}
+	}
+	var all []accord.Range
+	for _, rs := range gained {
+		for _, r := range rs {
+			if !slices.Contains(all, r) {
+				all = append(all, r)
+			}
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	pts, err := p.accord.BootstrapPoints(ctx, all)
+	cancel()
+	if err != nil {
+		return func() {}
+	}
+	return func() {
+		for addr, rs := range gained {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = p.accord.SendBootstrapped(ctx, accord.NodeID(addr), pts.For(rs))
+			cancel()
+		}
+	}
 }
 
 // accordTableRanges are the whole token ranges of the user tables.

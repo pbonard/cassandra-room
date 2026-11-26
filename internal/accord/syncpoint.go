@@ -285,16 +285,41 @@ func (n *Node) durability() {
 }
 
 // Bootstrap takes a sync point applied at every replica of each range, for
-// a node about to stream the ranges' data: the data then holds every
-// transaction before the sync points, and this node does not wait for
+// this node about to stream the ranges' data: the data then holds every
+// transaction on a range before its point, and this node does not wait for
 // those it does not know (reads still fetch them first).
 func (n *Node) Bootstrap(ctx context.Context, ranges []Range) error {
-	var at Timestamp
+	pts, err := n.BootstrapPoints(ctx, ranges)
+	if err != nil {
+		return err
+	}
+	return n.s.setBootstrapped(pts)
+}
+
+// BootstrapPoints are sync points over ranges, one per range.
+type BootstrapPoints []bound
+
+// For returns the points of ranges (each one of those taken).
+func (b BootstrapPoints) For(ranges []Range) BootstrapPoints {
+	var out BootstrapPoints
+	for _, p := range b {
+		if slices.Contains(ranges, p.R) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// BootstrapPoints takes a sync point over each range, applied at every
+// replica if they all answer in time, otherwise (a replica is down, as when
+// replacing or removing it) at a quorum: the transactions some streaming
+// source may lack are then fetched before a node reads them. Ranges'
+// data streamed after their points holds every transaction before them;
+// the nodes receiving it learn so with SendBootstrapped (or Bootstrap for
+// this node).
+func (n *Node) BootstrapPoints(ctx context.Context, ranges []Range) (BootstrapPoints, error) {
+	var out BootstrapPoints
 	for _, r := range ranges {
-		// Applied at every replica if they all answer in time; otherwise
-		// (a replica is down, as when replacing it) at a quorum: the
-		// transactions some streaming source may lack are then fetched
-		// before this node reads them.
 		uctx, cancel := context.WithTimeout(ctx, 4*n.cfg.RequestTimeout)
 		id, err := n.SyncPoint(uctx, r, true)
 		cancel()
@@ -302,26 +327,46 @@ func (n *Node) Bootstrap(ctx context.Context, ranges []Range) error {
 			id, err = n.SyncPoint(ctx, r, false)
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
-		at = maxTimestamp(at, id.Timestamp)
+		out = append(out, bound{R: r, TS: id.Timestamp})
 	}
-	return n.s.setBootstrapped(at)
+	return out, nil
+}
+
+type bootstrappedReq struct {
+	Points BootstrapPoints
+}
+
+// SendBootstrapped tells a node it received the data of ranges as of their
+// bootstrap points (a node taking over ranges a leaving or removed node
+// held, streamed to it by another).
+func (n *Node) SendBootstrapped(ctx context.Context, to NodeID, pts BootstrapPoints) error {
+	if len(pts) == 0 {
+		return nil
+	}
+	return n.send(ctx, to, mBootstrapped, &bootstrappedReq{Points: pts}, nil)
 }
 
 var bootstrapRecordID = TxnID{Timestamp: Timestamp{Node: "~bootstrap"}, Kind: SyncPoint}
 
-// setBootstrapped records the bootstrap point, durably.
-func (s *store) setBootstrapped(at Timestamp) error {
+// setBootstrapped records bootstrap points, durably.
+func (s *store) setBootstrapped(pts BootstrapPoints) error {
 	s.mu.Lock()
-	if prev := s.n.bootstrapped.Load(); prev != nil && !prev.Less(at) {
+	changed := false
+	for _, p := range pts {
+		if !slices.ContainsFunc(s.bootstrapped, func(b bound) bool { return b.R == p.R && !b.TS.Less(p.TS) }) {
+			s.bootstrapped = addBound(s.bootstrapped, p.R, p.TS)
+			changed = true
+		}
+	}
+	if !changed {
 		s.mu.Unlock()
 		return nil
 	}
-	s.n.bootstrapped.Store(&at)
 	// One fixed id (no real command has it), so the record replaces any
 	// earlier bootstrap record.
-	rec := &Command{ID: bootstrapRecordID, ExecuteAt: at, Bootstrap: true}
+	rec := &Command{ID: bootstrapRecordID, Bootstrap: true, Bounds: slices.Clone(s.bootstrapped)}
 	s.bootstrapRec = rec
 	if s.gc != nil {
 		b, err := json.Marshal(rec)

@@ -166,9 +166,22 @@ names, not its class structure.
     below its bound is forgotten; the barrier refuses anything it would
     have ordered.
 - **Joining nodes** (`Bootstrap`): before streaming, a joining node takes a
-  sync point over the ranges it will own in every table, applied at every
+  sync point over each range it will own in every table, applied at every
   current replica (or at a quorum when one is down, as when replacing it).
-  - **Persisted:** the bootstrap point is journaled and restored on
+  - **Per range:** a node keeps one bootstrap point per range it received
+    (the store's `bootstrapped` bounds), not one for the node. It only skips
+    unknown dependencies where its data reflects them: on a range it
+    replicated all along, it waits for each one. A single node-wide point,
+    raised by a later bootstrap, let a transaction on such a range execute,
+    and read, before a dependency's writes had applied there.
+  - **Leaving and removed nodes' ranges** (`BootstrapPoints`,
+    `SendBootstrapped`): the node driving a decommission or removenode
+    takes the sync points of the ranges the other nodes take over, after
+    the movement's first barrier and before streaming them their data. Once
+    streamed, it sends each node the points of its ranges. Best effort, as
+    a join's: a node without them fetches the earlier transactions it
+    lacks.
+  - **Persisted:** the bootstrap points are journaled and restored on
     restart.
   - **Streamed data:** it then holds every transaction before the sync
     point; later ones reach the node as a pending replica, since writes go
@@ -332,11 +345,19 @@ names, not its class structure.
   - durability rounds every 300 ms under message loss (all checks hold,
     records forgotten, late messages refused);
   - bootstrap at a sync point, kept across a restart;
+  - per-range bootstrap points: a later bootstrap leaves earlier ranges'
+    points alone, and points sent by another node are kept across a
+    restart;
+  - an unknown earlier dependency skipped on a bootstrapped range and
+    waited for on another;
   - majority durability with a replica down, and its catching up.
 - `internal/accord/review_test.go`: recovery across epochs, a `Truncated`
   outcome, and ephemeral reads retried at a newer epoch.
 - `TestTransactionSchemaPinned` (`internal/db`): a table changed under a
   transaction.
+- `TestClusterAccordDecommission` (`internal/db`): transfers while a node
+  leaves; the nodes taking over its ranges get their bootstrap points,
+  balances are conserved, and the replicas converge.
 - `TestPrivilegedRestrictions`: the two cassandra-accord `fc4a769`
   restrictions.
 - `internal/db` cluster tests:
