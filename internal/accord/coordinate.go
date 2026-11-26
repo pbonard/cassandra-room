@@ -223,7 +223,7 @@ func (n *Node) propose(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 	req := &acceptReq{ID: id, Ballot: ballot, ExecuteAt: executeAt, Deps: deps, Txn: txn, Keys: txn.Keys, NoDeps: medium}
 	ch := broadcast[acceptReply](ctx, n, ts.nodes(), mAccept, func(NodeID) any { return req })
 	tr := newTracker(ts, (*Shard).slowQuorum)
-	merged := Deps{}
+	merged := deps.with(nil)
 	for pending := len(ts.nodes()); pending > 0 && !tr.done(); pending-- {
 		var r response[acceptReply]
 		select {
@@ -278,6 +278,7 @@ func (n *Node) execute(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 	stable := commit(true)
 	reads := map[string][]byte{}
 	readers := map[NodeID]bool{}
+	uniqueHLC := executeAt.HLC
 	var applied *commitReply
 	// A reply's reads count only for keys its replica reads for (a
 	// replica of several shards answers them all at once).
@@ -310,6 +311,7 @@ func (n *Node) execute(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 				continue
 			}
 			readers[to] = true
+			uniqueHLC = max(uniqueHLC, rep.MinHLC)
 			if rep.Applied {
 				applied = &rep
 			}
@@ -335,9 +337,12 @@ func (n *Node) execute(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 	if applied != nil {
 		// A replica already applied it (a recovery completed it first).
 		writes, result = applied.Writes, applied.Result
+		uniqueHLC = max(executeAt.HLC, applied.UniqueHLC)
 	} else {
+		writeAt := Timestamp{Epoch: executeAt.Epoch, HLC: uniqueHLC, Node: executeAt.Node}
+		n.clock.Observe(uniqueHLC)
 		var err error
-		writes, result, err = n.cfg.Agent.Execute(txn, executeAt, reads)
+		writes, result, err = n.cfg.Agent.Execute(txn, writeAt, reads)
 		if err != nil {
 			return nil, err
 		}
@@ -346,7 +351,7 @@ func (n *Node) execute(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 	if err != nil {
 		return nil, err
 	}
-	return result, n.persist(ctx, ats, id, txn, executeAt, deps, writes, result)
+	return result, n.persist(ctx, ats, id, txn, executeAt, uniqueHLC, deps, writes, result)
 }
 
 // applyTopologies are the replicas a transaction's writes go to: those of
@@ -362,8 +367,8 @@ func (n *Node) applyTopologies(ctx context.Context, keys []Key, id TxnID, execut
 // persist applies the outcome at every replica, returning once a quorum
 // of every shard has applied it; the rest continues in the background, and
 // once every replica has applied it they are told it is durable.
-func (n *Node) persist(ctx context.Context, ts *Topologies, id TxnID, txn *Txn, executeAt Timestamp, deps Deps, writes Writes, result []byte) error {
-	req := &applyReq{ID: id, ExecuteAt: executeAt, Deps: deps, Txn: txn, Writes: writes, Result: result}
+func (n *Node) persist(ctx context.Context, ts *Topologies, id TxnID, txn *Txn, executeAt Timestamp, uniqueHLC int64, deps Deps, writes Writes, result []byte) error {
+	req := &applyReq{ID: id, ExecuteAt: executeAt, UniqueHLC: uniqueHLC, Deps: deps, Txn: txn, Writes: writes, Result: result}
 	nodes := ts.applyNodes()
 	ch := broadcast[applyReply](context.Background(), n, nodes, mApply, func(NodeID) any { return req })
 	tr := newTracker(ts, (*Shard).slowQuorum)
@@ -489,7 +494,7 @@ func (n *Node) awaitOutcome(ctx context.Context, id TxnID, keys []Key) ([]byte, 
 				// reads do not).
 				ats, err := n.applyTopologies(ctx, keys, id, rep.ExecuteAt)
 				if err == nil {
-					err = n.persist(ctx, ats, id, rep.Txn, rep.ExecuteAt, rep.Deps, rep.Writes, rep.Result)
+					err = n.persist(ctx, ats, id, rep.Txn, rep.ExecuteAt, rep.UniqueHLC, rep.Deps, rep.Writes, rep.Result)
 				}
 				if err != nil {
 					return nil, err
@@ -576,7 +581,7 @@ func (n *Node) recover(ctx context.Context, id TxnID, txn *Txn, keys []Key) erro
 		if err != nil {
 			return err
 		}
-		return n.persist(ctx, ats, id, txn, best.ExecuteAt, best.Deps, best.Writes, best.Result)
+		return n.persist(ctx, ats, id, txn, best.ExecuteAt, best.UniqueHLC, best.Deps, best.Writes, best.Result)
 	case best.Status == Stable || best.Status == Committed:
 		_, err := n.execute(ctx, ballot, id, txn, best.ExecuteAt, best.Deps)
 		return err
@@ -868,7 +873,7 @@ func (n *Node) fetch(ctx context.Context, id TxnID, keys []Key) bool {
 			go func() {
 				actx, cancel := context.WithTimeout(context.Background(), n.recoveryTimeout())
 				defer cancel()
-				_, _ = n.s.apply(actx, &applyReq{ID: id, ExecuteAt: rep.ExecuteAt, Deps: rep.Deps, Txn: rep.Txn, Writes: rep.Writes, Result: rep.Result})
+				_, _ = n.s.apply(actx, &applyReq{ID: id, ExecuteAt: rep.ExecuteAt, UniqueHLC: rep.UniqueHLC, Deps: rep.Deps, Txn: rep.Txn, Writes: rep.Writes, Result: rep.Result})
 			}()
 			return true
 		case rep.Status == Stable && rep.Txn != nil:

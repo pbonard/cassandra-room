@@ -263,10 +263,12 @@ type RangeShard struct {
 }
 
 // bound is a timestamp over a range: a sync point's barrier, or the
-// redundancy bound it established.
+// redundancy bound it established. MaxHLC, on a bootstrap bound, is the
+// largest HLC applied at the source replicas before streaming.
 type bound struct {
-	R  Range
-	TS Timestamp
+	R      Range
+	TS     Timestamp
+	MaxHLC int64 `json:"m,omitempty"`
 }
 
 // boundFor returns the largest bound covering a key.
@@ -280,13 +282,29 @@ func boundFor(bs []bound, k Key) Timestamp {
 	return m
 }
 
+// boundMaxHLC returns the largest HLC bound covering a key.
+func boundMaxHLC(bs []bound, k Key) int64 {
+	var m int64
+	for _, b := range bs {
+		if b.R.contains(k) {
+			m = max(m, b.TS.HLC, b.MaxHLC)
+		}
+	}
+	return m
+}
+
 // addBound records a bound, keeping the largest per range.
 func addBound(bs []bound, r Range, ts Timestamp) []bound {
+	return addBootstrapBound(bs, bound{R: r, TS: ts})
+}
+
+func addBootstrapBound(bs []bound, nb bound) []bound {
 	for i := range bs {
-		if bs[i].R == r {
-			bs[i].TS = maxTimestamp(bs[i].TS, ts)
+		if bs[i].R == nb.R {
+			bs[i].TS = maxTimestamp(bs[i].TS, nb.TS)
+			bs[i].MaxHLC = max(bs[i].MaxHLC, nb.MaxHLC)
 			return bs
 		}
 	}
-	return append(bs, bound{r, ts})
+	return append(bs, nb)
 }

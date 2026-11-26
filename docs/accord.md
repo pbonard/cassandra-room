@@ -124,12 +124,21 @@ names, not its class structure.
     made it a pending replica of a key applied the transaction without
     that key, and the write was lost there once it learnt the epoch.
   - **HLC order:** transactions execute in timestamp order (epoch
-    first), but their writes are cells timestamped with the HLC alone. An
-    execution timestamp therefore exceeds every conflicting one its
-    replicas witnessed in HLC too (`mergeMax`, as upstream's
-    `Timestamp.mergeMax`): with only the largest timestamp kept per key, a
-    transaction of a newer epoch could execute after one of an older epoch
-    at a lower HLC, and its writes lost to the older one's.
+    first, then HLC, then node), while their writes are cells timestamped
+    with an HLC alone. Two mechanisms keep the written cells in execution
+    order without changing the SSTable cell format:
+    1. An execution timestamp exceeds every conflicting one its replicas
+       witnessed in HLC too (`mergeMax`, as upstream's
+       `Timestamp.mergeMax`).
+    2. When a replica answers a read at execution time, it reports a
+       minimum HLC strictly above every earlier write applied on those
+       keys (and above any streamed bootstrap bound); the coordinator
+       executes and persists with `UniqueHLC = max(ExecuteAt.HLC, MinHLC)`
+       (`TimestampWithUniqueHlc` / `ExecuteTxn` in upstream). This covers
+       both an older-epoch transaction taking the slow path at a higher
+       HLC after a newer-epoch fast-path transaction committed, and two
+       slow-path transactions across shards proposing the same microsecond
+       HLC on different nodes.
   - **Late ownership** (`late_owned`): a transaction applied here that
     gains a key this node owned at the epoch it executed at is counted.
     Gaining keys of a later epoch is normal (a range the node starts
@@ -166,9 +175,10 @@ names, not its class structure.
      replicas (a schema change) needs no sync point.
 - **Durability** (`CoordinateShardDurable`, `RedundantBefore`): each node
   periodically runs a sync point over the ranges it is the first replica
-  of, applied at every replica. It skips ranges with no transaction above
-  their current bound. Each sync point's id then becomes the range's
-  redundancy bound on every replica.
+  of, applied at every replica (pending replicas included). It skips
+  ranges with no transaction above their current bound. Each sync point's
+  id then becomes the range's redundancy bound on every replica and
+  pending replica.
   - **Forgetting:** below the bound, applied and invalidated records are
     forgotten (with their journal records).
   - **Late messages:** a late message about a forgotten transaction is
@@ -405,7 +415,9 @@ names, not its class structure.
   - `moving_test.go`: a replica behind the epoch waits for it before
     applying, reads skip keys a replica is only pending on, pending
     replicas changing a range's epoch sync, bootstrap points waking
-    waiting commands, and late ownership counted;
+    waiting commands, late ownership counted, `UniqueHLC` across epochs
+    and same-HLC ties, `propose` keeping input dependencies, and
+    universal durability sync points waiting for pending replicas;
   - majority durability with a replica down, and its catching up.
 - `internal/accord/review_test.go`: recovery across epochs, a `Truncated`
   outcome, and ephemeral reads retried at a newer epoch.
@@ -425,14 +437,6 @@ names, not its class structure.
     tables reporting them.
 
 ## Not done
-
-- **A rare lost update during decommissions:** `TestClusterAccordDecommission`
-  ends with balances off by 5 in about one run in 50 under the race
-  detector, on main as well (2 in 120); the replicas agree, and
-  `late_owned` is 0. Not found yet.
-- **Durability rounds and pending replicas:** their universal sync points
-  apply at the read replicas only; a pending replica that missed a
-  transaction could adopt the others' redundancy bound and skip it.
 
 - **Range reads:** they are ephemeral, so they form a per-partition
   snapshot, not one across the range. Sync points are the only range

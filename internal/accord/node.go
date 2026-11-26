@@ -431,15 +431,21 @@ type commitReq struct {
 type commitReply struct {
 	Outcome outcome
 	Reads   map[string][]byte
-	// Applied, Writes, Result: the transaction was already applied here.
-	Applied bool
-	Writes  Writes
-	Result  []byte
+	// MinHLC is the lowest write HLC above every earlier transaction
+	// applied on the keys this replica read.
+	MinHLC int64 `json:",omitempty"`
+	// Applied, UniqueHLC, Writes, Result: the transaction was already
+	// applied here.
+	Applied   bool
+	UniqueHLC int64 `json:",omitempty"`
+	Writes    Writes
+	Result    []byte
 }
 
 type applyReq struct {
 	ID        TxnID
 	ExecuteAt Timestamp
+	UniqueHLC int64 `json:",omitempty"`
 	Deps      Deps
 	Txn       *Txn
 	Writes    Writes
@@ -448,6 +454,7 @@ type applyReq struct {
 
 type applyReply struct {
 	Outcome outcome
+	MaxHLC  int64 `json:",omitempty"`
 }
 
 type recoverReq struct {
@@ -462,6 +469,7 @@ type recoverReply struct {
 	Status    Status
 	Accepted  Ballot
 	ExecuteAt Timestamp
+	UniqueHLC int64 `json:",omitempty"`
 	Deps      Deps
 	LocalDeps Deps
 	FastVote  bool
@@ -504,6 +512,7 @@ type checkStatusReply struct {
 	Promised  Ballot
 	Accepted  Ballot
 	ExecuteAt Timestamp
+	UniqueHLC int64 `json:",omitempty"`
 	Deps      Deps
 	Txn       *Txn
 	Keys      []Key
