@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	"github.com/datastax/go-cassandra-native-protocol/message"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
@@ -525,7 +526,35 @@ type iterator interface {
 	Close() error
 }
 
+// rowsReadBackward counts the rows reversed reads read (for tests).
+var rowsReadBackward atomic.Int64
+
+// revIterator reads rows backwards.
+type revIterator interface {
+	SeekLT(key []byte) bool
+	Prev() bool
+	Valid() bool
+	Key() []byte
+	Value() []byte
+	Error() error
+	Close() error
+}
+
+// reverseSource is a source that can read backwards (reversed queries read
+// only the rows they return).
+type reverseSource interface {
+	riter(lo, hi []byte) (revIterator, error)
+}
+
 type engineSource struct{ t *lsm.Table }
+
+func (s engineSource) riter(lo, hi []byte) (revIterator, error) {
+	it, err := s.t.NewReverseIter(lo, hi)
+	if err != nil {
+		return nil, err
+	}
+	return it, nil
+}
 
 func (s engineSource) get(key []byte) ([]byte, error) { return s.t.Get(key) }
 func (s engineSource) iter(lo, hi []byte) (iterator, error) {
@@ -628,6 +657,7 @@ type query struct {
 
 	rows      [][][]byte
 	sortKeys  [][]byte // with sortIN: each row's clustering, as stored
+	inOrder   bool     // rows reach emitRows in output order (read backwards)
 	count     int64    // rows counted for LIMIT
 	agg       *aggState
 	lastKey   []byte
@@ -817,6 +847,14 @@ func (q *query) readPartition(p []byte, pk [][]byte) error {
 		}
 		return q.emitPartition(p, pk, nil, deletions{}, []kv{{p, v}})
 	}
+	if rs, ok := q.src.(reverseSource); ok && q.s.reversed {
+		before := len(q.rows)
+		err := q.readPartitionReversed(rs, p, pk)
+		if !errors.Is(err, errNoReverseReads) || len(q.rows) != before {
+			return err
+		}
+		// A replica of an older version: read forward.
+	}
 	it, err := q.src.iter(append(slices.Clip(p), headerSuffix), append(slices.Clip(p), types.GTNext))
 	if err != nil {
 		return err
@@ -924,36 +962,10 @@ func (q *query) readPartitionIter(it iterator, p []byte, pk [][]byte) error {
 		}
 		suffix := k[len(p):]
 		switch {
-		case len(suffix) == 1 && suffix[0] == headerSuffix:
-			r, err := row.Decode(it.Value())
-			if err != nil {
+		case len(suffix) > 0 && (suffix[0] == headerSuffix && len(suffix) == 1 || suffix[0] == tombstoneSuffix):
+			if err := addPartitionEntry(suffix, it.Value(), &static, &dels); err != nil {
 				return err
 			}
-			for _, c := range r.Cells {
-				if c.Column == deletionColumn {
-					dels.partition = max(dels.partition, c.Timestamp)
-				} else if c.Column < rtEndColumn {
-					static = append(static, c)
-				}
-			}
-			valid = it.Next()
-		case len(suffix) > 0 && suffix[0] == tombstoneSuffix:
-			r, err := row.Decode(it.Value())
-			if err != nil {
-				return err
-			}
-			var rt rangeTombstone
-			for _, c := range r.Cells {
-				switch c.Column {
-				case rtStartColumn:
-					rt.start = slices.Clone(c.Value)
-				case rtEndColumn:
-					rt.end = slices.Clone(c.Value)
-				case deletionColumn:
-					rt.ts = c.Timestamp
-				}
-			}
-			dels.ranges = append(dels.ranges, rt)
 			valid = it.Next()
 		default:
 			// A row: skip to the current clustering range.
@@ -993,6 +1005,128 @@ func (q *query) readPartitionIter(it iterator, p []byte, pk [][]byte) error {
 	return q.emitPartition(p, pk, static, dels, rows)
 }
 
+// addPartitionEntry reads a partition's header (static row, partition
+// deletion) or one of its range tombstones.
+func addPartitionEntry(suffix, v []byte, static *[]row.Cell, dels *deletions) error {
+	r, err := row.Decode(v)
+	if err != nil {
+		return err
+	}
+	if suffix[0] == headerSuffix {
+		for _, c := range r.Cells {
+			if c.Column == deletionColumn {
+				dels.partition = max(dels.partition, c.Timestamp)
+			} else if c.Column < rtEndColumn {
+				*static = append(*static, c)
+			}
+		}
+		return nil
+	}
+	var rt rangeTombstone
+	for _, c := range r.Cells {
+		switch c.Column {
+		case rtStartColumn:
+			rt.start = slices.Clone(c.Value)
+		case rtEndColumn:
+			rt.end = slices.Clone(c.Value)
+		case deletionColumn:
+			rt.ts = c.Timestamp
+		}
+	}
+	dels.ranges = append(dels.ranges, rt)
+	return nil
+}
+
+// readPartitionReversed reads a partition in the reverse of its clustering
+// order, reading only the rows it returns, as Scylla's native reverse reads
+// do: the partition's static row and deletions first (they are stored
+// before its rows, so a short forward read finds them), then its rows from
+// the last clustering range to the first, each backwards, in chunks, until
+// the query is done.
+func (q *query) readPartitionReversed(rs reverseSource, p []byte, pk [][]byte) error {
+	dels := deletions{partition: row.NoTimestamp}
+	var static []row.Cell
+	dit, err := q.src.iter(append(slices.Clip(p), headerSuffix), append(slices.Clip(p), types.LTNext))
+	if err != nil {
+		return err
+	}
+	for ok := dit.First(); ok; ok = dit.Next() {
+		k := dit.Key()
+		if !bytes.HasPrefix(k, p) || len(k) == len(p) {
+			break
+		}
+		suffix := k[len(p):]
+		if suffix[0] == headerSuffix && len(suffix) == 1 || suffix[0] == tombstoneSuffix {
+			if err := addPartitionEntry(suffix, dit.Value(), &static, &dels); err != nil {
+				dit.Close()
+				return err
+			}
+		}
+	}
+	err = dit.Error()
+	dit.Close()
+	if err != nil {
+		return err
+	}
+	// The clustering ranges in storage order, as key suffix bounds [lo, hi).
+	type span struct{ lo, hi []byte }
+	spans := []span{{[]byte{types.LTNext}, []byte{types.GTNext}}}
+	if q.ranges != nil {
+		spans = spans[:0]
+		for _, r := range q.ranges {
+			if r.point {
+				// A point is one row: up to the smallest key above it.
+				spans = append(spans, span{r.start, append(slices.Clone(r.start), 0)})
+			} else {
+				spans = append(spans, span{r.start, r.end})
+			}
+		}
+	}
+	// A later page goes on below the last row of the previous one.
+	var below []byte
+	if q.resume != nil && bytes.HasPrefix(q.resume.lastKey, p) {
+		below = q.resume.lastKey
+	}
+	it, err := rs.riter(append(slices.Clip(p), types.LTNext), append(slices.Clip(p), types.GTNext))
+	if err != nil {
+		return err
+	}
+	defer it.Close()
+	q.inOrder = true
+	defer func() { q.inOrder = false }()
+	var rows []kv
+	// Rows are read in chunks sized to what the query still needs (some
+	// may be deleted), so LIMIT 1 reads a few rows, not a thousand.
+	chunk := func() int { return int(min(max(q.limit-q.count, 16), 1024)) }
+	for i := len(spans) - 1; i >= 0; i-- {
+		lo := append(slices.Clip(p), spans[i].lo...)
+		hi := append(slices.Clip(p), spans[i].hi...)
+		if below != nil && bytes.Compare(below, hi) < 0 {
+			hi = below
+		}
+		if bytes.Compare(lo, hi) >= 0 {
+			continue
+		}
+		for ok := it.SeekLT(hi); ok && bytes.Compare(it.Key(), lo) >= 0; ok = it.Prev() {
+			rows = append(rows, kv{slices.Clone(it.Key()), slices.Clone(it.Value())})
+			rowsReadBackward.Add(1)
+			if len(rows) >= chunk() {
+				if err := q.emitRows(p, pk, static, dels, rows, false); err != nil {
+					return err
+				}
+				rows = rows[:0]
+				if q.done() {
+					return nil
+				}
+			}
+		}
+		if err := it.Error(); err != nil {
+			return err
+		}
+	}
+	return q.emitRows(p, pk, static, dels, rows, true)
+}
+
 func (q *query) rangeEnded(ri int, suffix []byte) bool {
 	r := q.ranges[ri]
 	if r.point {
@@ -1025,7 +1159,7 @@ func (q *query) emitRows(p []byte, pk [][]byte, static []row.Cell, dels deletion
 		}
 	}
 	liveStatic := knownCells(t, liveCells(static, dels.partition, e.nowSec))
-	if s.reversed {
+	if s.reversed && !q.inOrder {
 		slices.Reverse(rows)
 	}
 	if s.distinct {
