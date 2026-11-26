@@ -162,7 +162,8 @@ type execCtx struct {
 	values  []*primitive.Value
 	now     time.Time
 	nowSec  int64
-	ts      int64 // the client's default timestamp, or 0
+	ts      int64 // the client's default timestamp, if tsSet
+	tsSet   bool  // ts is set (0 is a timestamp like any other)
 	page    int   // page size, or <= 0
 	paging  []byte
 	noMeta  bool
@@ -204,11 +205,14 @@ func (e *execCtx) readStore() storage {
 }
 
 func (e *execCtx) timestamp() int64 {
-	if e.ts == 0 {
-		e.ts = e.d.timestamp()
+	if !e.tsSet {
+		e.setTimestamp(e.d.timestamp())
 	}
 	return e.ts
 }
+
+// setTimestamp sets the statement's timestamp.
+func (e *execCtx) setTimestamp(ts int64) { e.ts, e.tsSet = ts, true }
 
 // RequestOptions are the per-request execution options.
 type RequestOptions struct {
@@ -258,7 +262,7 @@ func (d *DB) newCtx(o *RequestOptions, st *prepState) (*execCtx, error) {
 		e.nowSec = int64(uint32(*o.NowInSec)) // unsigned (CassandraUInt): past 2038
 	}
 	if o.Timestamp != nil {
-		e.ts = *o.Timestamp
+		e.setTimestamp(*o.Timestamp)
 	}
 	switch {
 	case len(o.Named) > 0:
@@ -367,7 +371,7 @@ func (d *DB) executeBatch(typ primitive.BatchType, children []BatchChild, o *Req
 		ctx.nowSec = int64(uint32(*o.NowInSec)) // unsigned (CassandraUInt)
 	}
 	if o.Timestamp != nil {
-		ctx.ts = *o.Timestamp
+		ctx.setTimestamp(*o.Timestamp)
 	}
 	for _, c := range children {
 		st, err := d.current(c.Prepared)

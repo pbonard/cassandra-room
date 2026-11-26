@@ -81,9 +81,9 @@ type accordUpdate struct {
 	// "read" a plain SELECT.
 	Mode  string `json:",omitempty"`
 	Stmts []accordStmt
-	// Timestamp, if not zero, is the cells' timestamp in "write" mode (a
-	// logged batch's client timestamp) instead of the executeAt's.
-	Timestamp int64 `json:",omitempty"`
+	// Timestamp, if set, is the cells' timestamp in "write" mode (a logged
+	// batch's client timestamp, which may be 0) instead of the executeAt's.
+	Timestamp *int64 `json:",omitempty"`
 	Now       int64 // unix nanoseconds
 	NowSec    int64
 	// Page and Paging page a read ("read", "range"): the page size and
@@ -659,15 +659,15 @@ func (a accordAgent) Execute(txn *accord.Txn, executeAt accord.Timestamp, reads 
 		if err != nil {
 			return nil, nil, err
 		}
-		var u struct{ Timestamp int64 }
+		var u struct{ Timestamp *int64 }
 		if err := json.Unmarshal(txn.Update, &u); err != nil {
 			return nil, nil, err
 		}
 		mu := &mutation{}
 		for _, bm := range mods {
-			bm.e.ts = executeAt.HLC
-			if u.Timestamp != 0 {
-				bm.e.ts = u.Timestamp
+			bm.e.setTimestamp(executeAt.HLC)
+			if u.Timestamp != nil {
+				bm.e.setTimestamp(*u.Timestamp)
 			}
 			if err := bm.m.addMutations(bm.e, mu); err != nil {
 				return nil, nil, err
@@ -694,7 +694,7 @@ func (a accordAgent) Execute(txn *accord.Txn, executeAt accord.Timestamp, reads 
 				}
 			}
 		}
-		e.ts = executeAt.HLC
+		e.setTimestamp(executeAt.HLC)
 		mu := &mutation{}
 		rows, err := tx.evaluate(e, merged, mu)
 		if err != nil {
@@ -729,7 +729,7 @@ func (a accordAgent) Execute(txn *accord.Txn, executeAt accord.Timestamp, reads 
 	}
 	mu := &mutation{}
 	for _, bm := range mods {
-		bm.e.ts = executeAt.HLC
+		bm.e.setTimestamp(executeAt.HLC)
 		if err := bm.m.addMutations(bm.e, mu); err != nil {
 			return nil, nil, err
 		}
@@ -861,7 +861,10 @@ func (p *proxy) accordWrite(mods []boundModification, batchCtx *execCtx) error {
 	if !mods[0].m.t.accordManaged() {
 		// A logged batch on ordinary tables: Accord only makes it atomic;
 		// its cells take the client's timestamp, as any write's.
-		u.Timestamp = batchCtx.ts
+		if batchCtx.tsSet {
+			ts := batchCtx.ts
+			u.Timestamp = &ts
+		}
 	}
 	var keys []accord.Key
 	var last *stmtSource

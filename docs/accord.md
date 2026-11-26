@@ -77,6 +77,14 @@ names, not its class structure.
 
   Earlier transactions that may execute later but are only Accepted are
   awaited first (`simpleWait`). Otherwise recovery proposes the TxnID.
+- **Waiting for another coordinator** (`awaitOutcome`): a coordinator
+  preempted by a recovery, or whose attempt went stale, asks the replicas
+  for the outcome. Once one has it (PreApplied or Applied), it applies it
+  at a slow quorum of every shard before answering the client, as the
+  coordinator's own persist does. A QUORUM read outside Accord right after
+  the answer then sees its writes; this matters on tables whose
+  conditional statements, or writes, run on Accord while their reads do
+  not.
 - **Invalidation** (`Invalidate`): AcceptInvalidate at a quorum, then the
   invalidation is committed everywhere.
 - **Progress log** (`SimpleProgressLog`) finds stalled transactions:

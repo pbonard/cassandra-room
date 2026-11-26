@@ -511,7 +511,7 @@ func (tx *txnStmt) execute(e *execCtx) (message.Message, error) {
 			return nil, err
 		}
 		mu := &mutation{}
-		e.ts = d.timestamp()
+		e.setTimestamp(d.timestamp())
 		rows, err := tx.evaluate(e, reads, mu)
 		if err != nil {
 			return nil, err

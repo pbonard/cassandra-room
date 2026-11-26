@@ -146,7 +146,9 @@ node, the coordinator in a cluster.
   so a node still on version 4 is always sent its writes directly. A replica
   that does not answer within the write timeout is hinted, as one that
   fails. Too few live
-  replicas: `Unavailable`; no answer in time: `WriteTimeout`. Down or
+  replicas: `Unavailable`; no answer in time: `WriteTimeout` (at ANY, the
+  replicas that did not answer in time are hinted at once, and the hint
+  meets ANY). Down or
   failing replicas get **hints**, stored locally and replayed when they come
   back (and every 5 s), as Cassandra's hinted handoff: no hints for a node
   down longer than `max_hint_window` (3 h); a hint expires after the
@@ -167,11 +169,17 @@ node, the coordinator in a cluster.
   returned less. Replicas that
   returned less get the merged row (blocking read repair). Range scans read
   one ring range at a time, in pages, cutting each page at the first
-  replica page that was truncated.
+  replica page that was truncated. A replica answers row and range reads
+  without the cells its partition's deletion and range tombstones shadow
+  (as a Cassandra replica applies its tombstones), though they are stored
+  until compaction: read repair never copies such a row to a replica that
+  compacted it away and, past `gc_grace_seconds`, purged the deletion,
+  which would resurrect it.
 - **Schema** and role changes are metadata commits (above), from any node.
 - **Counters** are CounterMutations: the coordinator builds deltas, each
-  partition's first live replica (its leader) turns them into its counter
-  shard and replicates the result; a statement or batch may span
+  partition's leader (this node if it is a live replica, else a live one
+  in this data center, which evaluates LOCAL_QUORUM, else the first live
+  one) turns them into its counter shard and replicates the result; a statement or batch may span
   partitions.
 - **EACH_QUORUM** under NetworkTopologyStrategy needs a quorum in every
   data center, for reads and writes; writes also wait for pending
