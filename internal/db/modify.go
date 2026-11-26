@@ -280,7 +280,7 @@ func (d *DB) prepareModification(s *Schema, session string, raw cql.Statement, v
 			m.cond.read.sels = append(m.cond.read.sels, selector{kind: selColumn, name: col.Name, typ: col.Type, col: col})
 		}
 	}
-	m.pkIndices = pkIndices(t, vs)
+	m.pkIndices = pkIndices(t, m.where, vs)
 	return m, nil
 }
 
@@ -302,7 +302,21 @@ func operationString(op cql.Operation) string {
 // pkIndices returns the bind markers of the partition key columns, if each
 // is bound by one marker (the PK indices of the PREPARED result, which
 // drivers use for token-aware routing).
-func pkIndices(t *Table, vs *vars) []uint16 {
+func pkIndices(t *Table, w *where, vs *vars) []uint16 {
+	// The marker each partition key column is restricted to (by name or
+	// position: a named marker need not be named after its column, and a
+	// marker of the column's name may restrict another column).
+	if w != nil && len(w.pk) == len(t.PartitionKey) {
+		var out []uint16
+		for _, v := range w.pk {
+			m, ok := v.eqMarker()
+			if !ok {
+				return nil
+			}
+			out = append(out, uint16(m.idx))
+		}
+		return out
+	}
 	var out []uint16
 	for _, c := range t.PartitionKey {
 		found := false
