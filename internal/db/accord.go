@@ -309,6 +309,7 @@ func (p *proxy) accordTopology(s *Schema) {
 	}
 	ring := cluster.NewRing(nodeList(s))
 	future := cluster.NewFutureRing(nodeList(s))
+	old := cluster.NewOldRing(nodeList(s))
 	replication := func(k accord.Key) map[string]string {
 		id, _, err := splitAccordKey(k)
 		if err != nil {
@@ -376,9 +377,15 @@ func (p *proxy) accordTopology(s *Schema) {
 			if repl == nil {
 				return nil
 			}
+			// The write placement: old and future owners (a leaving node
+			// keeps receiving writes until its movement finishes).
 			var out []accord.NodeID
-			for _, n := range future.Replicas(repl, k.Token) {
-				out = append(out, n.Addr)
+			for _, r := range []*cluster.Ring{future, old} {
+				for _, n := range r.Replicas(repl, k.Token) {
+					if !slices.Contains(out, n.Addr) {
+						out = append(out, n.Addr)
+					}
+				}
 			}
 			return out
 		}})

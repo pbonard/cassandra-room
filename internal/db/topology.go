@@ -8,6 +8,7 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/datastax/go-cassandra-native-protocol/message"
@@ -143,25 +144,27 @@ func (p *proxy) bootstrap() error {
 	return nil
 }
 
-// pendingReplicas are the nodes that will become replicas of a token once
-// pending joins and departures complete: writes go to them too.
+// movingRings are the old and future placements of the range movements
+// in progress.
+type movingRings struct{ old, future *cluster.Ring }
+
+// pendingReplicas are the nodes a write must also reach, beyond the read
+// replicas (current): while ranges move, the write placement is the old
+// owners and the future ones together (see cluster's placements), so a
+// read at any step of the movement meets a write at any neighbouring one.
 func (p *proxy) pendingReplicas(k *Keyspace, token int64, current []*cluster.Node) []*cluster.Node {
-	states := nodeList(p.d.schema.Load())
-	moving := false
-	for _, s := range states {
-		if s.Status == cluster.StatusJoining || s.Status == cluster.StatusLeaving {
-			moving = true
-			break
-		}
-	}
-	if !moving {
+	m := p.moving.Load()
+	if m == nil {
 		return nil
 	}
 	var out []*cluster.Node
-	for _, n := range cluster.NewFutureRing(states).Replicas(k.Replication, token) {
-		// By host id: a replacement may reuse the dead node's address.
-		if !slices.ContainsFunc(current, func(c *cluster.Node) bool { return c.HostID == n.HostID }) {
-			out = append(out, n)
+	for _, ring := range []*cluster.Ring{m.old, m.future} {
+		for _, n := range ring.Replicas(k.Replication, token) {
+			// By host id: a replacement may reuse the dead node's address.
+			has := func(c *cluster.Node) bool { return c.HostID == n.HostID }
+			if !slices.ContainsFunc(current, has) && !slices.ContainsFunc(out, has) {
+				out = append(out, n)
+			}
 		}
 	}
 	return out
@@ -245,9 +248,31 @@ func (d *DB) Decommission() error {
 	if down := p.leaveTargetsDown(cluster.NewFutureRing(states)); len(down) > 0 {
 		return fmt.Errorf("db: nodes taking over this node's ranges are down: %s; bring them up (or remove them) first", strings.Join(down, ", "))
 	}
-	// PrepareLeave: once committed (and pushed to the live nodes), writes
-	// also go to the nodes taking over this node's ranges.
-	if err := p.setStatus("PREPARE_LEAVE", cluster.StatusLeaving); err != nil {
+	if d.schema.Load().Nodes[d.local.HostID].Status != cluster.StatusMidLeave {
+		if err := p.unbootstrap(); err != nil {
+			return err
+		}
+	}
+	// FinishLeave once no read uses the placements before MidLeave.
+	if err := p.progressBarrier(); err != nil {
+		return err
+	}
+	p.replayHints()
+	if err := p.setStatus("FINISH_LEAVE", cluster.StatusLeft); err != nil {
+		return err
+	}
+	return d.progress().clear("decommission")
+}
+
+// unbootstrap starts this node's leave (PrepareLeave), streams its ranges
+// to the nodes taking them over once every node writes to them too, then
+// moves reads to them (MidLeave).
+func (p *proxy) unbootstrap() error {
+	d := p.d
+	if err := p.startMovement("PREPARE_LEAVE", d.local.HostID, cluster.StatusLeaving); err != nil {
+		return err
+	}
+	if err := p.progressBarrier(); err != nil {
 		return err
 	}
 	cur := p.ring.Load()
@@ -281,12 +306,7 @@ func (d *DB) Decommission() error {
 			}
 		}
 	}
-	p.replayHints()
-	// FinishLeave.
-	if err := p.setStatus("FINISH_LEAVE", cluster.StatusLeft); err != nil {
-		return err
-	}
-	return d.progress().clear("decommission")
+	return p.setStatus("MID_LEAVE", cluster.StatusMidLeave)
 }
 
 // ---- repair ----
@@ -457,7 +477,7 @@ func (d *DB) Cleanup(keyspace string) (int, error) {
 	}
 	s := d.schema.Load()
 	for _, n := range s.Nodes {
-		if n.Status == cluster.StatusJoining || n.Status == cluster.StatusLeaving {
+		if cluster.Moving(n.Status) {
 			return 0, fmt.Errorf("db: node %s is %s: cleanup must wait until ranges stop moving", n.Addr, n.Status)
 		}
 	}
@@ -530,7 +550,30 @@ func (d *DB) RemoveNode(target string) error {
 		return fmt.Errorf("db: node %s is a member of the cluster metadata service; reconfigure it first", target)
 	}
 	op := "removenode-" + dead.HostID
-	if err := p.setNodeStatus("PREPARE_REMOVE", dead.HostID, cluster.StatusLeaving); err != nil {
+	if dead.Status != cluster.StatusMidLeave {
+		if err := p.removeRanges(dead, op); err != nil {
+			return err
+		}
+	}
+	// FinishRemove once no read uses the placements before MidRemove.
+	if err := p.progressBarrier(); err != nil {
+		return err
+	}
+	if err := p.setNodeStatus("FINISH_REMOVE", dead.HostID, cluster.StatusLeft); err != nil {
+		return err
+	}
+	return d.progress().clear(op)
+}
+
+// removeRanges marks a dead node LEAVING (PrepareRemove), streams its
+// ranges from the surviving replicas to the nodes taking them over once
+// every node writes to those too, then moves reads to them (MidRemove).
+func (p *proxy) removeRanges(dead *cluster.Node, op string) error {
+	d := p.d
+	if err := p.startMovement("PREPARE_REMOVE", dead.HostID, cluster.StatusLeaving); err != nil {
+		return err
+	}
+	if err := p.progressBarrier(); err != nil {
 		return err
 	}
 	cur := p.ring.Load()
@@ -571,10 +614,7 @@ func (d *DB) RemoveNode(target string) error {
 			}
 		}
 	}
-	if err := p.setNodeStatus("FINISH_REMOVE", dead.HostID, cluster.StatusLeft); err != nil {
-		return err
-	}
-	return d.progress().clear(op)
+	return p.setNodeStatus("MID_REMOVE", dead.HostID, cluster.StatusMidLeave)
 }
 
 // ReconfigureCMS sets the members of the cluster metadata service (TCM's
@@ -679,4 +719,102 @@ func cmsStep(cur, want []string) (string, []string, bool) {
 		}
 	}
 	return "", nil, false
+}
+
+// errRangeMovement refuses to start a range movement while another one is
+// in progress (TCM's locked ranges, here for the whole ring: one movement
+// at a time, so the placements of two never overlap).
+var errRangeMovement = errors.New("db: another node is joining, leaving or being replaced or removed; retry once it is done")
+
+// movingOther returns a node other than the ones given that is in a range
+// movement, or nil.
+func movingOther(s *Schema, except ...string) *cluster.Node {
+	for _, n := range s.Nodes {
+		if cluster.Moving(n.Status) && !slices.Contains(except, n.HostID) {
+			return n
+		}
+	}
+	return nil
+}
+
+// startMovement commits the first step of a range movement of a node
+// (PrepareJoin's, PrepareLeave's, ...): refused while another node moves.
+func (p *proxy) startMovement(kind, hostID, status string) error {
+	_, err := p.d.change(kind, func(next *Schema) (message.Message, bool, error) {
+		n := next.Nodes[hostID]
+		if n == nil || n.Status == status {
+			return nil, false, nil
+		}
+		if o := movingOther(next, hostID); o != nil {
+			return nil, false, fmt.Errorf("%w (%s %s is %s)", errRangeMovement, o.HostID, o.Addr, o.Status)
+		}
+		n.Status = status
+		next.logDetail = fmt.Sprintf("%s %s %s", n.HostID, n.Addr, status)
+		return nil, true, nil
+	})
+	return err
+}
+
+// progressBarrier waits until every live node knows the metadata up to
+// this node's epoch, then until the requests coordinated with the
+// placements before it are over (TCM's progress barrier, which waits for
+// the epoch at the nodes of the ranges moved). A step of a range movement
+// begins only after the barrier of the step before it: the placements of
+// any two requests are then at most one step apart, and each step's read
+// and write placements intersect at a quorum with its neighbours'.
+func (p *proxy) progressBarrier() error {
+	s := p.d.schema.Load()
+	epoch := s.Epoch
+	var waiting []string
+	for _, n := range s.Nodes {
+		if n.Addr != p.self && n.Status != cluster.StatusLeft && !slices.Contains(waiting, n.Addr) {
+			waiting = append(waiting, n.Addr)
+		}
+	}
+	deadline := time.Now().Add(time.Minute)
+	for len(waiting) > 0 {
+		var behind []string
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		for _, addr := range waiting {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				e, err := p.cms.Sync(ctx, addr)
+				cancel()
+				// A node that is down (and does not answer) catches up
+				// with the log before it serves again. A new node's view
+				// of who is up may lag: a node that answers is waited for.
+				if err != nil && !p.g.IsAlive(addr) || err == nil && e >= epoch {
+					return
+				}
+				mu.Lock()
+				behind = append(behind, addr)
+				mu.Unlock()
+			}()
+		}
+		wg.Wait()
+		waiting = behind
+		if len(waiting) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			slices.Sort(waiting)
+			return fmt.Errorf("db: nodes have not reached metadata epoch %d: %s", epoch, strings.Join(waiting, ", "))
+		}
+		select {
+		case <-time.After(200 * time.Millisecond):
+		case <-p.stopCh:
+			return errors.New("db: stopped")
+		}
+	}
+	// Requests begun with the placements before the epoch time out by
+	// then.
+	select {
+	case <-time.After(max(p.opts.ReadTimeout, p.opts.WriteTimeout)):
+	case <-p.stopCh:
+		return errors.New("db: stopped")
+	}
+	return nil
 }
