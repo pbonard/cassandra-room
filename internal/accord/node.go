@@ -116,6 +116,9 @@ type Node struct {
 	lastDurable time.Time
 	// lastSyncedSent is when the leader last re-sent the synced epoch.
 	lastSyncedSent time.Time
+	// bootstrapped is the sync point this node bootstrapped at: the
+	// transactions before it are reflected in the data it streamed.
+	bootstrapped atomic.Pointer[Timestamp]
 	// persisting bounds the transactions whose outcome is being retried
 	// to replicas that missed it.
 	persisting chan struct{}
@@ -619,12 +622,13 @@ func (n *Node) Pending() []string {
 	return out
 }
 
-// bootstrappedBefore returns the sync point this node bootstrapped the
-// range of a key at (zero if it did not).
-func (n *Node) bootstrappedBefore(k Key) Timestamp {
-	n.s.mu.Lock()
-	defer n.s.mu.Unlock()
-	return boundFor(n.s.bootstrap, k)
+// bootstrappedBefore returns the sync point this node bootstrapped at (zero
+// if it did not).
+func (n *Node) bootstrappedBefore() Timestamp {
+	if t := n.bootstrapped.Load(); t != nil {
+		return *t
+	}
+	return Timestamp{}
 }
 
 // metrics count what the node did (exported through Stats).

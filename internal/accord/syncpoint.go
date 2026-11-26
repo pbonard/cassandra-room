@@ -289,7 +289,7 @@ func (n *Node) durability() {
 // transaction before the sync points, and this node does not wait for
 // those it does not know (reads still fetch them first).
 func (n *Node) Bootstrap(ctx context.Context, ranges []Range) error {
-	var bounds []bound
+	var at Timestamp
 	for _, r := range ranges {
 		// Applied at every replica if they all answer in time; otherwise
 		// (a replica is down, as when replacing it) at a quorum: the
@@ -304,34 +304,24 @@ func (n *Node) Bootstrap(ctx context.Context, ranges []Range) error {
 		if err != nil {
 			return err
 		}
-		bounds = append(bounds, bound{R: r, TS: id.Timestamp})
+		at = maxTimestamp(at, id.Timestamp)
 	}
-	return n.s.setBootstrapped(bounds)
+	return n.s.setBootstrapped(at)
 }
 
 var bootstrapRecordID = TxnID{Timestamp: Timestamp{Node: "~bootstrap"}, Kind: SyncPoint}
 
-// setBootstrapped records the ranges' bootstrap points, durably.
-func (s *store) setBootstrapped(bounds []bound) error {
+// setBootstrapped records the bootstrap point, durably.
+func (s *store) setBootstrapped(at Timestamp) error {
 	s.mu.Lock()
-	changed := false
-	for _, b := range bounds {
-		if boundFor(s.bootstrap, Key{Token: b.R.Lo}).Less(b.TS) || boundFor(s.bootstrap, Key{Token: b.R.Hi}).Less(b.TS) {
-			changed = true
-		}
-		s.bootstrap = addBound(s.bootstrap, b.R, b.TS)
-	}
-	if !changed {
+	if prev := s.n.bootstrapped.Load(); prev != nil && !prev.Less(at) {
 		s.mu.Unlock()
 		return nil
 	}
-	var at Timestamp
-	for _, b := range s.bootstrap {
-		at = maxTimestamp(at, b.TS)
-	}
+	s.n.bootstrapped.Store(&at)
 	// One fixed id (no real command has it), so the record replaces any
 	// earlier bootstrap record.
-	rec := &Command{ID: bootstrapRecordID, ExecuteAt: at, Bootstrap: true, BootstrapBounds: slices.Clone(s.bootstrap)}
+	rec := &Command{ID: bootstrapRecordID, ExecuteAt: at, Bootstrap: true}
 	s.bootstrapRec = rec
 	if s.gc != nil {
 		b, err := json.Marshal(rec)

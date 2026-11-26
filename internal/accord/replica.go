@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -76,11 +75,9 @@ type Command struct {
 	// every transaction with a lower id there is durable or never commits
 	// (RedundantBefore).
 	Redundant bool `json:",omitempty"`
-	// Bootstrap: not a command, but the sync points this node bootstrapped
-	// ranges at (BootstrapBounds; ExecuteAt alone, for every range, in
-	// records of earlier versions), kept across restarts.
-	Bootstrap       bool    `json:",omitempty"`
-	BootstrapBounds []bound `json:",omitempty"`
+	// Bootstrap: not a command, but the sync point this node bootstrapped
+	// at (its ID), kept across restarts.
+	Bootstrap bool `json:",omitempty"`
 	// SyncedEpoch: not a command, but the oldest epoch any node still has
 	// transactions of (the node's synced epoch), kept across restarts.
 	SyncedEpoch int64 `json:",omitempty"`
@@ -133,10 +130,6 @@ type store struct {
 	// with a lower id is refused there. redundant are the bounds below
 	// which every transaction is durable or never commits.
 	barriers, redundant []bound
-	// bootstrap are the sync points this node bootstrapped each range at:
-	// it does not wait for unknown transactions before them on that range
-	// (it streamed their effects), and only on that range.
-	bootstrap []bound
 	// majority are bounds below which every transaction applied at a
 	// majority of the replicas (or never commits): not kept across restarts.
 	majority []bound
@@ -596,7 +589,7 @@ func (s *store) maybeExecuteLocked(c *command) {
 				if (d == nil || d.Status < PreAccepted) && id.Timestamp.Less(boundFor(s.redundant, k)) {
 					continue // forgotten: durable
 				}
-				if (d == nil || d.Status < PreAccepted) && id.Timestamp.Less(boundFor(s.bootstrap, k)) {
+				if (d == nil || d.Status < PreAccepted) && id.Timestamp.Less(s.n.bootstrappedBefore()) {
 					if !slices.Contains(c.skipped, id) {
 						c.skipped = append(c.skipped, id)
 					}
@@ -819,10 +812,8 @@ func (s *store) replay() error {
 	for _, saved := range cs {
 		if saved.Bootstrap {
 			s.bootstrapRec = saved
-			s.bootstrap = saved.BootstrapBounds
-			if len(s.bootstrap) == 0 && !saved.ExecuteAt.IsZero() {
-				s.bootstrap = []bound{{R: Range{Lo: math.MinInt64, Hi: math.MaxInt64}, TS: saved.ExecuteAt}}
-			}
+			at := saved.ExecuteAt
+			s.n.bootstrapped.Store(&at)
 			continue
 		}
 		if saved.SyncedEpoch > 0 {
@@ -945,7 +936,7 @@ func (s *store) ephemeralRead(ctx context.Context, r *ephemeralReq) (*ephemeralR
 				if c.Status < PreAccepted && id.Timestamp.Less(boundFor(s.redundant, k)) {
 					continue // forgotten: durable
 				}
-				if c.Status < PreAccepted && id.Timestamp.Less(boundFor(s.bootstrap, k)) {
+				if c.Status < PreAccepted && id.Timestamp.Less(s.n.bootstrappedBefore()) {
 					// From before this node joined: another replica reads.
 					s.missingLocked([]TxnID{id}, []Key{k})
 					s.mu.Unlock()
