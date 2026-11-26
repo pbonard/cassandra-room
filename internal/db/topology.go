@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/datastax/go-cassandra-native-protocol/message"
+	"github.com/pbonard/cassandra-room/internal/accord"
 	"github.com/pbonard/cassandra-room/internal/cluster"
 	"github.com/pbonard/cassandra-room/internal/storage/lsm"
 )
@@ -76,8 +77,25 @@ func (p *proxy) bootstrap() error {
 	// replaced at RF 2), this node instead fetches the earlier transactions
 	// it does not know before using them.
 	if p.accord != nil && !cur.Empty() {
+		// The point is only valid where the data comes from: every live
+		// current replica it may be streamed from must apply it.
+		fut := cluster.NewFutureRing(nodeList(p.d.schema.Load()))
+		var sources []accord.NodeID
+		for _, t := range p.d.userTables() {
+			k := p.d.schema.Load().Keyspaces[t.Keyspace]
+			for _, r := range fut.Ranges() {
+				if !containsAddr(fut.Replicas(k.Replication, r[1]), p.self) {
+					continue
+				}
+				for _, n := range cur.Replicas(k.Replication, r[1]) {
+					if n.Addr != p.self && !p.replacedNode(n) && p.up(n) && !slices.Contains(sources, accord.NodeID(n.Addr)) {
+						sources = append(sources, accord.NodeID(n.Addr))
+					}
+				}
+			}
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		_ = p.accord.Bootstrap(ctx, p.accordOwnedRanges(cluster.NewFutureRing(nodeList(p.d.schema.Load())), false))
+		_ = p.accord.Bootstrap(ctx, p.accordOwnedRanges(fut, false), sources...)
 		cancel()
 	}
 	future := cluster.NewFutureRing(nodeList(p.d.schema.Load()))

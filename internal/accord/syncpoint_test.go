@@ -130,7 +130,7 @@ func TestBootstrapSyncPoint(t *testing.T) {
 	_, err := c.node(0).Coordinate(context.Background(), appendTxn(t, c.keys[0], 1))
 	require.NoError(t, err)
 	require.NoError(t, c.node(2).Bootstrap(context.Background(), []Range{{Lo: math.MinInt64, Hi: math.MaxInt64}}))
-	at := c.node(2).bootstrappedBefore()
+	at := bootstrappedAt(c.node(2), c.keys[0])
 	require.False(t, at.IsZero())
 	// Every replica applied the transaction before the sync point.
 	for _, id := range c.ids {
@@ -139,7 +139,51 @@ func TestBootstrapSyncPoint(t *testing.T) {
 	// The bootstrap point survives a restart.
 	c.crash(2)
 	c.start(2)
-	require.Equal(t, at, c.node(2).bootstrappedBefore())
+	require.Equal(t, at, bootstrappedAt(c.node(2), c.keys[0]))
+}
+
+// bootstrappedAt is a node's bootstrap point over a key (zero if none).
+func bootstrappedAt(n *Node, k Key) Timestamp {
+	n.s.mu.Lock()
+	defer n.s.mu.Unlock()
+	return boundFor(n.s.bootstrapped, k)
+}
+
+// TestBootstrapPerRange: bootstrap points are per range. A node
+// bootstrapping a range it receives later keeps waiting for unknown
+// transactions on the ranges it already replicated (a single node-wide
+// point let it skip them there); a node taking over ranges from a leaving
+// one learns their points from the node that took them and streamed the
+// data (SendBootstrapped); the points survive a restart.
+func TestBootstrapPerRange(t *testing.T) {
+	c := newSimCluster(t, 3, 3, 2)
+	c.setRanges(false, 0)
+	ka, kb := c.keys[0], c.keys[1]
+	ra, rb := Range{Lo: ka.Token, Hi: ka.Token}, Range{Lo: kb.Token, Hi: kb.Token}
+	ctx := context.Background()
+	_, err := c.node(0).Coordinate(ctx, appendTxn(t, ka, 1))
+	require.NoError(t, err)
+	require.NoError(t, c.node(2).Bootstrap(ctx, []Range{ra}))
+	atA := bootstrappedAt(c.node(2), ka)
+	require.False(t, atA.IsZero())
+	require.True(t, bootstrappedAt(c.node(2), kb).IsZero(), "the other range is not bootstrapped")
+
+	// Later, n1 takes range b's point and streams it to n2.
+	_, err = c.node(0).Coordinate(ctx, appendTxn(t, kb, 2))
+	require.NoError(t, err)
+	pts, err := c.node(1).BootstrapPoints(ctx, []Range{ra, rb})
+	require.NoError(t, err)
+	require.Len(t, pts.For([]Range{rb}), 1)
+	require.NoError(t, c.node(1).SendBootstrapped(ctx, "n2", pts.For([]Range{rb})))
+	atB := bootstrappedAt(c.node(2), kb)
+	require.False(t, atB.IsZero())
+	require.True(t, atA.Less(atB))
+	require.Equal(t, atA, bootstrappedAt(c.node(2), ka), "range a keeps its own point")
+
+	c.crash(2)
+	c.start(2)
+	require.Equal(t, atA, bootstrappedAt(c.node(2), ka))
+	require.Equal(t, atB, bootstrappedAt(c.node(2), kb))
 }
 
 // TestMajorityDurability: with a replica down, durability rounds fall back
@@ -173,4 +217,43 @@ func TestMajorityDurability(t *testing.T) {
 	require.Eventually(t, func() bool { return c.node(0).Stats().DurabilityRounds > rounds }, 60*time.Second, 100*time.Millisecond)
 	c.settle()
 	c.check(records)
+}
+
+// TestBootstrapSkipsOnlyItsRanges: an unknown dependency older than a
+// bootstrap point is skipped on the bootstrapped range (its effects are in
+// the streamed data), and waited for on another range (this node knew that
+// range's transactions all along: a single node-wide point skipped it, and
+// the command could execute before a transaction it depends on).
+func TestBootstrapSkipsOnlyItsRanges(t *testing.T) {
+	c := newSimCluster(t, 3, 3, 2)
+	c.setRanges(false, 0)
+	ka, kb := c.keys[0], c.keys[1]
+	n := c.node(2)
+	ctx := context.Background()
+	unknown := TxnID{Timestamp: Timestamp{Epoch: 1, HLC: n.clock.Next(0), Node: "n0"}, Kind: Write}
+	require.NoError(t, n.Bootstrap(ctx, []Range{{Lo: ka.Token, Hi: ka.Token}}))
+	require.True(t, unknown.Timestamp.Less(bootstrappedAt(n, ka)))
+
+	for _, tc := range []struct {
+		k    Key
+		wait bool
+	}{{ka, false}, {kb, true}} {
+		n.s.mu.Lock()
+		id := TxnID{Timestamp: Timestamp{Epoch: 1, HLC: n.clock.Next(0), Node: "n1"}, Kind: Write}
+		cmd := n.s.get(id)
+		cmd.Txn = appendTxn(t, tc.k, 9)
+		n.s.registerLocked(cmd, cmd.Txn.Keys)
+		cmd.Status, cmd.ExecuteAt = Stable, id.Timestamp
+		cmd.Deps = Deps{keyString(tc.k): {unknown}}
+		n.s.maybeExecuteLocked(cmd)
+		ready, blocked := cmd.ready, cmd.blockedOn
+		n.s.mu.Unlock()
+		if tc.wait {
+			require.False(t, ready, "key %s: not bootstrapped, waits", tc.k.ID)
+			require.NotNil(t, blocked)
+			require.Equal(t, unknown, *blocked)
+		} else {
+			require.True(t, ready, "key %s: bootstrapped, the dependency is in the data", tc.k.ID)
+		}
+	}
 }

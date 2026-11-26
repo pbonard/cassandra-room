@@ -116,9 +116,6 @@ type Node struct {
 	lastDurable time.Time
 	// lastSyncedSent is when the leader last re-sent the synced epoch.
 	lastSyncedSent time.Time
-	// bootstrapped is the sync point this node bootstrapped at: the
-	// transactions before it are reflected in the data it streamed.
-	bootstrapped atomic.Pointer[Timestamp]
 	// persisting bounds the transactions whose outcome is being retried
 	// to replicas that missed it.
 	persisting chan struct{}
@@ -305,6 +302,7 @@ const (
 	mSyncPropose   msgType = "ProposeSyncPoint"
 	mRedundant     msgType = "SetShardDurable"
 	mMajority      msgType = "SetMajorityDurable"
+	mBootstrapped  msgType = "SetBootstrapped"
 )
 
 type envelope struct {
@@ -532,6 +530,11 @@ func (n *Node) Handle(ctx context.Context, from NodeID, payload []byte) ([]byte,
 		if err = json.Unmarshal(env.B, &r); err == nil {
 			err = n.s.markRedundant(r.ID, r.Txn.Ranges)
 		}
+	case mBootstrapped:
+		var r bootstrappedReq
+		if err = json.Unmarshal(env.B, &r); err == nil {
+			err = n.s.setBootstrapped(r.Points)
+		}
 	case mMajority:
 		var r syncReq
 		if err = json.Unmarshal(env.B, &r); err == nil {
@@ -622,15 +625,6 @@ func (n *Node) Pending() []string {
 	return out
 }
 
-// bootstrappedBefore returns the sync point this node bootstrapped at (zero
-// if it did not).
-func (n *Node) bootstrappedBefore() Timestamp {
-	if t := n.bootstrapped.Load(); t != nil {
-		return *t
-	}
-	return Timestamp{}
-}
-
 // metrics count what the node did (exported through Stats).
 type metrics struct {
 	fastPath, mediumPath, slowPath, recoveries, invalidations atomic.Int64
@@ -646,7 +640,9 @@ type Stats struct {
 	MajorityRounds, PersistShed                               int64
 	Preempted, Stale, Timeouts, EpochSyncs, JournalErrors     int64
 	Commands, Keys, Barriers, Redundant                       int
-	Epoch, SyncedEpoch                                        int64
+	// Bootstrapped is the number of ranges with a bootstrap point.
+	Bootstrapped       int
+	Epoch, SyncedEpoch int64
 }
 
 // Stats returns the node's metrics.
@@ -659,6 +655,7 @@ func (n *Node) Stats() Stats {
 		Epoch: n.epoch(), SyncedEpoch: n.synced.Load()}
 	n.s.mu.Lock()
 	st.Commands, st.Keys, st.Barriers, st.Redundant = len(n.s.cmds), len(n.s.keys), len(n.s.barriers), len(n.s.redundant)
+	st.Bootstrapped = len(n.s.bootstrapped)
 	n.s.mu.Unlock()
 	return st
 }
