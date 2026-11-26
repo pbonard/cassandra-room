@@ -18,11 +18,17 @@
 //	POST   /api/v1/snapshots       {"name","keyspaces"}: the snapshot's files
 //	DELETE /api/v1/snapshots/{name}
 //	POST   /api/v1/import          {"keyspace","table","files"}
+//	POST   /api/v1/load            {"keyspace","table","files","consistency"}:
+//	                               writes sstables' rows through the
+//	                               coordinator, to their replicas here
+//	                               (sstableloader); the default is ALL
+//	POST   /api/v1/commitlog/archive  closes the commit log segment; the
+//	                               archived segments {"files"}
+//	POST   /api/v1/commitlog/replay   {"files","tables","until"}: replays
+//	                               archived segments (point in time)
 //	GET    /metrics                Prometheus metrics
 //
-// Errors are {"error": "..."} with a 4xx or 5xx status. The text endpoints
-// of earlier versions (GET /status, POST /repair, /cleanup, /removenode,
-// /cms/reconfigure, /decommission) remain.
+// Errors are {"error": "..."} with a 4xx or 5xx status.
 package manage
 
 import (
@@ -69,8 +75,21 @@ func Handler(d *db.DB, serving func() bool) http.Handler {
 		h.done(w, d.ClearSnapshot(r.PathValue("name")))
 	})
 	mux.HandleFunc("POST /api/v1/import", h.importFiles)
+	mux.HandleFunc("POST /api/v1/load", h.load)
+	mux.HandleFunc("POST /api/v1/commitlog/archive", func(w http.ResponseWriter, r *http.Request) {
+		files, err := d.ArchiveCommitLog()
+		h.result(w, map[string][]string{"files": files}, err)
+	})
+	mux.HandleFunc("POST /api/v1/commitlog/replay", func(w http.ResponseWriter, r *http.Request) {
+		var req db.ReplayRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		res, err := d.Replay(req)
+		h.result(w, res, err)
+	})
 	mux.Handle("GET /metrics", promhttp.HandlerFor(d.Registry(), promhttp.HandlerOpts{}))
-	legacy(mux, d)
 	return mux
 }
 
@@ -205,6 +224,32 @@ func (h *handler) importFiles(w http.ResponseWriter, r *http.Request) {
 	h.done(w, h.d.Import(req.Keyspace, req.Table, req.Files))
 }
 
+// LoadRequest is the body of POST /api/v1/load.
+type LoadRequest struct {
+	Keyspace    string   `json:"keyspace"`
+	Table       string   `json:"table"`
+	Files       []string `json:"files"`
+	Consistency string   `json:"consistency,omitempty"` // ALL if empty
+}
+
+func (h *handler) load(w http.ResponseWriter, r *http.Request) {
+	var req LoadRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Consistency == "" {
+		req.Consistency = "ALL"
+	}
+	cl, err := db.ParseConsistency(req.Consistency)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	res, err := h.d.Load(req.Keyspace, req.Table, req.Files, cl)
+	h.result(w, res, err)
+}
+
 func (h *handler) done(w http.ResponseWriter, err error) {
 	h.result(w, map[string]string{"status": "done"}, err)
 }
@@ -236,47 +281,4 @@ func splitList(s string) []string {
 		}
 	}
 	return out
-}
-
-// legacy are the text endpoints of earlier versions.
-func legacy(mux *http.ServeMux, d *db.DB) {
-	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, d.Status()) })
-	mux.HandleFunc("POST /repair", func(w http.ResponseWriter, r *http.Request) {
-		st, err := d.Repair(r.URL.Query().Get("keyspace"))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintf(w, "repaired %d ranges: %d mismatches, %d bytes streamed\n", st.Ranges, st.Mismatches, st.Streamed)
-	})
-	mux.HandleFunc("POST /cleanup", func(w http.ResponseWriter, r *http.Request) {
-		n, err := d.Cleanup(r.URL.Query().Get("keyspace"))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintf(w, "cleaned %d tables\n", n)
-	})
-	mux.HandleFunc("POST /removenode", func(w http.ResponseWriter, r *http.Request) {
-		if err := d.RemoveNode(r.URL.Query().Get("node")); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintln(w, "removed")
-	})
-	mux.HandleFunc("POST /cms/reconfigure", func(w http.ResponseWriter, r *http.Request) {
-		members := splitList(r.URL.Query().Get("members"))
-		if err := d.ReconfigureCMS(members); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintln(w, "the metadata service is now", strings.Join(members, ", "))
-	})
-	mux.HandleFunc("POST /decommission", func(w http.ResponseWriter, _ *http.Request) {
-		if err := d.Decommission(); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintln(w, "decommissioned: the node has left the ring and can be stopped")
-	})
 }

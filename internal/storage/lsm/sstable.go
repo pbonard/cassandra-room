@@ -27,28 +27,28 @@ func makeWriterOptions(o *Options) sstable.WriterOptions {
 		// them the reader needs no value-block provider.
 		DisableValueBlocks: true,
 	}
+	// Bloom filters of partitions, not keys: the filter holds each key's
+	// partition prefix, so a read of one partition of a table with
+	// clustering columns (a range of keys) can skip sstables without it.
 	if o.PartitionPrefix != nil {
-		// Bloom filters of partitions, not keys: the filter holds each
-		// key's partition prefix, so a read of one partition of a table
-		// with clustering columns (a range of keys) can skip sstables
-		// without it. Files written so carry this comparer's name.
-		partitionPrefix.Store(&o.PartitionPrefix)
-		w.Comparer, w.KeySchema = &partitionComparer, &partitionKeySchema
+		// Set once per process (the database's rule): a file's filter must
+		// be probed with the split it was written with.
+		partitionPrefix.CompareAndSwap(nil, &o.PartitionPrefix)
 	}
+	w.Comparer, w.KeySchema = &partitionComparer, &partitionKeySchema
 	return w
 }
 
 func makeReaderOptions() sstable.ReaderOptions {
 	var o sstable.ReaderOptions
 	o.FilterDecoders = append(o.FilterDecoders, bloom.Decoder)
-	// Files of either comparer (those before partition filters).
-	o.Comparers = sstable.Comparers{partitionComparer.Name: &partitionComparer}
-	o.KeySchemas = sstable.MakeKeySchemas(&defaultKeySchema, &partitionKeySchema)
+	o.Comparer = &partitionComparer
+	o.KeySchemas = sstable.MakeKeySchemas(&partitionKeySchema)
 	return o
 }
 
-// partitionPrefix is the length of a key's partition prefix (set from
-// Options.PartitionPrefix; the whole key if unset).
+// partitionPrefix is the length of a key's partition prefix (set from the
+// first Options.PartitionPrefix; the whole key if unset).
 var partitionPrefix atomic.Pointer[func([]byte) int]
 
 func splitPartition(k []byte) int {
@@ -69,10 +69,7 @@ var partitionComparer = func() pebble.Comparer {
 	return c
 }()
 
-var (
-	defaultKeySchema   = colblk.DefaultKeySchema(pebble.DefaultComparer, 16)
-	partitionKeySchema = colblk.DefaultKeySchema(&partitionComparer, 16)
-)
+var partitionKeySchema = colblk.DefaultKeySchema(&partitionComparer, 16)
 
 // filterPrefix is the prefix of key a table's Bloom filter holds.
 func (t *tableReader) filterPrefix(key []byte) []byte {
@@ -80,12 +77,8 @@ func (t *tableReader) filterPrefix(key []byte) []byte {
 }
 
 // mayHavePartition reports whether the table may hold keys of the
-// partition prefix p in [lower, upper), by its Bloom filter (always true
-// for tables whose filter holds whole keys).
+// partition prefix p in [lower, upper), by its Bloom filter.
 func (t *tableReader) mayHavePartition(p, lower []byte) (bool, error) {
-	if t.r.Comparer.Name != partitionComparer.Name {
-		return true, nil
-	}
 	it, err := t.r.NewPointIter(context.Background(), sstable.IterOptions{
 		FilterBlockSizeLimit: sstable.AlwaysUseFilterBlock,
 		Env:                  sstable.NoReadEnv,

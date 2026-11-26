@@ -46,6 +46,11 @@ type Options struct {
 	// WALSegmentSize is the size at which the commit log moves to a new
 	// segment. Defaults to 32 MiB. (Cassandra: commitlog_segment_size.)
 	WALSegmentSize int64
+	// WALArchiveDir, when set, keeps every WAL segment: once the engine
+	// moves on from a segment it hard-links it there (Cassandra's commit log
+	// archiving), for point-in-time recovery. Archived segments are never
+	// reused; whoever reads them (a backup agent) deletes them.
+	WALArchiveDir string
 	// WALTotalSpace is the size of live commit log segments above which the
 	// tables pinning the oldest segment are flushed. Defaults to 1 GiB.
 	// (Cassandra: commitlog_total_space.)
@@ -61,8 +66,7 @@ type Options struct {
 	// PartitionPrefix, if set, returns the length of a key's partition
 	// prefix (all of it, or 0, for a key with none): Bloom filters then
 	// hold partitions, and a range read within one partition (as a read of
-	// a table with clustering columns is) skips sstables without it. Files
-	// written before keep their whole-key filters.
+	// a table with clustering columns is) skips sstables without it.
 	PartitionPrefix func(key []byte) int
 	// BlockSize is the target uncompressed size of sstable data blocks. Zero
 	// uses Pebble's default.

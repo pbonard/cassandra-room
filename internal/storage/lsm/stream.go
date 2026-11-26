@@ -415,3 +415,35 @@ func (t *Table) installImported(metas []*fileMeta, discard func()) error {
 	e.maybeScheduleCompactionsLocked()
 	return nil
 }
+
+// ReadExternal reads an external sstable (one of an engine's, for example
+// from a backup) and calls fn with each of its entries in key order: the
+// source of a bulk load (Cassandra's sstableloader), which writes them
+// through the cluster's coordinator rather than importing the file into one
+// node. The slices fn receives are valid only during the call.
+func ReadExternal(fs vfs.FS, path string, fn func(key, value []byte) error) error {
+	x, err := openExternal(fs, path)
+	if err != nil {
+		return err
+	}
+	defer x.r.Close()
+	var bp block.BufferPool
+	bp.Init(4, block.ForCompaction)
+	defer bp.Release()
+	src, err := newCompactionSource(&tableReader{r: x.r}, &bp)
+	if err != nil {
+		return err
+	}
+	defer src.close()
+	for k, v, tr, ok := src.first(); ok; k, v, tr, ok = src.next() {
+		switch pebble.InternalKeyKind(tr & 0xff) {
+		case pebble.InternalKeyKindMerge, pebble.InternalKeyKindSet:
+		default:
+			return fmt.Errorf("lsm: %s: key %q has kind %v", path, k, pebble.InternalKeyKind(tr&0xff))
+		}
+		if err := fn(k, v); err != nil {
+			return err
+		}
+	}
+	return src.err()
+}

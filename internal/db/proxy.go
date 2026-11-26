@@ -197,6 +197,7 @@ func (d *DB) startCluster(o *ClusterOptions) error {
 	m.Handle(cluster.VerbReadRow, p.handleReadRow)
 	m.Handle(cluster.VerbReadDigest, p.handleReadDigest)
 	m.Handle(cluster.VerbReadRange, p.handleReadRange)
+	m.Handle(cluster.VerbReadRangeReverse, p.handleReadRangeReverse)
 	m.Handle(cluster.VerbRepair, p.handleRepair)
 	m.Handle(cluster.VerbStreamPush, p.handleStreamPush)
 	m.Handle(cluster.VerbStreamFile, p.handleStreamFile)
@@ -1643,6 +1644,120 @@ func (p *proxy) handleReadRange(ctx context.Context, _ string, payload []byte) (
 	return append([]byte{more}, out...), it.Error()
 }
 
+// handleReadRangeReverse serves a page of a key range from its end down.
+func (p *proxy) handleReadRangeReverse(ctx context.Context, _ string, payload []byte) ([]byte, error) {
+	id, parts, err := decodeParts(payload, 2)
+	if err != nil {
+		return nil, err
+	}
+	lt, err := p.d.engine.Table(id)
+	if err != nil {
+		return nil, err
+	}
+	lo, hi := parts[0], parts[1]
+	if len(lo) == 0 {
+		lo = nil
+	}
+	if len(hi) == 0 {
+		hi = nil
+	}
+	it, err := lt.NewReverseIter(lo, hi)
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
+	var out []byte
+	n := 0
+	more := byte(0)
+	for ok := it.Last(); ok; ok = it.Prev() {
+		if n == rangePage {
+			more = 1
+			break
+		}
+		if n%64 == 0 && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		out = binary.AppendUvarint(out, uint64(len(it.Key())))
+		out = append(out, it.Key()...)
+		out = binary.AppendUvarint(out, uint64(len(it.Value())))
+		out = append(out, it.Value()...)
+		n++
+	}
+	return append([]byte{more}, out...), it.Error()
+}
+
+// riter reads [lo, hi) of one partition backwards across its replicas.
+func (s *distSource) riter(lo, hi []byte) (revIterator, error) {
+	if lo == nil || hi == nil || keyToken(lo) != keyToken(hi) {
+		return nil, errors.New("db: reverse reads are within one partition")
+	}
+	return &revDistIter{s: s, lo: lo, hi: hi}, nil
+}
+
+// revDistIter reads a range of one partition from its end down: a page per
+// replica at a time, merged in reverse order.
+type revDistIter struct {
+	s      *distSource
+	lo, hi []byte
+	buf    []kv
+	i      int
+	below  []byte // the next page is below this key (nil: no more)
+	err    error
+}
+
+func (it *revDistIter) load(bound []byte) bool {
+	it.buf, it.i, it.below = nil, 0, nil
+	for {
+		reps, need, err := it.s.readTargets(keyToken(it.lo))
+		if err != nil {
+			it.err = err
+			return false
+		}
+		kvs, cutoff, err := it.s.fetch(reps, need, it.lo, bound, true)
+		if err != nil {
+			it.err = err
+			return false
+		}
+		it.below = cutoff
+		if len(kvs) > 0 {
+			it.buf = kvs
+			return true
+		}
+		if cutoff == nil {
+			return false
+		}
+		bound = cutoff
+	}
+}
+
+func (it *revDistIter) SeekLT(key []byte) bool {
+	if key == nil || bytes.Compare(key, it.hi) > 0 {
+		key = it.hi
+	}
+	return it.load(key)
+}
+
+func (it *revDistIter) Prev() bool {
+	if it.buf == nil {
+		return false
+	}
+	it.i++
+	if it.i < len(it.buf) {
+		return true
+	}
+	if it.below == nil {
+		it.buf = nil
+		return false
+	}
+	return it.load(it.below)
+}
+
+func (it *revDistIter) Valid() bool   { return it.buf != nil && it.i < len(it.buf) && it.err == nil }
+func (it *revDistIter) Key() []byte   { return it.buf[it.i].k }
+func (it *revDistIter) Value() []byte { return it.buf[it.i].v }
+func (it *revDistIter) Error() error  { return it.err }
+func (it *revDistIter) Close() error  { return nil }
+
 func decodeKVs(b []byte) (kvs []kv, more bool, err error) {
 	if len(b) == 0 {
 		return nil, false, errors.New("db: corrupt range response")
@@ -1741,7 +1856,21 @@ func (it *distIter) load(from []byte) bool {
 // fetch reads [from, to) from need replicas and merges their rows; cutoff
 // is the last complete key when a replica's page was cut.
 func (it *distIter) fetch(reps []*cluster.Node, need ackNeed, from, to []byte) ([]kv, []byte, error) {
+	return it.s.fetch(reps, need, from, to, false)
+}
+
+// fetch reads [from, to) from need replicas and merges their rows, in key
+// order or, reverse, from the end down (as Scylla's native reverse reads:
+// every replica answers in reverse order, and the merge, cutoff and read
+// repair are mirrored). cutoff is the last complete key when a replica's
+// page was cut (the smallest one, reversed: rows below it may be missing).
+func (s *distSource) fetch(reps []*cluster.Node, need ackNeed, from, to []byte, reverse bool) ([]kv, []byte, error) {
+	it := &distIter{s: s}
 	p := it.s.p
+	verb := cluster.VerbReadRange
+	if reverse {
+		verb = cluster.VerbReadRangeReverse
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), p.opts.ReadTimeout)
 	defer cancel()
 	type resp struct {
@@ -1752,7 +1881,7 @@ func (it *distIter) fetch(reps []*cluster.Node, need ackNeed, from, to []byte) (
 	}
 	ch := make(chan resp, len(reps))
 	ask := func(r *cluster.Node) {
-		b, err := p.m.Request(ctx, r.Addr, cluster.VerbReadRange, encodeKey(it.s.id, from, to))
+		b, err := p.m.Request(ctx, r.Addr, verb, encodeKey(it.s.id, from, to))
 		if err != nil {
 			ch <- resp{node: r, err: err}
 			return
@@ -1806,7 +1935,7 @@ func (it *distIter) fetch(reps []*cluster.Node, need ackNeed, from, to []byte) (
 	for _, r := range got {
 		if r.more && len(r.kvs) > 0 {
 			last := r.kvs[len(r.kvs)-1].k
-			if cutoff == nil || bytes.Compare(last, cutoff) < 0 {
+			if cutoff == nil || (bytes.Compare(last, cutoff) < 0) != reverse {
 				cutoff = last
 			}
 		}
@@ -1814,7 +1943,7 @@ func (it *distIter) fetch(reps []*cluster.Node, need ackNeed, from, to []byte) (
 	merged := map[string][]byte{}
 	for _, r := range got {
 		for _, e := range r.kvs {
-			if cutoff != nil && bytes.Compare(e.k, cutoff) > 0 {
+			if cutoff != nil && (bytes.Compare(e.k, cutoff) > 0) != reverse && !bytes.Equal(e.k, cutoff) {
 				continue
 			}
 			if cur, ok := merged[string(e.k)]; ok {
@@ -1832,7 +1961,7 @@ func (it *distIter) fetch(reps []*cluster.Node, need ackNeed, from, to []byte) (
 	for k, v := range merged {
 		out = append(out, kv{[]byte(k), v})
 	}
-	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i].k, out[j].k) < 0 })
+	sort.Slice(out, func(i, j int) bool { return (bytes.Compare(out[i].k, out[j].k) < 0) != reverse })
 	// Blocking read repair: replicas that returned less get the merged rows
 	// (DataResolver).
 	if len(got) > 1 && it.s.readRepair() {

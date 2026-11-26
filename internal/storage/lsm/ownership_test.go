@@ -39,10 +39,10 @@ func TestOwnership(t *testing.T) {
 	require.InDelta(t, 1.0, newOwnership([]TokenRange{{0, math.MaxUint64}}).span(tokenKey(0), tokenKey(math.MaxUint64)), 1e-9)
 }
 
-// TestPartitionFiltersAndOldFiles: sstables written before partition
-// filters (whole-key filters) still read, and range reads inside one
-// partition skip the new ones without it.
-func TestPartitionFiltersAndOldFiles(t *testing.T) {
+// TestPartitionFilters: range reads inside one partition skip the
+// sstables whose partition filter lacks it, and point reads still find
+// every key.
+func TestPartitionFilters(t *testing.T) {
 	fs := vfs.NewMem()
 	// Keys: 8-byte token, then "p<n>" and a 0 terminator (the partition),
 	// then a clustering byte.
@@ -57,30 +57,20 @@ func TestPartitionFiltersAndOldFiles(t *testing.T) {
 		}
 		return len(k)
 	}
-	e, err := Open("db", &Options{FS: fs})
-	require.NoError(t, err)
-	tbl, err := e.CreateTable(1)
-	require.NoError(t, err)
-	put := func(e *Engine, k []byte) { putCell(t, e, string(k), liveCell(1, "v")) }
-	put(e, key(1, 1))
-	require.NoError(t, tbl.Flush()) // an old file
-	require.NoError(t, e.Close())
-
-	e, err = Open("db", &Options{FS: fs, PartitionPrefix: prefix, DisableCompactions: true})
+	e, err := Open("db", &Options{FS: fs, PartitionPrefix: prefix, DisableCompactions: true})
 	require.NoError(t, err)
 	defer e.Close()
-	tbl, err = e.Table(1)
+	tbl, err := e.CreateTable(1)
 	require.NoError(t, err)
+	put := func(k []byte) { putCell(t, e, string(k), liveCell(1, "v")) }
 	for p := 2; p <= 5; p++ {
-		put(e, key(p, 1))
-		put(e, key(9, p))               // so the files' key ranges overlap
-		require.NoError(t, tbl.Flush()) // new files
+		put(key(p, 1))
+		put(key(9, p)) // so the files' key ranges overlap
+		require.NoError(t, tbl.Flush())
 	}
-	for p := 1; p <= 5; p++ {
+	for p := 2; p <= 5; p++ {
 		require.True(t, liveAt(t, tbl, string(key(p, 1)), 0), "partition %d", p)
-		lo := key(p, 0)
-		hi := key(p, 9)
-		it, err := tbl.NewIter(lo, hi)
+		it, err := tbl.NewIter(key(p, 0), key(p, 9))
 		require.NoError(t, err)
 		n := 0
 		for ok := it.First(); ok; ok = it.Next() {

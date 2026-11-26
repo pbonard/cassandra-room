@@ -37,6 +37,7 @@ func main() {
 		shutdownTimeout       = flag.Duration("shutdown-timeout", 15*time.Second, "Graceful shutdown deadline for draining in-flight requests")
 		dataDir               = flag.String("data-dir", "data", "Directory of the database (data_file_directories, commitlog_directory)")
 		commitlogSync         = flag.String("commitlog-sync", "periodic", "periodic: fsync the commit log every -commitlog-sync-period; batch: fsync before acknowledging each write")
+		commitlogArchive      = flag.String("commitlog-archive-dir", "", "Keep every commit log segment in this directory, for point-in-time restores (commit log archiving); relative to -data-dir, on the same file system. A backup agent uploads and deletes them")
 		commitlogSyncPeriod   = flag.Duration("commitlog-sync-period", 10*time.Second, "Commit log fsync period in periodic mode (commitlog_sync_period)")
 		memtableSpace         = flag.Int64("memtable-space", 0, "Memtable space in bytes across all tables (memtable_heap_space); 0 uses the default")
 		clusterName           = flag.String("cluster-name", "Test Cluster", "Cluster name reported in system.local")
@@ -64,7 +65,7 @@ func main() {
 		adminKey              = flag.String("admin-key", "", "PEM private key for the management API")
 		adminCA               = flag.String("admin-ca", "", "PEM CA the management API's clients must present a certificate from")
 		_                     = flag.String("flags-file", "", "File of further flags, one per line (\"-name=value\"); the command line overrides them")
-		adminAddress          = flag.String("admin-address", "", "HTTP address for nodetool-style operations: GET /status, POST /repair?keyspace=, POST /cleanup?keyspace=, POST /removenode?node=, POST /cms/reconfigure?members=, POST /decommission")
+		adminAddress          = flag.String("admin-address", "", "HTTP address of the management API (/api/v1/...: nodes, ring, repair, cleanup, decommission, snapshots...; see docs/cluster.md)")
 	)
 	if err := flag.CommandLine.Parse(withFlagsFile(os.Args[1:])); err != nil {
 		os.Exit(2)
@@ -124,6 +125,12 @@ func main() {
 		}
 	}
 	opts.Engine.WALSyncPeriod = *commitlogSyncPeriod
+	if *commitlogArchive != "" {
+		opts.Engine.WALArchiveDir = *commitlogArchive
+		if !filepath.IsAbs(*commitlogArchive) {
+			opts.Engine.WALArchiveDir = filepath.Join(*dataDir, *commitlogArchive)
+		}
+	}
 	opts.Engine.MemTableBudget = *memtableSpace
 	database, err := db.Open(*dataDir, opts)
 	if err != nil {
