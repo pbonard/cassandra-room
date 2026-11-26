@@ -86,3 +86,17 @@ func TestGroupByPerPartitionLimit(t *testing.T) {
 	s.ok("UPDATE ks.s SET st = 8 WHERE p = 2")
 	require.Len(t, s.rows("SELECT p, c, count(*) FROM ks.s GROUP BY p, c"), 2)
 }
+
+// TestListPrependsInBatch: two prepends in one batch share its timestamp;
+// the later statement's elements come first, and one prepend keeps its
+// elements' order.
+func TestListPrependsInBatch(t *testing.T) {
+	s := openTest(t, nil)
+	s.ok("CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+	s.ok("CREATE TABLE ks.t (k int PRIMARY KEY, l list<int>)")
+	s.ok("INSERT INTO ks.t (k, l) VALUES (1, [9])")
+	s.ok("BEGIN UNLOGGED BATCH UPDATE ks.t SET l = [1, 2] + l WHERE k = 1; UPDATE ks.t SET l = [3, 4] + l WHERE k = 1; APPLY BATCH")
+	require.Equal(t, []string{"[3, 4, 1, 2, 9]"}, s.rows("SELECT toJson(l) FROM ks.t WHERE k = 1"))
+	s.ok("UPDATE ks.t SET l = [5, 6] + l, l = l + [7] WHERE k = 1")
+	require.Equal(t, []string{"[5, 6, 3, 4, 1, 2, 9, 7]"}, s.rows("SELECT toJson(l) FROM ks.t WHERE k = 1"))
+}

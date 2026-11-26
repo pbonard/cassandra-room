@@ -37,7 +37,7 @@ func (d *DB) listPath(ts int64, prepend bool) []byte {
 		t = -ts
 	}
 	out := binary.BigEndian.AppendUint64(make([]byte, 0, 16), uint64(t)^(1<<63))
-	out = binary.BigEndian.AppendUint32(out, d.listSeq.Add(1))
+	out = binary.BigEndian.AppendUint32(out, listSeq(d.listSeq.Add(1), prepend))
 	return append(out, d.nodeSuffix[:]...)
 }
 
@@ -54,8 +54,19 @@ func (e *execCtx) listPath(ts int64, prepend bool) []byte {
 	}
 	*e.listSeq++
 	out := binary.BigEndian.AppendUint64(make([]byte, 0, 16), uint64(t)^(1<<63))
-	out = binary.BigEndian.AppendUint32(out, *e.listSeq)
+	out = binary.BigEndian.AppendUint32(out, listSeq(*e.listSeq, prepend))
 	return append(out, 0, 0, 0, 0)
+}
+
+// listSeq orders elements of the same timestamp: appended ones in the
+// order added, prepended ones the other way (each prepend goes before the
+// earlier ones, as Lists.Prepender's decreasing times do: two prepends in
+// one batch share its timestamp).
+func listSeq(seq uint32, prepend bool) uint32 {
+	if prepend {
+		return ^seq
+	}
+	return seq
 }
 
 // columnCells returns the cells of column id in sorted cells.
@@ -132,6 +143,15 @@ func (d *DB) elementCells(c *Column, v []byte, ts int64, prepend bool, listPath 
 		if err != nil {
 			return nil, invalidf("Invalid collection value for %s", c.Name)
 		}
+		if t.Kind == types.List && prepend {
+			// Last element first: each prepended path sorts before the
+			// previous one, so the first element ends up first.
+			for i := len(elems) - 1; i >= 0; i-- {
+				out = append(out, cell(listPath(ts, prepend), elems[i]))
+			}
+			slices.Reverse(out)
+			return out, nil
+		}
 		for _, e := range elems {
 			if t.Kind == types.List {
 				out = append(out, cell(listPath(ts, prepend), e))
@@ -142,10 +162,6 @@ func (d *DB) elementCells(c *Column, v []byte, ts int64, prepend bool, listPath 
 				return nil, err
 			}
 			out = append(out, cell(p, []byte{}))
-		}
-		if t.Kind == types.List && prepend {
-			// The paths of one prepend are increasing: keep the order.
-			slices.SortStableFunc(out, func(a, b row.Cell) int { return row.Compare(&a, &b) })
 		}
 	case types.Map:
 		elems, err := types.SplitCollection(v, 2)
