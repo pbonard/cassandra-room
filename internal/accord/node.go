@@ -89,6 +89,10 @@ type Config struct {
 	// particular): it should bring the node's metadata up to that epoch.
 	// The node waits for it either way.
 	FetchEpoch func(from NodeID, epoch int64)
+	// Alive, if set, reports whether a node is believed up (a failure
+	// detector's view): a bootstrap's sync point does not wait for those
+	// that are not to apply it.
+	Alive func(NodeID) bool
 }
 
 // Errors returned by Coordinate.
@@ -177,6 +181,11 @@ func NewNode(cfg Config) (*Node, error) {
 	}
 	n.s.gc = newGroupCommit(bj, func() { n.metrics.journalErrors.Add(1) })
 	return n, nil
+}
+
+// alive reports whether a node is believed up.
+func (n *Node) alive(id NodeID) bool {
+	return id == n.cfg.ID || n.cfg.Alive == nil || n.cfg.Alive(id)
 }
 
 // ID returns the node's id.
@@ -359,6 +368,7 @@ const (
 	mRedundant     msgType = "SetShardDurable"
 	mMajority      msgType = "SetMajorityDurable"
 	mBootstrapped  msgType = "SetBootstrapped"
+	mGetSynced     msgType = "GetSyncedEpoch"
 	mDecideHLC     msgType = "DecideUniqueHlc"
 )
 
@@ -622,6 +632,8 @@ func (n *Node) Handle(ctx context.Context, from NodeID, payload []byte) ([]byte,
 		if err = json.Unmarshal(env.B, &r); err == nil {
 			n.advanceSynced(r.Epoch)
 		}
+	case mGetSynced:
+		reply = &epochSynced{Epoch: n.synced.Load()}
 	case mSyncPropose:
 		var r syncReq
 		if err = json.Unmarshal(env.B, &r); err == nil {

@@ -183,22 +183,29 @@ func (n *Node) rangeTopologies(r Range) *Topologies {
 // its id once it applied at a quorum of every shard (at every replica if
 // universal).
 func (n *Node) SyncPoint(ctx context.Context, r Range, universal bool) (TxnID, error) {
-	id, _, _, err := n.syncPoint(ctx, []Range{r}, universal, universal)
+	id, _, _, err := n.syncPoint(ctx, []Range{r}, syncOpts{universal: universal, pending: universal})
 	return id, err
 }
 
-// syncPoint coordinates one exclusive sync point over ranges: every
-// transaction on any of them with a lower id is one of its dependencies.
-// It returns once it applied at a quorum of every shard (or every replica
-// if universal, pending ones too if pending), with the nodes it applied at
-// by then and the largest HLC applied on their ranges.
+// syncOpts say when a sync point is done applying: at a quorum of every
+// shard, or at every replica if universal (pending ones too if pending);
+// linger, after a quorum, also waits that long at most for the other
+// replicas not known to be down, to be among the nodes it applied at.
 //
 // Durability rounds wait for pending replicas, so that a redundancy bound
 // is never set before they applied the transactions it covers. A
 // bootstrap's sync point does not: the pending replicas are the nodes
-// about to receive the ranges' data, which cannot apply it before they
-// have it (the universal attempt would always time out).
-func (n *Node) syncPoint(ctx context.Context, ranges []Range, universal, pending bool) (TxnID, []NodeID, int64, error) {
+// about to receive the data, which cannot apply it before they have it.
+type syncOpts struct {
+	universal, pending bool
+	linger             time.Duration
+}
+
+// syncPoint coordinates one exclusive sync point over ranges: every
+// transaction on any of them with a lower id is one of its dependencies.
+// It returns once it applied as opts say, with the nodes it applied at by
+// then and the largest HLC applied on their ranges.
+func (n *Node) syncPoint(ctx context.Context, ranges []Range, opts syncOpts) (TxnID, []NodeID, int64, error) {
 	ts := &Topologies{}
 	for _, r := range ranges {
 		ts.Shards = append(ts.Shards, n.rangeTopologies(r).Shards...)
@@ -235,21 +242,61 @@ func (n *Node) syncPoint(ctx context.Context, ranges []Range, universal, pending
 	n.metrics.syncPoints.Add(1)
 	// Applying it means every dependency applied at that replica.
 	applyTargets := nodes
-	if universal && pending {
+	if opts.universal && opts.pending {
 		applyTargets = ts.applyNodes()
 	}
 	req := &applyReq{ID: id, ExecuteAt: id.Timestamp, Deps: deps, Txn: txn, Writes: Writes{}}
 	applied := map[NodeID]bool{}
 	maxHLC := id.HLC
 	tr = newTracker(ts, (*Shard).slowQuorum)
+	// done: as soon as it is (a replica that does not answer, cut off or
+	// behind the epoch, is not waited for once a quorum applied).
+	var lingerUntil time.Time
+	done := func() bool {
+		if opts.universal {
+			return len(applied) == len(applyTargets)
+		}
+		if !tr.done() {
+			return false
+		}
+		if opts.linger <= 0 {
+			return true
+		}
+		if lingerUntil.IsZero() {
+			lingerUntil = time.Now().Add(opts.linger)
+		}
+		for _, x := range applyTargets {
+			if !applied[x] && n.alive(x) && time.Now().Before(lingerUntil) {
+				return false
+			}
+		}
+		return true
+	}
+	result := func() (TxnID, []NodeID, int64, error) {
+		var at []NodeID
+		for x := range applied {
+			at = append(at, x)
+		}
+		slices.Sort(at)
+		return id, at, maxHLC, nil
+	}
 	backoff := 50 * time.Millisecond
 	for {
 		pending := slices.DeleteFunc(slices.Clone(applyTargets), func(x NodeID) bool { return applied[x] })
 		ach := broadcast[applyReply](ctx, n, pending, mApply, func(NodeID) any { return req })
 		for range pending {
+			var wait <-chan time.Time
+			if !lingerUntil.IsZero() {
+				wait = time.After(time.Until(lingerUntil))
+			}
 			var rep response[applyReply]
 			select {
 			case rep = <-ach:
+			case <-wait:
+				if done() {
+					return result()
+				}
+				continue
 			case <-ctx.Done():
 				return TxnID{}, nil, 0, ErrTimeout
 			}
@@ -258,14 +305,12 @@ func (n *Node) syncPoint(ctx context.Context, ranges []Range, universal, pending
 				maxHLC = max(maxHLC, rep.reply.MaxHLC)
 				tr.success(rep.from)
 			}
-		}
-		if universal && len(applied) == len(applyTargets) || !universal && tr.done() {
-			var at []NodeID
-			for x := range applied {
-				at = append(at, x)
+			if done() {
+				return result()
 			}
-			slices.Sort(at)
-			return id, at, maxHLC, nil
+		}
+		if done() {
+			return result()
 		}
 		select {
 		case <-ctx.Done():
@@ -347,13 +392,13 @@ func (b BootstrapPoints) For(ranges []Range) BootstrapPoints {
 	return out
 }
 
-// BootstrapPoints takes one sync point over all the ranges, applied at
-// every replica if they all answer in time, otherwise (a replica is down,
-// as when replacing or removing it, or behind the epoch) at a quorum, and
-// returns the nodes it applied at. The ranges' data then holds every
-// transaction on them before it only where it is streamed from one of
-// those: a node that had not applied it may still apply a transaction
-// before it after the data left. The nodes receiving the data learn the
+// BootstrapPoints takes one sync point over all the ranges, applied at a
+// quorum of every shard and at the other replicas that apply it in a
+// moment (not those down, as when replacing or removing one, or cut off,
+// or behind the epoch), and returns the nodes it applied at. The ranges'
+// data then holds every transaction on them before it only where it is
+// streamed from one of those: a node that had not applied it may still
+// apply a transaction before it after the data left. The nodes receiving the data learn the
 // point with SendBootstrapped (or Bootstrap for this node). One sync point,
 // not one per range: a transaction on a range with an id between that
 // range's point and a later one's would be covered by neither, though a
@@ -369,12 +414,10 @@ func (n *Node) BootstrapPoints(ctx context.Context, ranges []Range) (BootstrapPo
 	// its dependencies nor reach them. Once it is, replicas refuse those,
 	// and they are coordinated again in an epoch that includes them.
 	n.awaitSynced(ctx, n.epoch())
-	uctx, cancel := context.WithTimeout(ctx, 4*n.cfg.RequestTimeout)
-	id, applied, maxHLC, err := n.syncPoint(uctx, ranges, true, false)
-	cancel()
-	if err != nil {
-		id, applied, maxHLC, err = n.syncPoint(ctx, ranges, false, false)
-	}
+	// One sync point, kept once a quorum applied it: the replicas that do
+	// not apply it in a moment (down, cut off, behind the epoch) are not
+	// waited for, only left out of the nodes the data may be streamed from.
+	id, applied, maxHLC, err := n.syncPoint(ctx, ranges, syncOpts{linger: n.cfg.RequestTimeout / 2})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -388,14 +431,22 @@ func (n *Node) BootstrapPoints(ctx context.Context, ranges []Range) (BootstrapPo
 // awaitSynced waits until epoch is synchronised (every transaction of an
 // earlier epoch on the ranges that changed is done, and the later ones are
 // refused), for at most half of ctx's time: the epoch synchronisation runs
-// on the leader, and the caller goes on without it if it lags.
+// on the leader, and the caller goes on without it if it lags. Besides the
+// leader's notice (sent once, which a node joining may not have been there
+// for, or may miss), it asks the other nodes for their synchronised epoch
+// every so often.
 func (n *Node) awaitSynced(ctx context.Context, epoch int64) {
 	limit := 10 * n.cfg.RequestTimeout
 	if d, ok := ctx.Deadline(); ok {
 		limit = min(limit, time.Until(d)/2)
 	}
 	deadline := time.Now().Add(limit)
+	var asked time.Time
 	for n.synced.Load() < epoch && time.Now().Before(deadline) {
+		if time.Since(asked) >= 200*time.Millisecond {
+			asked = time.Now()
+			go n.askSynced(ctx)
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -403,6 +454,29 @@ func (n *Node) awaitSynced(ctx context.Context, epoch int64) {
 			return
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+}
+
+// askSynced adopts the highest synchronised epoch the other nodes of the
+// latest epoch report (each learnt it from the leader once the epoch's sync
+// points applied).
+func (n *Node) askSynced(ctx context.Context) {
+	n.topoMu.RLock()
+	var nodes []NodeID
+	if t := n.topos[n.latest]; t != nil {
+		nodes = t.Nodes
+	}
+	n.topoMu.RUnlock()
+	for _, to := range nodes {
+		if to == n.cfg.ID || !n.alive(to) {
+			continue
+		}
+		go func() {
+			var r epochSynced
+			if err := n.send(ctx, to, mGetSynced, struct{}{}, &r); err == nil {
+				n.advanceSynced(r.Epoch)
+			}
+		}()
 	}
 }
 

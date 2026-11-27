@@ -480,8 +480,92 @@ func TestBootstrapSyncPointSkipsPending(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
-	_, applied, _, err := c.node(0).syncPoint(ctx, []Range{whole}, true, false)
+	_, applied, _, err := c.node(0).syncPoint(ctx, []Range{whole}, syncOpts{universal: true})
 	require.NoError(t, err)
 	require.Equal(t, []NodeID{"n0", "n1"}, applied)
+	require.Less(t, time.Since(start), time.Second)
+}
+
+// epochWithRanges gives nodes epoch 2, whose one range shard (every key)
+// has every node as a replica, and marks it synchronised (no leader runs
+// epoch synchronisation here); stuck, if not -1, does not learn it: it
+// answers nothing about epoch 2 until its request times out, as a node cut
+// off from the metadata log.
+func epochWithRanges(c *simCluster, stuck int) {
+	epoch2 := &Topology{Epoch: 2, Replicas: c.replicas, Nodes: c.ids,
+		RangeReplicas: func(r Range) []RangeShard { return []RangeShard{{Range: r, Nodes: c.ids}} }}
+	for i := range c.ids {
+		if i != stuck {
+			c.node(i).SetTopology(epoch2)
+			c.node(i).advanceSynced(2)
+		}
+	}
+}
+
+// TestSyncPointQuorumNoWait: a sync point that needs only a quorum returns
+// once a quorum applied it, not after every replica of the round answered:
+// a replica that does not answer cost a whole request timeout per sync
+// point (per changed range, in turn, when synchronising an epoch a node
+// joining waits for).
+func TestSyncPointQuorumNoWait(t *testing.T) {
+	c := newSimCluster(t, 3, 3, 1)
+	epochWithRanges(c, 2)
+	whole := Range{Lo: math.MinInt64, Hi: math.MaxInt64}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, applied, _, err := c.node(0).syncPoint(ctx, []Range{whole}, syncOpts{})
+	require.NoError(t, err)
+	require.Equal(t, []NodeID{"n0", "n1"}, applied)
+	require.Less(t, time.Since(start), c.node(0).cfg.RequestTimeout/2, "n2's request timeout not waited out")
+}
+
+// TestBootstrapPointsLinger: a bootstrap's sync point waits a moment for
+// the replicas beyond a quorum (the more nodes applied it, the more the
+// data may be streamed from), but not for one known to be down, nor more
+// than a moment for one that does not answer.
+func TestBootstrapPointsLinger(t *testing.T) {
+	whole := Range{Lo: math.MinInt64, Hi: math.MaxInt64}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	c := newSimCluster(t, 3, 3, 1)
+	epochWithRanges(c, -1)
+	_, applied, err := c.node(0).BootstrapPoints(ctx, []Range{whole})
+	require.NoError(t, err)
+	require.Equal(t, c.ids, applied, "every replica answers: every one is a source")
+
+	c = newSimCluster(t, 3, 3, 1)
+	epochWithRanges(c, 2)
+	n0 := c.node(0)
+	start := time.Now()
+	_, applied, err = n0.BootstrapPoints(ctx, []Range{whole})
+	require.NoError(t, err)
+	require.Equal(t, []NodeID{"n0", "n1"}, applied)
+	took := time.Since(start)
+	require.Less(t, took, n0.cfg.RequestTimeout, "a replica that does not answer is waited for a moment only")
+
+	n0.cfg.Alive = func(id NodeID) bool { return id != "n2" }
+	start = time.Now()
+	_, applied, err = n0.BootstrapPoints(ctx, []Range{whole})
+	require.NoError(t, err)
+	require.Equal(t, []NodeID{"n0", "n1"}, applied)
+	require.Less(t, time.Since(start), n0.cfg.RequestTimeout/4, "a replica known down is not waited for")
+}
+
+// TestAwaitSyncedAsks: a node waiting for an epoch to be synchronised asks
+// the others for theirs, instead of only waiting for the leader's notice,
+// which it may have missed (a node joining was not there for it).
+func TestAwaitSyncedAsks(t *testing.T) {
+	c := newSimCluster(t, 3, 3, 1)
+	for i := 0; i < 2; i++ {
+		c.node(i).advanceSynced(3)
+	}
+	n := c.node(2)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	n.awaitSynced(ctx, 3)
+	require.Equal(t, int64(3), n.synced.Load())
 	require.Less(t, time.Since(start), time.Second)
 }

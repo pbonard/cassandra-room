@@ -291,6 +291,9 @@ func (p *proxy) startAccord() error {
 		Proximity:          p.accordProximity,
 		// A transaction of an epoch this node does not know yet waits for
 		// it: catch up with the node that knows it.
+		// The failure detector's view: a bootstrap's sync point does not
+		// wait for nodes it believes down.
+		Alive: func(id accord.NodeID) bool { return p.g.IsAlive(string(id)) },
 		FetchEpoch: func(from accord.NodeID, epoch int64) {
 			f := string(from)
 			if f == "" {
@@ -1220,10 +1223,20 @@ func accordTxnRows(d *DB) []map[string][]byte {
 }
 
 // accordLeader reports whether this node synchronises Accord's epochs:
-// the live normal node with the lowest address.
+// the live normal node with the lowest address among those that know its
+// metadata epoch.
 func (p *proxy) accordLeader() bool {
-	for _, n := range p.d.schema.Load().Nodes {
-		if n.Status == cluster.StatusNormal && n.Addr < p.self && p.up(n) {
+	s := p.d.schema.Load()
+	// A node behind this one's metadata (cut off from the metadata log)
+	// does not lead: it would never synchronise the epochs it does not
+	// know, and no other node would either, so nodes joining waited for
+	// them in vain. Its epoch is as gossiped.
+	epochs := map[string]int64{}
+	for _, st := range p.g.States() {
+		epochs[st.Addr] = st.Epoch
+	}
+	for _, n := range s.Nodes {
+		if n.Status == cluster.StatusNormal && n.Addr < p.self && p.up(n) && epochs[n.Addr] >= s.Epoch {
 			return false
 		}
 	}
