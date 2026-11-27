@@ -171,19 +171,28 @@ names, not its class structure.
   - **Abandoned ones:** a sync point is never recovered. One its coordinator
     abandons only leaves barriers, and is invalidated locally after a while.
 - **Epoch synchronisation**: for each new epoch, in order, the leader (the
-  live normal node with the lowest address) finds the ranges whose replicas
+  live normal node with the lowest address among those whose gossiped
+  metadata epoch is at least this node's: a node cut off from the metadata
+  log never synchronised the epochs it did not know, and no other node
+  did either) finds the ranges whose replicas
   or pending replicas changed from the previous epoch (a range starting to
   move to a node changes only its pending replicas: earlier-epoch
   transactions, which do not reach that node, must be done before data is
   streamed to it).
-  1. It runs a sync point over each of them, with quorums in both epochs.
-     The barrier refuses any earlier-epoch transaction the sync point doesn't
-     follow.
+  1. It runs one sync point over all of them, with quorums in both
+     epochs. The barrier refuses any earlier-epoch transaction the sync
+     point doesn't follow. A sync point needing quorums returns as soon as
+     they applied it, not once every replica answered (one that does not
+     answer cost a request timeout per changed range, which a node joining
+     waits for).
   2. Once the sync points apply, no earlier-epoch transaction is in progress
      there, and every node is told the epoch is synchronised. Each node
      journals its synchronised epoch, and the leader re-sends it every
      durability interval, for nodes that restarted without it or joined
-     since.
+     since. A node waiting for an epoch to be synchronised (one about to
+     bootstrap) also asks the others for theirs (`GetSyncedEpoch`) every
+     200 ms, instead of waiting for the leader's notice, which a node
+     joining was not there for.
   3. Phases then stop including the earlier epochs. An epoch that changed no
      replicas (a schema change) needs no sync point.
 - **Durability** (`CoordinateShardDurable`, `RedundantBefore`): each node
@@ -215,8 +224,12 @@ names, not its class structure.
     have ordered.
 - **Joining nodes** (`Bootstrap`): before streaming, a joining node takes
   one sync point over all the ranges it will own in every table, applied
-  at every current replica (or at a quorum when one is down, as when
-  replacing it). If it fails the join fails (and can be retried), unless a
+  at a quorum of every shard, and kept once it is: it then waits half a
+  request timeout at most for the other replicas, and not at all for those
+  the failure detector believes down (`Config.Alive`). Those that did not
+  apply it (down, cut off, behind the epoch) are only left out of the
+  sources (below); it used to wait for every replica first, a whole 8 s
+  when one did not answer. If it fails the join fails (and can be retried), unless a
   range has no live quorum (`ErrUnavailable`, a replica being replaced at
   RF 2): no transaction commits there meanwhile, and the node goes without
   the point.
@@ -234,9 +247,7 @@ names, not its class structure.
     raised by a later bootstrap, let a transaction on such a range execute,
     and read, before a dependency's writes had applied there.
   - **Sources:** the point is only valid where the data comes from: the
-    live current replicas it may be streamed from must have applied the
-    sync point (when not every replica answers in time, the quorum must
-    include them).
+    data is streamed only from replicas that applied the sync point.
   - **Leaving and removed nodes' ranges:** the node driving the movement
     takes the sync point (`BootstrapPoints`) before streaming, applied at
     every node the data is streamed from, and tells the nodes taking over

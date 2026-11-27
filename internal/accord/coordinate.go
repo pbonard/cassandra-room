@@ -1105,10 +1105,11 @@ func (n *Node) syncEpochs() {
 		if cur == nil {
 			return
 		}
-		ranges := n.changedRanges(prev, cur)
-		for _, r := range ranges {
+		// One sync point over every range that changed (not one each, in
+		// turn: a node joining waits for this before it streams).
+		if ranges := n.changedRanges(prev, cur); len(ranges) > 0 {
 			sctx, scancel := context.WithTimeout(ctx, 2*n.recoveryTimeout())
-			_, err := n.SyncPoint(sctx, r, false)
+			_, _, _, err := n.syncPoint(sctx, ranges, syncOpts{})
 			scancel()
 			if err != nil {
 				return // retried at the next opportunity
