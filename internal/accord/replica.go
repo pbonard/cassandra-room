@@ -592,7 +592,10 @@ func (s *store) decideHLC(r *decideHLCReq) (*decideHLCReply, error) {
 			return nil, err
 		}
 	}
-	return &decideHLCReply{Outcome: ok, UniqueHLC: c.UniqueHLC}, s.unlock()
+	// Read before unlocking: in one return statement the field read is
+	// not ordered before the call.
+	rep := &decideHLCReply{Outcome: ok, UniqueHLC: c.UniqueHLC}
+	return rep, s.unlock()
 }
 
 func (s *store) commitLocked(c *command, executeAt Timestamp, deps Deps, txn *Txn, keys []Key, ballot Ballot, stable bool) error {
