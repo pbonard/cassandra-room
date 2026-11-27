@@ -1,8 +1,8 @@
 package lsm
 
 import (
-	"slices"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/cockroachdb/pebble/vfs"
