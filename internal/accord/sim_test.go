@@ -370,6 +370,30 @@ func (c *simCluster) settle() {
 	deadline := time.Now().Add(60 * time.Second)
 	for stuck(false) {
 		if time.Now().After(deadline) {
+			roots := map[TxnID]bool{}
+			for _, n := range c.net.nodes {
+				n.s.mu.Lock()
+				for _, cmd := range n.s.cmds {
+					if cmd.blockedOn != nil {
+						if d := n.s.cmds[*cmd.blockedOn]; d != nil && d.blockedOn == nil {
+							roots[*cmd.blockedOn] = true
+						}
+					}
+				}
+				n.s.mu.Unlock()
+			}
+			for id := range roots {
+				for _, nid := range c.ids {
+					n := c.net.nodes[nid]
+					n.s.mu.Lock()
+					if d := n.s.cmds[id]; d != nil {
+						c.t.Logf("ROOT %v at %s: %s exec=%v accepted=%v promised=%v deps=%d keys=%v owned=%v durable=%v fast=%v txn=%v", id, nid, d.Status, d.ExecuteAt, d.Accepted, d.Promised, len(d.Deps), d.Keys, d.owned, d.Durable, d.FastVote, d.Txn != nil)
+					} else {
+						c.t.Logf("ROOT %v at %s: none", id, nid)
+					}
+					n.s.mu.Unlock()
+				}
+			}
 			stuck(true)
 			c.t.Fatal("commands neither applied nor invalidated")
 		}
