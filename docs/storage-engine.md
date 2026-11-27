@@ -80,10 +80,19 @@ What Pebble's format holds for Cassandra:
 
 - one key per row; the partition header (partition deletion, static row) is
   a key that sorts first in the partition;
-- cells are encoded in the value against the table's schema, as Cassandra's
-  `SerializationHeader` does (*planned*, data-model layer);
+- cells are encoded in the value by `internal/storage/row` (section 4); a
+  live cell without TTL, the common case, stores only its column, flags,
+  timestamp and value: the local deletion time and TTL that every cell
+  carried before (11 bytes) are implied by a flag (row format version 3);
 - the Bloom filter is built on the partition prefix through a `Comparer`
-  whose `Split` returns its length (*planned*);
+  whose `Split` returns its length;
+- blocks are compressed per the table's `compression` option
+  (`TableOptions.Compression`, applied to the files written afterwards):
+  `LZ4Compressor`, Cassandra's default, maps to MinLZ (Pebble has no LZ4;
+  MinLZ is the same kind of fast LZ77 codec), `SnappyCompressor` to Snappy,
+  `ZstdCompressor` and `DeflateCompressor` to Zstandard level 3, and
+  `enabled: false` or `NoopCompressor` to none. `chunk_length_in_kb` is
+  accepted but the block size stays the engine's;
 - `Statistics.db`-style metadata (min and max timestamps, max local
   deletion time, tombstone histogram) is recorded per sstable in the
   manifest (M5, section 9) rather than by block property collectors.
@@ -107,7 +116,15 @@ repair, hinted handoff and client-supplied timestamps cause routinely. So:
   - a row deletion shadows cells with timestamps at or below it, and the
     superseding deletion wins (`DeletionTime.supersedes`);
   - merging is commutative, associative and idempotent (tested on random
-    rows), so fragments combine in any order.
+    rows), so fragments combine in any order;
+  - the encoding (version 3) gives each cell a header `column << 4 |
+    flags` and, unless the `live` flag says it is a live cell without TTL,
+    its local deletion time and TTL. Version 2 values (no `live` flag) are
+    still read, and rewritten as version 3 by the next merge or compaction.
+    For a ten-cell row of one write this takes the value from 293 to 185
+    bytes and encoding, decoding and merging about 30% less time
+    (`BenchmarkRowFormat`); `BenchmarkRowSpace` reports the bytes per row
+    in the WAL and in sstables for each compression.
   Collections (cells with paths), counters and range tombstones are not
   modelled yet.
 - **Memtables keep every fragment**; a flush merges each key's fragments into

@@ -87,7 +87,7 @@ func (t *Table) ExportRange(lower, upper []byte, fs vfs.FS, dir string) ([]strin
 		}
 		var dstNum uint64
 		_, _ = fmt.Sscanf(fs.PathBase(dst), "%d.sst", &dstNum)
-		b, err := newSSTBuilder(fs, dir, dstNum, e.writerOpts, e.merger, false, created)
+		b, err := newSSTBuilder(fs, dir, dstNum, t.writerOpts(), e.merger, false, created)
 		if err != nil {
 			src.close()
 			return fail(err)
@@ -362,9 +362,9 @@ func (t *Table) rewriteImported(ext []*externalTable, alloc func() uint64, creat
 	var metas []*fileMeta
 	var err error
 	if split := t.timeSplitter(); split != nil {
-		metas, err = writeByWindow(e.fs, t.dir, alloc, e.writerOpts, e.merger, next, split, t.o().fragmentSize(), created)
+		metas, err = writeByWindow(e.fs, t.dir, alloc, t.writerOpts(), e.merger, next, split, t.o().fragmentSize(), created)
 	} else {
-		metas, err = writeSharded(e.fs, t.dir, alloc, e.writerOpts, e.merger, next, boundaries, t.o().fragmentSize(), created)
+		metas, err = writeSharded(e.fs, t.dir, alloc, t.writerOpts(), e.merger, next, boundaries, t.o().fragmentSize(), created)
 	}
 	if err != nil {
 		return nil, err

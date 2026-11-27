@@ -550,6 +550,9 @@ func applyTableProperties(p *TableParams, props []cql.Property) error {
 				return err
 			}
 			if prop.Name == "compression" {
+				if _, err := compressionOption(m); err != nil {
+					return err
+				}
 				p.Compression = m
 			} else {
 				p.Caching = m
@@ -582,6 +585,60 @@ func mapProperty(p cql.Property) (map[string]string, error) {
 		out[k.Text] = v.Text
 	}
 	return out, nil
+}
+
+// compressionOption translates a table's compression map to the storage
+// engine's block compression. LZ4 (Cassandra's default) maps to MinLZ, the
+// same kind of codec; Deflate, which only Zstandard matches in ratio, to
+// Zstandard. With enabled: false or an empty class the table is not
+// compressed, as in Cassandra; an empty map is the default.
+func compressionOption(m map[string]string) (lsm.Compression, error) {
+	if len(m) == 0 {
+		return lsm.CompressionDefault, nil
+	}
+	var unknown []string
+	for k := range m {
+		switch k {
+		case "class", "sstable_compression", "enabled", "chunk_length_in_kb", "chunk_length_kb",
+			"crc_check_chance", "compression_level", "min_compress_ratio", "max_compressed_length":
+		default:
+			unknown = append(unknown, k)
+		}
+	}
+	if len(unknown) > 0 {
+		slices.Sort(unknown)
+		return 0, configf("Unknown compression options [%s]", strings.Join(unknown, ", "))
+	}
+	if e, ok := m["enabled"]; ok {
+		switch strings.ToLower(e) {
+		case "true":
+		case "false":
+			return lsm.CompressionNone, nil
+		default:
+			return 0, configf("Invalid value %s for 'enabled' compression option", e)
+		}
+	}
+	class, ok := m["class"]
+	if !ok {
+		class, ok = m["sstable_compression"]
+	}
+	if !ok {
+		return 0, configf("Missing sub-option 'class' for the 'compression' option.")
+	}
+	if class == "" {
+		return lsm.CompressionNone, nil
+	}
+	switch class[strings.LastIndexByte(class, '.')+1:] {
+	case "LZ4Compressor":
+		return lsm.CompressionMinLZ, nil
+	case "SnappyCompressor":
+		return lsm.CompressionSnappy, nil
+	case "ZstdCompressor", "DeflateCompressor":
+		return lsm.CompressionZstd, nil
+	case "NoopCompressor":
+		return lsm.CompressionNone, nil
+	}
+	return 0, configf("Could not create Compression for type %s", class)
 }
 
 // compactionOptions translates a table's compaction map to the storage
