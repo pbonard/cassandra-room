@@ -52,6 +52,11 @@ type TableOptions struct {
 	// SerialOutputShards writes a compaction's output shards one after the
 	// other instead of in parallel (parallelize_output_shards: false).
 	SerialOutputShards bool
+	// Compression is the block compression of the table's new sstables
+	// (its compression option); existing files keep theirs until they are
+	// rewritten.
+	Compression Compression
+
 	// FragmentSize, if positive, cuts each shard's compaction output into
 	// fragments of about this size and releases inputs as the compaction
 	// goes, as ScyllaDB's incremental compaction strategy does
@@ -1695,7 +1700,7 @@ func (c *compaction) compactShard(s int) error {
 		num := e.mu.nextFileNum
 		e.mu.nextFileNum++
 		e.mu.Unlock()
-		sb, err := newSSTBuilder(e.fs, t.dir, num, e.writerOpts, e.merger, decode, nowSec)
+		sb, err := newSSTBuilder(e.fs, t.dir, num, t.writerOpts(), e.merger, decode, nowSec)
 		if err != nil {
 			return nil, err
 		}

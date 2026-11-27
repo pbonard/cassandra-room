@@ -246,6 +246,7 @@ func (d *DB) engineTableOptions(id lsm.TableID) lsm.TableOptions {
 		if t, ok := s.byStorage[id]; ok {
 			o, err := compactionOptions(t.Params.Compaction, t.Params.GCGraceSeconds)
 			if err == nil {
+				o.Compression, _ = compressionOption(t.Params.Compression)
 				if len(t.Clustering) > 0 {
 					o.RowFilter = newDeletionFilter
 				}

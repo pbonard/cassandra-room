@@ -7,16 +7,21 @@
 // with Merge, which is commutative and associative, so the storage engine can
 // combine them in any order.
 //
-// Encoding (version 2; version 1 has no cell flags, paths or counters):
+// Encoding (version 3):
 //
 //	row  := version(1) | flags(1) | [deletion] | uvarint numCells | cell...
 //	deletion := varint markedForDeleteAt | varint localDeletionTime
-//	cell := uvarint (column << 3 | cellFlags) | [uvarint len | path]
-//	        | varint timestamp | varint localDeletionTime
-//	        | uvarint ttl | (live or expiring only) uvarint len | value
+//	cell := uvarint (column << 4 | cellFlags) | [uvarint len | path]
+//	        | varint timestamp
+//	        | (unless cellLive) varint localDeletionTime | uvarint ttl
+//	        | (live or expiring only) uvarint len | value
 //
 // localDeletionTime is NoDeletionTime for live cells, the expiry time for
-// expiring cells, and the deletion time for tombstones.
+// expiring cells, and the deletion time for tombstones. A live cell without
+// TTL (most cells) has the cellLive flag and stores neither: they would take
+// 11 of its bytes. Version 2, read but no longer written, has no cellLive
+// flag (column << 3 | cellFlags) and always stores both; version 1 has no
+// cell flags, paths or counters either.
 //
 // Multi-cell (complex) columns, such as non-frozen collections, have one
 // cell per element, identified by its path (the element's byte-comparable
@@ -36,12 +41,15 @@ import (
 )
 
 const (
-	version         = 2
+	version         = 3
 	flagHasDeletion = 1
 
 	cellHasPath         = 1
 	cellCounter         = 2
 	cellComplexDeletion = 4
+	// cellLive marks a live cell without TTL: no local deletion time or
+	// TTL follows (version 3).
+	cellLive = 8
 	// NoDeletionTime marks a live cell, as Cassandra's Cell.NO_DELETION_TIME.
 	NoDeletionTime = math.MaxInt64
 	// NoTimestamp means "no deletion" for a row deletion.
@@ -198,14 +206,20 @@ func appendCell(dst []byte, c *Cell) []byte {
 	if c.ComplexDeletion {
 		flags |= cellComplexDeletion
 	}
-	dst = binary.AppendUvarint(dst, uint64(c.Column)<<3|flags)
+	live := c.LocalDeletionTime == NoDeletionTime && c.TTL == 0
+	if live {
+		flags |= cellLive
+	}
+	dst = binary.AppendUvarint(dst, uint64(c.Column)<<4|flags)
 	if c.Path != nil {
 		dst = binary.AppendUvarint(dst, uint64(len(c.Path)))
 		dst = append(dst, c.Path...)
 	}
 	dst = binary.AppendVarint(dst, c.Timestamp)
-	dst = binary.AppendVarint(dst, c.LocalDeletionTime)
-	dst = binary.AppendUvarint(dst, uint64(c.TTL))
+	if !live {
+		dst = binary.AppendVarint(dst, c.LocalDeletionTime)
+		dst = binary.AppendUvarint(dst, uint64(c.TTL))
+	}
 	if !c.IsTombstone() {
 		dst = binary.AppendUvarint(dst, uint64(len(c.Value)))
 		dst = append(dst, c.Value...)
@@ -220,16 +234,16 @@ type decoder struct {
 	deletion Deletion
 	n        uint64
 	err      error
-	v1       bool
+	ver      byte
 }
 
 func newDecoder(b []byte) decoder {
 	d := decoder{deletion: Deletion{MarkedForDeleteAt: NoTimestamp}}
-	if len(b) < 2 || b[0] != version && b[0] != 1 {
+	if len(b) < 2 || b[0] < 1 || b[0] > version {
 		d.err = ErrCorrupt
 		return d
 	}
-	d.v1 = b[0] == 1
+	d.ver = b[0]
 	flags := b[1]
 	d.b = b[2:]
 	if flags&flagHasDeletion != 0 {
@@ -267,11 +281,16 @@ func (d *decoder) next(c *Cell) bool {
 	}
 	d.n--
 	c.Path, c.Counter, c.ComplexDeletion = nil, false, false
-	if d.v1 {
+	live := false
+	if d.ver == 1 {
 		c.Column = uint32(d.uvarint())
 	} else {
 		h := d.uvarint()
-		c.Column = uint32(h >> 3)
+		if d.ver == 2 {
+			c.Column = uint32(h >> 3)
+		} else {
+			c.Column, live = uint32(h>>4), h&cellLive != 0
+		}
 		c.Counter, c.ComplexDeletion = h&cellCounter != 0, h&cellComplexDeletion != 0
 		if h&cellHasPath != 0 {
 			l := d.uvarint()
@@ -284,8 +303,12 @@ func (d *decoder) next(c *Cell) bool {
 		}
 	}
 	c.Timestamp = d.varint()
-	c.LocalDeletionTime = d.varint()
-	c.TTL = uint32(d.uvarint())
+	if live {
+		c.LocalDeletionTime, c.TTL = NoDeletionTime, 0
+	} else {
+		c.LocalDeletionTime = d.varint()
+		c.TTL = uint32(d.uvarint())
+	}
 	c.Value = nil
 	if !c.IsTombstone() {
 		l := d.uvarint()

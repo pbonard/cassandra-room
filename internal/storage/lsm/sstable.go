@@ -521,3 +521,37 @@ func out0(out []*fileMeta, meta *fileMeta) uint64 {
 	}
 	return meta.num
 }
+
+// Compression is a table's sstable block compression.
+type Compression uint8
+
+const (
+	// CompressionDefault is MinLZ (Cassandra's default, LZ4, is the same
+	// kind: fast, LZ77 without entropy coding).
+	CompressionDefault Compression = iota
+	CompressionNone
+	CompressionSnappy
+	CompressionMinLZ
+	// CompressionZstd is Zstandard level 3 (Cassandra's default level).
+	CompressionZstd
+)
+
+func (c Compression) profile() *sstable.CompressionProfile {
+	switch c {
+	case CompressionNone:
+		return sstable.NoCompression
+	case CompressionSnappy:
+		return sstable.SnappyCompression
+	case CompressionZstd:
+		return sstable.ZstdCompression
+	default:
+		return sstable.MinLZCompression
+	}
+}
+
+// writerOpts are the options of the table's new sstables.
+func (t *Table) writerOpts() sstable.WriterOptions {
+	w := t.e.writerOpts
+	w.Compression = t.o().Compression.profile()
+	return w
+}
