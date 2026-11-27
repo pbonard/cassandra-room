@@ -55,10 +55,24 @@ names, not its class structure.
   (`Agent.Execute`) and applies them everywhere (`Persist`). It answers
   once a quorum of every shard has applied them, then keeps retrying any
   replica that missed them, and marks the transaction durable once all
-  have applied it.
+  have applied it. If the coordinator stops first, the progress log of a
+  replica holding the transaction applied but not durable finishes the
+  job (the home shard's replicas first): it sends the outcome to every
+  replica, which a replica that never heard of the transaction needs, then
+  marks it durable everywhere.
+- **Reads** (`StableThenRead`): the coordinator asks each shard's read
+  replicas in turn, and asks again every 50 ms until its deadline if none
+  could read (a dependency still recovering, a replica unreachable): the
+  decision is final, so giving up early only loses the outcome.
 - **Recovery** (`Recover`, `BeginRecovery`): any replica's progress log
-  recovers a transaction that has stalled. The recovery coordinator takes a
-  ballot and gathers a quorum of every shard, then acts on what it finds:
+  recovers a transaction that has stalled: after `RecoverAfter`, or a
+  tenth of it once its coordinator is known to be down (`Config.Alive`).
+  A dependency the replica does not know is recovered on the keys it is a
+  dependency on, which it touches: a shard it does not touch has no fast
+  votes for it, which must not count as "no fast path". A recovery that
+  learns the definition from a reply while running on other keys starts
+  again on the transaction's own. The recovery coordinator takes a ballot
+  and gathers a quorum of every shard, then acts on what it finds:
 
   | What the quorum reports | What recovery does |
   | --- | --- |
@@ -423,10 +437,32 @@ names, not its class structure.
     its execution timestamp;
   - acknowledged appends are applied once, and invalidated ones never;
   - real-time order is respected (strict serializability).
+
+  Liveness: of the transactions whose coordinator stayed up, at least half
+  are acknowledged (one whose coordinator crashed ends unknown to its
+  client).
+
+  The simulation runs in a `testing/synctest` bubble: a fake clock that
+  advances only when every goroutine of the cluster is blocked. Delays,
+  timeouts and the fault schedule therefore play out the same on a loaded
+  machine, or under the race detector, as on an idle one, and waiting costs
+  no real time: the crash test takes about 4 s instead of 30–45 s. The
+  network's delays and losses and the faults are drawn from a fixed seed.
+  The goroutine interleaving is still the Go scheduler's, so two runs are
+  not identical, but the checks hold on every run (400 of 400 crash runs).
+  A crash is a real one: `Node.Stop` cancels and waits for everything the
+  node started, so a crashed node sends nothing more.
 - `internal/accord/recovery_test.go` covers specific cases:
   - a fast-path commit that reached one replica, recovered without it;
   - a transaction barely witnessed, then invalidated;
-  - Accept reaching a newer epoch's replicas.
+  - Accept reaching a newer epoch's replicas;
+  - a transaction applied at a quorum whose coordinator stopped before
+    reaching the last replica, which never heard of it: the progress log
+    re-sends the outcome to every replica, then marks it durable;
+  - a dependency recovered by a node that does not know it, on keys it does
+    not touch: those shards have no votes for it, which must not count as
+    "no fast path" (that invalidated a transaction decided on the fast
+    path).
 - `internal/accord/syncpoint_test.go`:
   - a sync point under load (every dependency applied, lower ids refused);
   - durability rounds every 300 ms under message loss (all checks hold,

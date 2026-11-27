@@ -136,6 +136,12 @@ type Node struct {
 	stop    chan struct{}
 	stopped atomic.Bool
 	wg      sync.WaitGroup
+	// ctx is cancelled when the node stops: the context of its background
+	// work (see background).
+	ctx    context.Context
+	cancel context.CancelFunc
+	// bgMu orders starting background work against Stop.
+	bgMu sync.Mutex
 	// recovering marks transactions this node is recovering or fetching.
 	recovering sync.Map
 }
@@ -171,6 +177,7 @@ func NewNode(cfg Config) (*Node, error) {
 	}
 	n := &Node{cfg: cfg, clock: NewClock(cfg.Now), topos: map[int64]*Topology{}, stop: make(chan struct{}),
 		persisting: make(chan struct{}, maxPersisting)}
+	n.ctx, n.cancel = context.WithCancel(context.Background())
 	n.s = newStore(n)
 	if err := n.s.replay(); err != nil {
 		return nil, err
@@ -341,7 +348,10 @@ func (n *Node) Start() {
 
 // Stop stops the node: it no longer sends or answers requests.
 func (n *Node) Stop() {
+	n.bgMu.Lock()
 	n.stopped.Store(true)
+	n.bgMu.Unlock()
+	n.cancel()
 	close(n.stop)
 	n.wg.Wait()
 	if n.s.gc != nil {
@@ -716,13 +726,43 @@ type response[R any] struct {
 func broadcast[R any](ctx context.Context, n *Node, nodes []NodeID, t msgType, req func(NodeID) any) <-chan response[R] {
 	ch := make(chan response[R], len(nodes))
 	for _, to := range nodes {
-		go func() {
+		started := n.background(func(context.Context) {
+			ctx, cancel := n.bound(ctx)
+			defer cancel()
 			var r R
 			err := n.send(ctx, to, t, req(to), &r)
 			ch <- response[R]{from: to, reply: r, err: err}
-		}()
+		})
+		if !started {
+			ch <- response[R]{from: to, err: errStopped}
+		}
 	}
 	return ch
+}
+
+// background runs f in a goroutine that Stop cancels (through ctx) and
+// waits for, so a stopped node leaves nothing running. It reports false,
+// running nothing, once the node is stopping.
+func (n *Node) background(f func(ctx context.Context)) bool {
+	n.bgMu.Lock()
+	if n.stopped.Load() {
+		n.bgMu.Unlock()
+		return false
+	}
+	n.wg.Add(1)
+	n.bgMu.Unlock()
+	go func() {
+		defer n.wg.Done()
+		f(n.ctx)
+	}()
+	return true
+}
+
+// bound returns ctx, also cancelled when the node stops.
+func (n *Node) bound(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(n.ctx, cancel)
+	return ctx, func() { stop(); cancel() }
 }
 
 // jitter returns d plus up to half of it, at random.

@@ -507,7 +507,7 @@ func (s *store) commit(ctx context.Context, r *commitReq) (*commitReply, error) 
 		}
 		s.mu.Lock()
 	}
-	if s.missingLocked(skipped, readKeys) {
+	if s.missingLocked(skipped, readKeys, c.Deps) {
 		return &commitReply{Outcome: notReady}, s.unlock()
 	}
 	// Every earlier dependency on readKeys applied here: the transaction's
@@ -592,7 +592,10 @@ func (s *store) decideHLC(r *decideHLCReq) (*decideHLCReply, error) {
 			return nil, err
 		}
 	}
-	return &decideHLCReply{Outcome: ok, UniqueHLC: c.UniqueHLC}, s.unlock()
+	// Read before unlocking: in one return statement the field read is
+	// not ordered before the call.
+	rep := &decideHLCReply{Outcome: ok, UniqueHLC: c.UniqueHLC}
+	return rep, s.unlock()
 }
 
 func (s *store) commitLocked(c *command, executeAt Timestamp, deps Deps, txn *Txn, keys []Key, ballot Ballot, stable bool) error {
@@ -731,7 +734,8 @@ func (s *store) maybeExecuteLocked(c *command) {
 		return
 	}
 	c.executing = true
-	go s.applyWrites(c.ID, c.Txn, c.writeAt(), c.owned, c.Writes)
+	id, txn, at, owned, writes := c.ID, c.Txn, c.writeAt(), c.owned, c.Writes
+	s.n.background(func(context.Context) { s.applyWrites(id, txn, at, owned, writes) })
 }
 
 // knowsEpochsLocked reports whether this node knows the epochs a command
@@ -919,7 +923,9 @@ func (s *store) informDurable(id TxnID) error {
 
 func (s *store) informDurableLocked2(id TxnID) error {
 	c := s.cmds[id]
-	if c == nil || c.Durable || c.Status != Applied {
+	// Kept once the outcome is known here (PreApplied: the writes may
+	// still wait for a dependency); truncation still waits for Applied.
+	if c == nil || c.Durable || c.Status < PreApplied || c.Status == Invalidated || c.Status == Truncated {
 		return nil
 	}
 	c.Durable = true
@@ -1113,7 +1119,7 @@ func (s *store) ephemeralRead(ctx context.Context, r *ephemeralReq) (*ephemeralR
 				}
 				if c.Status < PreAccepted && id.Timestamp.Less(boundFor(s.bootstrapped, k)) {
 					// From before this node joined: another replica reads.
-					s.missingLocked([]TxnID{id}, []Key{k})
+					s.missingLocked([]TxnID{id}, []Key{k}, nil)
 					s.mu.Unlock()
 					return &ephemeralReply{Outcome: notReady}, nil
 				}
@@ -1127,20 +1133,20 @@ func (s *store) ephemeralRead(ctx context.Context, r *ephemeralReq) (*ephemeralR
 		if wait == nil {
 			break
 		}
-		if !fetched[wait.ID] && s.n.cfg.Now().Sub(start) > s.n.cfg.RecoverAfter {
+		if !fetched[wait.ID] && s.n.cfg.Now().Sub(start) > s.n.stallAfter(wait.ID, s.n.cfg.RecoverAfter) {
 			fetched[wait.ID] = true
 			id, keys := wait.ID, slices.Clone(wait.Keys)
-			go func() {
+			s.n.background(func(ctx context.Context) {
 				if _, busy := s.n.recovering.LoadOrStore(id, true); busy {
 					return
 				}
 				defer s.n.recovering.Delete(id)
-				fctx, cancel := context.WithTimeout(context.Background(), s.n.recoveryTimeout())
+				fctx, cancel := context.WithTimeout(ctx, s.n.recoveryTimeout())
 				defer cancel()
 				if !s.n.fetch(fctx, id, keys) {
 					_ = s.n.recover(fctx, id, nil, keys)
 				}
-			}()
+			})
 		}
 		ch := wait.changed
 		s.mu.Unlock()
@@ -1251,7 +1257,10 @@ func (s *store) forgetLocked() {
 
 // missingLocked reports whether some of ids are not applied here yet, and
 // fetches them in the background.
-func (s *store) missingLocked(ids []TxnID, keys []Key) bool {
+// deps, if not nil, are the dependencies ids come from: each is fetched on
+// the keys it is a dependency on, which it touches (a recovery on other
+// keys could wrongly invalidate it), else on keys.
+func (s *store) missingLocked(ids []TxnID, keys []Key, deps Deps) bool {
 	missing := false
 	for _, id := range ids {
 		d := s.cmds[id]
@@ -1259,12 +1268,38 @@ func (s *store) missingLocked(ids []TxnID, keys []Key) bool {
 			continue
 		}
 		missing = true
-		if d != nil && len(d.Keys) > 0 {
-			keys = d.Keys
+		on := depKeys(deps, id)
+		if len(on) == 0 && d != nil && len(d.Keys) > 0 {
+			on = slices.Clone(d.Keys)
 		}
-		go s.n.fetchOnce(id, slices.Clone(keys))
+		if len(on) == 0 {
+			on = slices.Clone(keys)
+		}
+		s.n.background(func(ctx context.Context) { s.n.fetchOnce(ctx, id, on) })
 	}
 	return missing
+}
+
+// depKeys returns the keys deps holds id on: keys the transaction touches.
+func depKeys(deps Deps, id TxnID) []Key {
+	var out []Key
+	for ks, ids := range deps {
+		if slices.Contains(ids, id) {
+			if k, ok := parseKeyString(ks); ok {
+				out = append(out, k)
+			}
+		}
+	}
+	slices.SortFunc(out, Key.Compare)
+	return out
+}
+
+// sameKeys reports whether a and b hold the same keys.
+func sameKeys(a, b []Key) bool {
+	a, b = slices.Clone(a), slices.Clone(b)
+	slices.SortFunc(a, Key.Compare)
+	slices.SortFunc(b, Key.Compare)
+	return slices.EqualFunc(a, b, func(x, y Key) bool { return x.Compare(y) == 0 })
 }
 
 // parseKeyString inverts keyString.

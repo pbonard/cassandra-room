@@ -262,6 +262,64 @@ func (n *Node) execute(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, e
 	return n.executeWith(ctx, ballot, id, txn, executeAt, deps, 0)
 }
 
+func latest(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
+}
+
+// ensureDurable sends an applied transaction's outcome to every replica
+// and, once all have applied it, tells them it is durable (the end of
+// Persist, for a transaction whose coordinator stopped first: a replica
+// that never heard of it would otherwise never apply it). It does nothing
+// while a replica is known to be down: it cannot become durable yet.
+func (n *Node) ensureDurable(ctx context.Context, req *applyReq) {
+	ats, err := n.applyTopologies(ctx, req.Txn.Keys, req.ID, req.ExecuteAt)
+	if err != nil {
+		return
+	}
+	nodes := ats.applyNodes()
+	for _, to := range nodes {
+		if !n.alive(to) {
+			return
+		}
+	}
+	ch := broadcast[applyReply](ctx, n, nodes, mApply, func(NodeID) any { return req })
+	for range nodes {
+		if r := <-ch; r.err != nil || r.reply.Outcome != ok {
+			return
+		}
+	}
+	for _, to := range nodes {
+		_ = n.send(ctx, to, mInformDurable, &checkStatusReq{ID: req.ID}, nil)
+	}
+	if !slices.Contains(nodes, n.cfg.ID) {
+		// A record kept here without being a replica (a coordinator that
+		// fetched its transaction's outcome): durable too, so it can be
+		// truncated.
+		_ = n.s.informDurable(req.ID)
+	}
+}
+
+// readRetryPause is how long a coordinator waits before asking a shard's
+// read replicas again, when none could read (not ready or unreachable).
+const readRetryPause = 50 * time.Millisecond
+
+// pause waits d, reporting false if ctx ends or the node stops first.
+func (n *Node) pause(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-n.stop:
+		return false
+	}
+}
+
 // executeWith executes with prior, if not 0, the write HLC an earlier
 // executor had accepted at the highest ballot a recovery found.
 func (n *Node) executeWith(ctx context.Context, ballot Ballot, id TxnID, txn *Txn, executeAt Timestamp, deps Deps, prior int64) ([]byte, error) {
@@ -308,31 +366,36 @@ func (n *Node) executeWith(ctx context.Context, ballot Ballot, id TxnID, txn *Tx
 		}
 		order := n.readOrder(s.Nodes)
 		done := false
-		for _, to := range order {
-			req := *stable
-			req.Read = true
-			var rep commitReply
-			if err := n.send(ctx, to, mCommit, &req, &rep); err != nil || rep.Outcome != ok {
-				if ctx.Err() != nil {
-					return nil, ErrTimeout
+		// Until the deadline: the decision is final, and a replica that
+		// was not ready (a dependency still recovering) or unreachable may
+		// be on the next round.
+		for round := 0; !done; round++ {
+			if round > 0 && !n.pause(ctx, readRetryPause) {
+				return nil, ErrTimeout
+			}
+			for _, to := range order {
+				req := *stable
+				req.Read = true
+				var rep commitReply
+				if err := n.send(ctx, to, mCommit, &req, &rep); err != nil || rep.Outcome != ok {
+					if ctx.Err() != nil {
+						return nil, ErrTimeout
+					}
+					continue
 				}
-				continue
-			}
-			readers[to] = true
-			uniqueHLC = max(uniqueHLC, rep.MinHLC)
-			if rep.Applied {
-				applied = &rep
-			}
-			for k, v := range rep.Reads {
-				if slices.Contains(readsFor[k], to) {
-					reads[k] = v
+				readers[to] = true
+				uniqueHLC = max(uniqueHLC, rep.MinHLC)
+				if rep.Applied {
+					applied = &rep
 				}
+				for k, v := range rep.Reads {
+					if slices.Contains(readsFor[k], to) {
+						reads[k] = v
+					}
+				}
+				done = true
+				break
 			}
-			done = true
-			break
-		}
-		if !done {
-			return nil, ErrTimeout
 		}
 	}
 	if err := <-committed; err != nil {
@@ -340,7 +403,7 @@ func (n *Node) executeWith(ctx context.Context, ballot Ballot, id TxnID, txn *Tx
 	}
 	for _, to := range ts.nodes() {
 		if !readers[to] {
-			go func() { _ = n.send(context.Background(), to, mCommit, stable, nil) }()
+			n.background(func(ctx context.Context) { _ = n.send(ctx, to, mCommit, stable, nil) })
 		}
 	}
 	var writes Writes
@@ -430,7 +493,8 @@ func (n *Node) applyTopologies(ctx context.Context, keys []Key, id TxnID, execut
 func (n *Node) persist(ctx context.Context, ts *Topologies, id TxnID, txn *Txn, executeAt Timestamp, uniqueHLC int64, deps Deps, writes Writes, result []byte) error {
 	req := &applyReq{ID: id, ExecuteAt: executeAt, UniqueHLC: uniqueHLC, Deps: deps, Txn: txn, Writes: writes, Result: result}
 	nodes := ts.applyNodes()
-	ch := broadcast[applyReply](context.Background(), n, nodes, mApply, func(NodeID) any { return req })
+	// Not ctx: the replies are awaited after this returns (below).
+	ch := broadcast[applyReply](n.ctx, n, nodes, mApply, func(NodeID) any { return req })
 	tr := newTracker(ts, (*Shard).slowQuorum)
 	got := 0
 	for ; got < len(nodes) && !tr.done(); got++ {
@@ -458,7 +522,7 @@ func (n *Node) persist(ctx context.Context, ts *Topologies, id TxnID, txn *Txn, 
 		n.metrics.persistShed.Add(1)
 		return nil
 	}
-	go func() {
+	started := n.background(func(ctx context.Context) {
 		defer func() { <-n.persisting }()
 		// Every replica must apply it: retry those that failed (a replica
 		// that was down learns the outcome when it is back), then tell
@@ -485,7 +549,7 @@ func (n *Node) persist(ctx context.Context, ts *Topologies, id TxnID, txn *Txn, 
 			for _, to := range nodes {
 				if !applied[to] {
 					var rep applyReply
-					if err := n.send(context.Background(), to, mApply, req, &rep); err == nil && rep.Outcome == ok {
+					if err := n.send(ctx, to, mApply, req, &rep); err == nil && rep.Outcome == ok {
 						applied[to] = true
 					}
 				}
@@ -493,10 +557,13 @@ func (n *Node) persist(ctx context.Context, ts *Topologies, id TxnID, txn *Txn, 
 		}
 		if len(applied) == len(nodes) {
 			for _, to := range nodes {
-				_ = n.send(context.Background(), to, mInformDurable, &checkStatusReq{ID: id}, nil)
+				_ = n.send(ctx, to, mInformDurable, &checkStatusReq{ID: id}, nil)
 			}
 		}
-	}()
+	})
+	if !started {
+		<-n.persisting
+	}
 	return nil
 }
 
@@ -622,6 +689,13 @@ func (n *Node) recover(ctx context.Context, id TxnID, txn *Txn, keys []Key) erro
 	}
 	if !tr.done() {
 		return ErrTimeout
+	}
+	if req.Txn == nil && txn != nil && !sameKeys(keys, txn.Keys) {
+		// Started without the definition, on keys that are not exactly the
+		// transaction's: decide only from its own shards' votes. A shard it
+		// does not touch has no votes for it, which would read as "no fast
+		// path" and could invalidate a transaction decided on the fast path.
+		return n.recover(ctx, id, txn, txn.Keys)
 	}
 	// The most advanced state found (by phase, then ballot).
 	var best *recoverReply
@@ -775,7 +849,7 @@ func (n *Node) invalidate(ctx context.Context, ballot Ballot, ts *Topologies, id
 func (n *Node) commitInvalidate(ts *Topologies, id TxnID, keys []Key) error {
 	req := &commitReq{ID: id, Keys: keys, Invalidate: true}
 	for _, to := range ts.nodes() {
-		go func() { _ = n.send(context.Background(), to, mCommit, req, nil) }()
+		n.background(func(ctx context.Context) { _ = n.send(ctx, to, mCommit, req, nil) })
 	}
 	return nil
 }
@@ -803,7 +877,7 @@ func (n *Node) awaitDecided(ctx context.Context, id TxnID, keys []Key) error {
 				known = rep.Keys
 			}
 		}
-		if n.cfg.Now().Sub(start) > n.cfg.RecoverAfter {
+		if n.cfg.Now().Sub(start) > n.stallAfter(id, n.cfg.RecoverAfter) {
 			if known == nil {
 				known = keys
 			}
@@ -843,11 +917,22 @@ func (n *Node) progressLog() {
 			keys []Key
 		}
 		var todo []stalled
+		var undurable []*applyReq
 		now := n.cfg.Now()
 		after := jitter(n.cfg.RecoverAfter)
 		n.s.mu.Lock()
 		for _, c := range n.s.cmds {
 			switch {
+			case c.Status == Applied && !c.Durable && c.ID.Kind != SyncPoint && c.Txn != nil && len(c.Keys) > 0 &&
+				now.Sub(latest(c.appliedAt, c.lastChange)) > 4*n.homeDelay(c.Keys, n.stallAfter(c.ID, after))<<min(c.recoveries, 2):
+				// Applied here but not known applied at every replica: its
+				// coordinator stopped before telling them all (Persist), or
+				// this replica missed that it did. The home shard finishes
+				// the job, the other replicas later if it does not.
+				undurable = append(undurable, &applyReq{ID: c.ID, ExecuteAt: c.ExecuteAt, UniqueHLC: c.UniqueHLC,
+					Deps: c.Deps, Txn: c.Txn, Writes: c.Writes, Result: c.Result})
+				c.lastChange = now
+				c.recoveries++
 			case c.Status == Applied || c.Status == Invalidated || c.Status == Truncated:
 			case c.ID.Kind == SyncPoint && c.Status < PreApplied:
 				// Never recovered: one its coordinator abandoned is
@@ -856,19 +941,25 @@ func (n *Node) progressLog() {
 					c.Status = Invalidated
 					_ = n.s.saveLocked(c)
 				}
-			case c.blockedOn != nil && now.Sub(c.blockedSince) > after:
+			case c.blockedOn != nil && now.Sub(c.blockedSince) > n.stallAfter(*c.blockedOn, after):
 				dep := n.s.cmds[*c.blockedOn]
 				var txn *Txn
-				keys := c.owned
+				// The keys the dependency is on (never others: a recovery
+				// asking shards the transaction does not touch finds no
+				// votes there and may wrongly invalidate it).
+				keys := depKeys(c.Deps, *c.blockedOn)
 				if dep != nil {
 					txn = dep.Txn
-					if len(dep.Keys) > 0 {
+					if len(keys) == 0 && len(dep.Keys) > 0 {
 						keys = dep.Keys
 					}
 				}
+				if len(keys) == 0 {
+					keys = c.owned
+				}
 				todo = append(todo, stalled{*c.blockedOn, txn, keys})
 				c.blockedSince = now
-			case now.Sub(c.lastChange) > n.homeDelay(c.Keys, after)<<min(c.recoveries, 4) && (c.Status != NotDefined || !c.Promised.IsZero()) && len(c.Keys) > 0:
+			case now.Sub(c.lastChange) > n.homeDelay(c.Keys, n.stallAfter(c.ID, after))<<min(c.recoveries, 4) && (c.Status != NotDefined || !c.Promised.IsZero()) && len(c.Keys) > 0:
 				todo = append(todo, stalled{c.ID, c.Txn, c.Keys})
 				c.lastChange = now
 				c.recoveries++
@@ -876,6 +967,20 @@ func (n *Node) progressLog() {
 		}
 		n.s.truncateLocked()
 		n.s.mu.Unlock()
+		for _, req := range undurable {
+			if _, busy := n.recovering.LoadOrStore(req.ID, true); busy {
+				continue
+			}
+			started := n.background(func(ctx context.Context) {
+				defer n.recovering.Delete(req.ID)
+				ctx, cancel := context.WithTimeout(ctx, n.recoveryTimeout())
+				defer cancel()
+				n.ensureDurable(ctx, req)
+			})
+			if !started {
+				n.recovering.Delete(req.ID)
+			}
+		}
 		if n.cfg.DurabilityRanges != nil && now.Sub(n.lastDurable) > jitter(n.cfg.DurabilityInterval) {
 			n.lastDurable = now
 			n.wg.Add(1)
@@ -905,15 +1010,18 @@ func (n *Node) progressLog() {
 			if _, busy := n.recovering.LoadOrStore(s.id, true); busy {
 				continue
 			}
-			go func() {
+			started := n.background(func(ctx context.Context) {
 				defer n.recovering.Delete(s.id)
-				ctx, cancel := context.WithTimeout(context.Background(), n.recoveryTimeout())
+				ctx, cancel := context.WithTimeout(ctx, n.recoveryTimeout())
 				defer cancel()
 				if n.fetch(ctx, s.id, s.keys) {
 					return
 				}
 				_ = n.recover(ctx, s.id, s.txn, s.keys)
-			}()
+			})
+			if !started {
+				n.recovering.Delete(s.id)
+			}
 		}
 	}
 }
@@ -940,11 +1048,11 @@ func (n *Node) fetch(ctx context.Context, id TxnID, keys []Key) bool {
 			_, err := n.s.commit(ctx, &commitReq{ID: id, Keys: rep.Keys, Invalidate: true})
 			return err == nil
 		case (rep.Status == Applied || rep.Status == PreApplied) && rep.Txn != nil:
-			go func() {
-				actx, cancel := context.WithTimeout(context.Background(), n.recoveryTimeout())
+			n.background(func(ctx context.Context) {
+				actx, cancel := context.WithTimeout(ctx, n.recoveryTimeout())
 				defer cancel()
 				_, _ = n.s.apply(actx, &applyReq{ID: id, ExecuteAt: rep.ExecuteAt, UniqueHLC: rep.UniqueHLC, Deps: rep.Deps, Txn: rep.Txn, Writes: rep.Writes, Result: rep.Result})
-			}()
+			})
 			return true
 		case rep.Status == Stable && rep.Txn != nil:
 			// Decided and stable elsewhere: stable here too; the writes
@@ -1052,22 +1160,24 @@ func (n *Node) ephemeralReadAt(ctx context.Context, txn *Txn, epoch int64) ([]by
 	for _, s := range ts.latest() {
 		order := n.readOrder(s.Nodes)
 		done := false
-		for _, to := range order {
-			var rep ephemeralReply
-			if err := n.send(ctx, to, mEphemeralRead, &ephemeralReq{Keys: s.Keys, Deps: deps, Txn: txn}, &rep); err != nil || rep.Outcome != ok {
-				if ctx.Err() != nil {
-					return nil, 0, ErrTimeout
+		for round := 0; !done; round++ {
+			if round > 0 && !n.pause(ctx, readRetryPause) {
+				return nil, 0, ErrTimeout
+			}
+			for _, to := range order {
+				var rep ephemeralReply
+				if err := n.send(ctx, to, mEphemeralRead, &ephemeralReq{Keys: s.Keys, Deps: deps, Txn: txn}, &rep); err != nil || rep.Outcome != ok {
+					if ctx.Err() != nil {
+						return nil, 0, ErrTimeout
+					}
+					continue
 				}
-				continue
+				for k, v := range rep.Reads {
+					reads[k] = v
+				}
+				done = true
+				break
 			}
-			for k, v := range rep.Reads {
-				reads[k] = v
-			}
-			done = true
-			break
-		}
-		if !done {
-			return nil, 0, ErrTimeout
 		}
 	}
 	_, result, err := n.cfg.Agent.Execute(txn, Timestamp{Epoch: epoch, HLC: n.clock.Next(0), Node: n.cfg.ID}, reads)
@@ -1084,15 +1194,7 @@ func (n *Node) ephemeralReadAt(ctx context.Context, txn *Txn, epoch int64) ([]by
 // those ranges, and every node is told the epoch is synchronised: phases
 // stop including the earlier epochs.
 func (n *Node) syncEpochs() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		select {
-		case <-n.stop:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
+	ctx := n.ctx
 	for {
 		n.topoMu.RLock()
 		synced, latest := n.synced.Load(), n.latest
@@ -1249,12 +1351,12 @@ func (s *store) saveSynced() error {
 
 // fetchOnce fetches a transaction's outcome, or recovers it, unless that
 // is already under way.
-func (n *Node) fetchOnce(id TxnID, keys []Key) {
+func (n *Node) fetchOnce(ctx context.Context, id TxnID, keys []Key) {
 	if _, busy := n.recovering.LoadOrStore(id, true); busy {
 		return
 	}
 	defer n.recovering.Delete(id)
-	ctx, cancel := context.WithTimeout(context.Background(), n.recoveryTimeout())
+	ctx, cancel := context.WithTimeout(ctx, n.recoveryTimeout())
 	defer cancel()
 	if !n.fetch(ctx, id, keys) {
 		_ = n.recover(ctx, id, nil, keys)
@@ -1402,6 +1504,17 @@ func (n *Node) readOrder(nodes []NodeID) []NodeID {
 // homeDelay is how long a stalled transaction waits before this replica
 // recovers it: the replicas of its home key (the first) recover first
 // (accord's home shard progress log); the others only if those fail.
+// stallAfter is how long a transaction may stall before this node steps
+// in: after, or a tenth of it (at least a progress interval) once its
+// coordinator is known to be down (Config.Alive), as then nobody else is
+// completing it. Recoveries still back off and wait for the home shard.
+func (n *Node) stallAfter(id TxnID, after time.Duration) time.Duration {
+	if n.alive(id.Node) {
+		return after
+	}
+	return max(after/10, n.cfg.ProgressInterval)
+}
+
 func (n *Node) homeDelay(keys []Key, after time.Duration) time.Duration {
 	if len(keys) == 0 || len(n.owned(keys[:1], 0)) > 0 {
 		return after
