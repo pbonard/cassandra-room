@@ -251,8 +251,10 @@ func (c *simCluster) run(clients, ops int, chaos func(step int)) []*opRecord {
 	var next atomic.Int64
 	var wg sync.WaitGroup
 	stopChaos := make(chan struct{})
+	chaosDone := make(chan struct{})
 	if chaos != nil {
 		go func() {
+			defer close(chaosDone)
 			for step := 0; ; step++ {
 				select {
 				case <-stopChaos:
@@ -319,6 +321,11 @@ func (c *simCluster) run(clients, ops int, chaos func(step int)) []*opRecord {
 	}
 	wg.Wait()
 	close(stopChaos)
+	if chaos != nil {
+		// A tick racing the stop could otherwise crash a node after
+		// settle restarted them all.
+		<-chaosDone
+	}
 	return records
 }
 
