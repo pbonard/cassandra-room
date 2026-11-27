@@ -9,12 +9,19 @@ names, not its class structure.
 
 ## Protocol
 
-- **Timestamps** (`primitives.go`): epoch, hybrid logical clock, node.
-  Each node's clock is strictly increasing and carries a per-node tag in
-  its low 10 bits: the node's ordinal, a number unique among the cluster's
-  nodes that the cluster metadata assigns when the node registers. Clock
-  values from different nodes therefore never collide, so an execution timestamp's hlc can be the write timestamp of
-  the transaction's updates (`Timestamp.uniqueHlc`).
+- **Timestamps** (`primitives.go`): epoch, hybrid logical clock, node,
+  ordered in that order. Each node's clock ticks in microseconds: a new
+  value is the wall clock's, unless the clock is already ahead (then one
+  above its last value), and above any timestamp it was asked to follow;
+  it observes every timestamp it receives. Two nodes can produce the same
+  HLC: the node breaks the tie between timestamps. Cells, though, carry
+  the HLC alone, so a transaction's writes take a separate write HLC,
+  strictly above every conflicting write applied before it and decided
+  once for all replicas (`UniqueHLC`, see "HLC order" below). An earlier
+  clock gave every value a 10-bit per-node tag so that clocks never
+  collided; rounding up to the tag spaced a node's transactions about
+  1 ms apart, which under load ran the clock ahead of the wall clock and
+  let a transaction's cells beat ordinary writes made just after it.
 - **PreAccept** (`replica.go`, `Commands.preaccept`): a replica proposes
   executing at the TxnID if nothing conflicting on its keys has a later
   timestamp and the TxnID's epoch is current. Otherwise it proposes a new,
