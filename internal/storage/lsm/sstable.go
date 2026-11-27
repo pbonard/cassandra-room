@@ -555,3 +555,19 @@ func (t *Table) writerOpts() sstable.WriterOptions {
 	w.Compression = t.o().Compression.profile()
 	return w
 }
+
+// SSTableCompressions returns the block compression of each of the table's
+// sstables, by Pebble's name (MinLZ, Snappy, ZSTD, NoCompression).
+func (t *Table) SSTableCompressions() ([]string, error) {
+	s := t.acquireState()
+	defer s.release()
+	var out []string
+	for _, f := range s.files {
+		p, err := f.reader.r.ReadPropertiesBlock(context.Background(), nil)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p.CompressionName)
+	}
+	return out, nil
+}

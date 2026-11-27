@@ -575,7 +575,10 @@ func (s *store) decideHLC(r *decideHLCReq) (*decideHLCReply, error) {
 	case c.Status == Invalidated:
 		return &decideHLCReply{Outcome: redundant}, s.unlock()
 	case c.Status >= PreApplied:
-		return &decideHLCReply{Outcome: ok, Applied: true, UniqueHLC: c.UniqueHLC}, s.unlock()
+		// The HLC its writes were applied at, never below the execution
+		// timestamp's (UniqueHLC alone is 0 for a command applied without
+		// one).
+		return &decideHLCReply{Outcome: ok, Applied: true, UniqueHLC: c.writeHLC()}, s.unlock()
 	case r.Ballot.Less(c.Promised):
 		return &decideHLCReply{Outcome: rejectedBallot}, s.unlock()
 	}
