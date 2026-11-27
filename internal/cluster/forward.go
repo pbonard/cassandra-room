@@ -37,9 +37,8 @@ type relayWait struct {
 // order they arrive; a node that has not answered when ctx ends gets
 // ErrTimeout (or ctx's error).
 //
-// It falls back to sending to each node directly when a node does not speak
-// a messaging version with forwarding, or when the request could not be
-// sent to via at all.
+// It falls back to sending to each node directly when the request could
+// not be sent to via at all.
 func (m *Messaging) RequestForward(ctx context.Context, via string, forward []string, verb Verb, payload []byte) <-chan Reply {
 	out := make(chan Reply, len(forward)+1)
 	direct := func(nodes []string) {

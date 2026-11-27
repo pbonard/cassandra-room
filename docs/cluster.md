@@ -3,7 +3,8 @@
 Nodes form a cluster as Cassandra nodes do, with the same consistency
 levels and the same failure behaviour seen from drivers. Everything is in
 `internal/cluster` (transport, membership, ring) and `internal/db/proxy.go`,
-`topology.go` (coordination), using only the Go standard library (no memberlist or Raft dependency).
+`topology.go` (coordination), with no memberlist or Raft dependency (the
+only library is LZ4, for internode compression).
 
 ```
 cassandra-room -addr 10.0.0.1:9042 -listen-address 10.0.0.1:7000 -seeds 10.0.0.1:7000 -admin-address 10.0.0.1:7199
@@ -57,8 +58,8 @@ is a linearized log of epochs**.
     (membership, metadata service), small (reads, writes), large
     (streaming, range reads, repair, and any message over 64 KiB), so a
     large message never delays a heartbeat or a write;
-  - a handshake agreeing on the protocol version (refusing peers with no
-    common version), then frames carrying a CRC32C of header and payload
+  - a handshake checking the protocol version (a cluster runs one version:
+    a peer on another is refused), then frames carrying a CRC32C of header and payload
     (a mismatch closes the connection) and the sender's deadline;
   - queue limits as `internode_application_*_queue_*`: 4 MiB per
     connection, then 128 MiB per endpoint and 512 MiB in all. Outbound, a
@@ -142,8 +143,7 @@ node, the coordinator in a cluster.
   each data center once instead of once per replica. A replica the
   forwarding node cannot reach is reported to the coordinator as failed
   (and hinted); if the forwarding node itself cannot be sent the message,
-  the others are sent it directly. Forwarding needs messaging version 5,
-  so a node still on version 4 is always sent its writes directly. A replica
+  the others are sent it directly. A replica
   that does not answer within the write timeout is hinted, as one that
   fails. Too few live
   replicas: `Unavailable`; no answer in time: `WriteTimeout` (at ANY, the

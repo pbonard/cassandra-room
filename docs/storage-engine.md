@@ -1,7 +1,6 @@
 # Storage engine design (`internal/storage/lsm`)
 
-This document describes cassandra-room's own LSM storage engine. It replaces
-the plan in MEMO.md to use Pebble as the storage engine.
+This document describes cassandra-room's own LSM storage engine.
 
 The engine follows **Cassandra's storage architecture**: one commit log per
 node, and a memtable, sstable set and compaction strategy per table. It
@@ -63,8 +62,8 @@ Per-table operations:
 
 ## 3. What is reused from Pebble, and what is not
 
-Pebble is pinned at upstream commit a995e89. Only its public packages are
-imported.
+Pebble is an upstream commit, pinned in `go.mod`. Only its public packages
+are imported.
 
 | Area | Choice | Why |
 |---|---|---|
@@ -125,8 +124,13 @@ repair, hinted handoff and client-supplied timestamps cause routinely. So:
     bytes and encoding, decoding and merging about 30% less time
     (`BenchmarkRowFormat`); `BenchmarkRowSpace` reports the bytes per row
     in the WAL and in sstables for each compression.
-  Collections (cells with paths), counters and range tombstones are not
-  modelled yet.
+  Multi-cell columns are modelled too: an element is a cell with a path,
+  and a complex deletion shadows the column's older elements. So are
+  counters, whose cells hold contexts merged shard by shard, not by
+  timestamp. Partition deletions and range tombstones span several keys,
+  so the schema layer stores them as rows of their own and purges them
+  with a compaction filter (`TableOptions.RowFilter`; see
+  `docs/execution-layer.md`).
 - **Memtables keep every fragment**; a flush merges each key's fragments into
   one entry, and records the file's minimum and maximum timestamps (as
   Cassandra's `Statistics.db`) in the manifest.
@@ -203,6 +207,10 @@ are deleted.
   same rows as point lookups. An iterator holds a reference on the table's
   read state, so sstables replaced by a compaction stay open (and on disk)
   until the last iterator using them closes.
+- **Reverse iterators (`Table.NewReverseIter`):** rows from the upper bound
+  down, for queries in the opposite of the stored clustering order. They
+  read only the rows they return: memtables by skiplist searches, sstables
+  by Pebble's `SeekLT`/`Prev`, merged with a max-heap.
 - **Read snapshots (M6, `Table.NewSnapshot`):** the table's read state (a
   reference on its memtables and sstables) plus the visible sequence
   number, which hides later writes in the memtables. Reads through the
@@ -221,8 +229,9 @@ cluster layer (choosing ranges, peers and transfers) is out of scope.
   `snapshots/<name>/<table>/`, then `manifest.json` (the data files and
   creation time, as Cassandra's `SnapshotManifest`) is written last, so an
   incomplete snapshot is recognisable; this follows `TakeSnapshotTask`
-  (flush unless skipped, link, manifest). Not ported: `schema.cql` (no
-  schema layer yet), snapshot TTLs and ephemeral snapshots. Links share space with the live
+  (flush unless skipped, link, manifest). Not ported: `schema.cql` (a
+  snapshot holds only data files; the schema is the database's own, in
+  `schema.json`), snapshot TTLs and ephemeral snapshots. Links share space with the live
   table until compaction replaces its files. Recovery ignores the snapshots
   directory. `Engine.ClearSnapshot` deletes one; `Table.SnapshotFiles` lists
   one for restoring with `Import`.
@@ -292,8 +301,12 @@ and `unified/Controller.java`.
   last's (`ShardManager.density`); a span under 2⁻⁴⁸ (one partition, or a
   test's narrow keys) counts as the whole space, as
   `MINIMUM_TOKEN_COVERAGE` does. Level `n` starts at density `m·F^n`, where
-  `m` is the flush size. The engine is one node owning the whole ring, so
-  there are no local ranges to discount.
+  `m` is the flush size. In a cluster a node owns only some token ranges
+  (`Table.SetOwnedRanges`, set by the database from the ring): densities
+  and shard boundaries are then measured over the owned token space, as
+  Cassandra discounts local ranges, so a node owning a quarter of the ring
+  does not see its sstables as four times sparser than they are. Without
+  owned ranges the whole space counts.
 - **Trigger and buckets (M4):** within a level, sstables form overlap sets
   (`Overlaps.constructOverlapSets`: for every key, some set holds every
   sstable covering it). A set with `T` or more sstables triggers a
@@ -520,8 +533,8 @@ differences it found were fixed or are listed.) Cell reconciliation
   tombstones cannot be dropped yet is not rewritten in a loop.
 - **Row existence.** The row codec has no primary-key liveness (Cassandra's
   row marker): a row with no cells and no deletion is empty and may be
-  dropped. The schema layer must represent `INSERT` of a key alone with a
-  cell (for example an empty marker column).
+  dropped. The schema layer represents `INSERT` of a key alone with a cell
+  of column 0, the row marker (`docs/execution-layer.md`).
 - **Major compaction (`Table.Compact`):** Cassandra's `nodetool compact`:
   flush, wait for the table's running compactions (pausing new ones), then
   merge and purge all of its sstables into one set of shards.
