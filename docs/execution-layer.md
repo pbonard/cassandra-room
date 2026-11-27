@@ -167,8 +167,11 @@ options one to one (scaling_parameters, base_shard_count,
 target_sstable_size, min_sstable_size, sstable_growth, ...);
 TimeWindowCompactionStrategy to the time-window mode (window unit and size,
 unsafe_aggressive_sstable_expiration); SizeTiered and Leveled run as UCS with
-T4 and L10. gc_grace_seconds sets the purge horizon. Options changed by
-ALTER TABLE take effect when the server restarts.
+T4 and L10. gc_grace_seconds sets the purge horizon. The compression map
+selects the sstables' block compression (validated as Cassandra's
+CompressionParams; see storage-engine.md). Options changed by ALTER TABLE
+apply to the table at once, as the new schema is installed; compression
+applies to the sstables written from then on.
 
 ## Also supported
 

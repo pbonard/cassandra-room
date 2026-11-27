@@ -4,6 +4,7 @@ import (
 	"crypto/md5"
 	"encoding/json"
 	"fmt"
+	"math"
 	"regexp"
 	"slices"
 	"sort"
@@ -590,55 +591,132 @@ func mapProperty(p cql.Property) (map[string]string, error) {
 // compressionOption translates a table's compression map to the storage
 // engine's block compression. LZ4 (Cassandra's default) maps to MinLZ, the
 // same kind of codec; Deflate, which only Zstandard matches in ratio, to
-// Zstandard. With enabled: false or an empty class the table is not
-// compressed, as in Cassandra; an empty map is the default.
+// Zstandard. With enabled: false, an empty legacy sstable_compression or
+// NoopCompressor the table is not compressed; an empty map is the default.
+// The other options are validated as Cassandra does, though the block size
+// stays the engine's (chunk_length_in_kb) and levels are not mapped.
 func compressionOption(m map[string]string) (lsm.Compression, error) {
 	if len(m) == 0 {
 		return lsm.CompressionDefault, nil
+	}
+	// The checks and messages of Cassandra's CompressionParams.fromMap.
+	if e, ok := m["enabled"]; ok {
+		switch strings.ToLower(e) {
+		case "true":
+		case "false":
+			if len(m) > 1 {
+				return 0, configf("If the 'enabled' option is set to false no other options must be specified")
+			}
+			return lsm.CompressionNone, nil
+		default:
+			return 0, configf("Invalid value %s for 'enabled' compression option", e)
+		}
+	}
+	class, hasClass := m["class"]
+	legacy, hasLegacy := m["sstable_compression"]
+	switch {
+	case hasClass && hasLegacy:
+		return 0, configf("The 'sstable_compression' option must not be used if the compression algorithm is already specified by the 'class' option")
+	case hasClass && class == "":
+		return 0, configf("The 'class' option must not be empty. To disable compression use 'enabled' : false")
+	case hasLegacy && legacy == "":
+		return lsm.CompressionNone, nil
+	case hasLegacy:
+		class = legacy
+	case !hasClass:
+		return 0, configf("Missing sub-option 'class' for the 'compression' option.")
+	}
+	short := class[strings.LastIndexByte(class, '.')+1:]
+	var c lsm.Compression
+	// The options of the compressor itself (Cassandra's
+	// ICompressor.supportedOptions).
+	own := map[string]bool{}
+	switch short {
+	case "LZ4Compressor":
+		c, own["lz4_compressor_type"], own["lz4_high_compressor_level"] = lsm.CompressionMinLZ, true, true
+	case "SnappyCompressor":
+		c = lsm.CompressionSnappy
+	case "ZstdCompressor":
+		c, own["compression_level"] = lsm.CompressionZstd, true
+	case "DeflateCompressor":
+		c = lsm.CompressionZstd
+	case "NoopCompressor":
+		c = lsm.CompressionNone
+	default:
+		return 0, configf("Could not create Compression for type %s", class)
 	}
 	var unknown []string
 	for k := range m {
 		switch k {
 		case "class", "sstable_compression", "enabled", "chunk_length_in_kb", "chunk_length_kb",
-			"crc_check_chance", "compression_level", "min_compress_ratio", "max_compressed_length":
+			"crc_check_chance", "min_compress_ratio", "max_compressed_length":
 		default:
-			unknown = append(unknown, k)
+			if !own[k] {
+				unknown = append(unknown, k)
+			}
 		}
 	}
 	if len(unknown) > 0 {
 		slices.Sort(unknown)
 		return 0, configf("Unknown compression options [%s]", strings.Join(unknown, ", "))
 	}
-	if e, ok := m["enabled"]; ok {
-		switch strings.ToLower(e) {
-		case "true":
-		case "false":
-			return lsm.CompressionNone, nil
-		default:
-			return 0, configf("Invalid value %s for 'enabled' compression option", e)
+
+	chunk, hasChunk := m["chunk_length_in_kb"]
+	if old, ok := m["chunk_length_kb"]; ok {
+		if hasChunk {
+			return 0, configf("The 'chunk_length_kb' option must not be used if the chunk length is already specified by the 'chunk_length_in_kb' option")
+		}
+		chunk, hasChunk = old, true
+	}
+	if hasChunk {
+		n, err := strconv.ParseInt(chunk, 10, 64)
+		switch {
+		case err != nil:
+			return 0, configf("Invalid value %s for chunk_length_in_kb", chunk)
+		case n <= 0:
+			return 0, configf("Invalid negative or null chunk_length_in_kb")
+		case n > math.MaxInt32/1024:
+			return 0, configf("Value of chunk_length_in_kb is too large (%s)", chunk)
+		case n&(n-1) != 0:
+			return 0, configf("chunk_length_in_kb must be a power of 2")
 		}
 	}
-	class, ok := m["class"]
-	if !ok {
-		class, ok = m["sstable_compression"]
+	if v, ok := m["crc_check_chance"]; ok {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil || f < 0 || f > 1 {
+			return 0, configf("crc_check_chance should be between 0.0 and 1.0")
+		}
 	}
-	if !ok {
-		return 0, configf("Missing sub-option 'class' for the 'compression' option.")
+	ratio, hasRatio := m["min_compress_ratio"]
+	if hasRatio {
+		f, err := strconv.ParseFloat(ratio, 64)
+		if err != nil || f != 0 && f < 1 {
+			return 0, configf("Invalid 'min_compress_ratio' value for the 'compression' option. Can either be 0 or greater than or equal to 1: %s", ratio)
+		}
 	}
-	if class == "" {
-		return lsm.CompressionNone, nil
+	if v, ok := m["max_compressed_length"]; ok {
+		if hasRatio {
+			return 0, configf("Can not specify both 'min_compress_ratio' and 'max_compressed_length' for the compressor parameters.")
+		}
+		if n, err := strconv.ParseInt(v, 10, 32); err != nil || n < 0 {
+			return 0, configf("Invalid value %s for max_compressed_length", v)
+		}
 	}
-	switch class[strings.LastIndexByte(class, '.')+1:] {
-	case "LZ4Compressor":
-		return lsm.CompressionMinLZ, nil
-	case "SnappyCompressor":
-		return lsm.CompressionSnappy, nil
-	case "ZstdCompressor", "DeflateCompressor":
-		return lsm.CompressionZstd, nil
-	case "NoopCompressor":
-		return lsm.CompressionNone, nil
+	if v, ok := m["compression_level"]; ok {
+		n, err := strconv.ParseInt(v, 10, 32)
+		if err != nil || n < -131072 || n > 22 {
+			return 0, configf("ZstdCompressor compression_level must be between -131072 and 22: %s", v)
+		}
 	}
-	return 0, configf("Could not create Compression for type %s", class)
+	if v, ok := m["lz4_compressor_type"]; ok && v != "fast" && v != "high" {
+		return 0, configf("Invalid compressor type '%s' specified for LZ4 parameter 'lz4_compressor_type'. Valid options are [fast, high].", v)
+	}
+	if v, ok := m["lz4_high_compressor_level"]; ok {
+		if n, err := strconv.Atoi(v); err != nil || n < 1 || n > 17 {
+			return 0, configf("Invalid value [%s] for parameter 'lz4_high_compressor_level'. Value must be between 1 and 17.", v)
+		}
+	}
+	return c, nil
 }
 
 // compactionOptions translates a table's compaction map to the storage

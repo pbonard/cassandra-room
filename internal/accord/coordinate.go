@@ -357,7 +357,7 @@ func (n *Node) executeWith(ctx context.Context, ballot Ballot, id TxnID, txn *Tx
 			uniqueHLC = prior
 		}
 		var err error
-		if uniqueHLC, err = n.decideHLC(ctx, ts, ballot, id, txn.Keys, uniqueHLC); err != nil {
+		if uniqueHLC, err = n.decideHLC(ctx, ts, ballot, id, executeAt, txn.Keys, uniqueHLC); err != nil {
 			return nil, err
 		}
 		writeAt := Timestamp{Epoch: executeAt.Epoch, HLC: uniqueHLC, Node: executeAt.Node}
@@ -378,8 +378,9 @@ func (n *Node) executeWith(ctx context.Context, ballot Ballot, id TxnID, txn *Tx
 // writes carry, at a ballot, and returns the decided one: a replica that
 // already applied the transaction answers the HLC it applied it at, which
 // is final.
-func (n *Node) decideHLC(ctx context.Context, ts *Topologies, ballot Ballot, id TxnID, keys []Key, hlc int64) (int64, error) {
-	req := &decideHLCReq{ID: id, Ballot: ballot, UniqueHLC: hlc, Keys: keys}
+func (n *Node) decideHLC(ctx context.Context, ts *Topologies, ballot Ballot, id TxnID, executeAt Timestamp, keys []Key, hlc int64) (int64, error) {
+	hlc = max(hlc, executeAt.HLC)
+	req := &decideHLCReq{ID: id, Ballot: ballot, ExecuteAt: executeAt, UniqueHLC: hlc, Keys: keys}
 	nodes := ts.nodes()
 	ch := broadcast[decideHLCReply](ctx, n, nodes, mDecideHLC, func(NodeID) any { return req })
 	tr := newTracker(ts, (*Shard).slowQuorum)
@@ -398,7 +399,8 @@ func (n *Node) decideHLC(ctx context.Context, ts *Topologies, ballot Ballot, id 
 		case r.reply.Outcome != ok:
 			tr.failure(r.from)
 		case r.reply.Applied:
-			return r.reply.UniqueHLC, nil
+			// Writes are never below the execution timestamp.
+			return max(r.reply.UniqueHLC, executeAt.HLC), nil
 		default:
 			tr.success(r.from)
 		}

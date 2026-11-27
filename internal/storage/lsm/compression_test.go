@@ -1,7 +1,7 @@
 package lsm
 
 import (
-	"context"
+	"slices"
 	"fmt"
 	"testing"
 
@@ -86,15 +86,10 @@ func TestTableCompression(t *testing.T) {
 }
 
 func compressionNames(tbl *Table) []string {
-	s := tbl.acquireState()
-	defer s.release()
-	var out []string
-	for _, f := range s.files {
-		p, err := f.reader.r.ReadPropertiesBlock(context.Background(), nil)
-		if err != nil {
-			panic(err)
-		}
-		out = append(out, p.CompressionName)
+	out, err := tbl.SSTableCompressions()
+	if err != nil {
+		panic(err)
 	}
+	slices.Sort(out)
 	return out
 }

@@ -421,7 +421,7 @@ func TestRecoveryAdoptsDecidedHLC(t *testing.T) {
 	ts := n1.phaseTopologies(txn.Keys, id.Epoch, id.Epoch)
 	// n1 coordinated it up to the decided HLC, then stopped.
 	require.NoError(t, n1.quorum(ctx, ts, mCommit, &commitReq{ID: id, ExecuteAt: id.Timestamp, Deps: Deps{}, Txn: txn, Keys: txn.Keys}))
-	decided, err := n1.decideHLC(ctx, ts, Ballot{}, id, txn.Keys, id.HLC)
+	decided, err := n1.decideHLC(ctx, ts, Ballot{}, id, id.Timestamp, txn.Keys, id.HLC)
 	require.NoError(t, err)
 	require.Equal(t, id.HLC, decided)
 
@@ -455,7 +455,7 @@ func TestDecideHLCPreempted(t *testing.T) {
 		_, err := c.node(i).s.beginRecovery(&recoverReq{ID: id, Ballot: b, Txn: txn, Keys: txn.Keys})
 		require.NoError(t, err)
 	}
-	_, err := n1.decideHLC(ctx, ts, Ballot{}, id, txn.Keys, id.HLC)
+	_, err := n1.decideHLC(ctx, ts, Ballot{}, id, id.Timestamp, txn.Keys, id.HLC)
 	require.ErrorIs(t, err, errPreempted)
 }
 
@@ -568,4 +568,65 @@ func TestAwaitSyncedAsks(t *testing.T) {
 	n.awaitSynced(ctx, 3)
 	require.Equal(t, int64(3), n.synced.Load())
 	require.Less(t, time.Since(start), time.Second)
+}
+
+// TestDecideHLCAppliedFloor: a replica that applied a transaction answers
+// the HLC its writes carry, which is never below the execution timestamp's,
+// even for a command applied without a UniqueHLC; the executor then writes
+// at that HLC, never at 0.
+func TestDecideHLCAppliedFloor(t *testing.T) {
+	c := newSimCluster(t, 3, 3, 1)
+	k := c.keys[0]
+	n1 := c.node(1)
+	id := TxnID{Timestamp: Timestamp{Epoch: 1, HLC: n1.clock.Next(0), Node: "n1"}, Kind: Write}
+	txn := appendTxn(t, k, 1)
+	for i := 0; i < 3; i++ {
+		s := c.node(i).s
+		s.mu.Lock()
+		cmd := s.get(id)
+		cmd.Txn, cmd.Status, cmd.ExecuteAt, cmd.UniqueHLC = txn, PreApplied, id.Timestamp, 0
+		s.registerLocked(cmd, txn.Keys)
+		s.mu.Unlock()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ts := n1.phaseTopologies(txn.Keys, id.Epoch, id.Epoch)
+	decided, err := n1.decideHLC(ctx, ts, Ballot{}, id, id.Timestamp, txn.Keys, id.HLC)
+	require.NoError(t, err)
+	require.Equal(t, id.HLC, decided)
+}
+
+// TestDecideHLCWaitsForEpoch: like Commit, DecideUniqueHlc waits for the
+// execution epoch (a replica only of that epoch would otherwise not own
+// the keys yet).
+func TestDecideHLCWaitsForEpoch(t *testing.T) {
+	c := newSimCluster(t, 3, 2, 2)
+	k0, k1 := c.keys[0], c.keys[1]
+	epoch2 := leaveTopology(c)
+	c.node(1).SetTopology(epoch2)
+	n0 := c.node(0)
+	asked := make(chan int64, 1)
+	n0.cfg.FetchEpoch = func(from NodeID, e int64) {
+		select {
+		case asked <- e:
+		default:
+		}
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			n0.SetTopology(epoch2)
+		}()
+	}
+	txn := transferTxn(t, k0, k1)
+	id := TxnID{Timestamp: Timestamp{Epoch: 1, HLC: n0.clock.Next(0), Node: "n1"}, Kind: Write}
+	at := Timestamp{Epoch: 2, HLC: id.HLC + 1, Node: "n1"}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rep := handle[decideHLCReply](t, ctx, n0, "n1", mDecideHLC, &decideHLCReq{ID: id, ExecuteAt: at, UniqueHLC: at.HLC, Keys: txn.Keys})
+	require.Equal(t, ok, rep.Outcome)
+	select {
+	case e := <-asked:
+		require.Equal(t, int64(2), e)
+	default:
+		t.Fatal("n0 did not wait for the execution epoch")
+	}
 }

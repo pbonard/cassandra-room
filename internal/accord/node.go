@@ -474,6 +474,7 @@ type applyReply struct {
 type decideHLCReq struct {
 	ID        TxnID
 	Ballot    Ballot
+	ExecuteAt Timestamp
 	UniqueHLC int64
 	Keys      []Key
 }
@@ -650,7 +651,9 @@ func (n *Node) Handle(ctx context.Context, from NodeID, payload []byte) ([]byte,
 	case mDecideHLC:
 		var r decideHLCReq
 		if err = json.Unmarshal(env.B, &r); err == nil {
-			if err = n.awaitEpochFrom(ctx, from, r.ID.Epoch); err != nil {
+			// As Commit: a replica of the execution epoch only may not
+			// know it yet.
+			if err = n.awaitEpochFrom(ctx, from, max(r.ID.Epoch, r.ExecuteAt.Epoch)); err != nil {
 				break
 			}
 			reply, err = n.s.decideHLC(&r)
