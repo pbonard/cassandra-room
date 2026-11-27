@@ -22,10 +22,7 @@ names, not its class structure.
   collided; rounding up to the tag spaced a node's transactions about
   1 ms apart, which under load ran the clock ahead of the wall clock and
   let a transaction's cells beat ordinary writes made just after it.
-- **PreAccept** (`replica.go`, `Commands.preaccept`): a replica proposes
-  executing at the TxnID if nothing conflicting on its keys has a later
-  timestamp and the TxnID's epoch is current. Otherwise it proposes a new,
-  later timestamp. It returns the conflicting transactions with lower ids
+- **PreAccept** (`replica.go`, `Commands.preaccept`): If the transaction's TxnID is in the current epoch and newer than every conflicting transaction the replica has seen on those keys, the replica votes to execute it at TxnID. Otherwise, it proposes a later timestamp. It returns the conflicting transactions with lower ids
   (its dependencies).
 - **Fast path** (`coordinate.go`, `CoordinateTransaction`): if a fast
   quorum of every shard voted for the TxnID, the transaction executes there
