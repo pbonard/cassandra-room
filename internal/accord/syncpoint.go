@@ -329,14 +329,7 @@ func (n *Node) durability() {
 		if !n.s.dirty(r) {
 			continue // nothing above its redundancy bound
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*n.recoveryTimeout())
-		go func() {
-			select {
-			case <-n.stop:
-				cancel()
-			case <-ctx.Done():
-			}
-		}()
+		ctx, cancel := context.WithTimeout(n.ctx, 2*n.recoveryTimeout())
 		uctx, ucancel := context.WithTimeout(ctx, n.recoveryTimeout())
 		id, err := n.SyncPoint(uctx, r, true)
 		ucancel()
@@ -445,7 +438,7 @@ func (n *Node) awaitSynced(ctx context.Context, epoch int64) {
 	for n.synced.Load() < epoch && time.Now().Before(deadline) {
 		if time.Since(asked) >= 200*time.Millisecond {
 			asked = time.Now()
-			go n.askSynced(ctx)
+			n.askSynced(ctx)
 		}
 		select {
 		case <-ctx.Done():
@@ -471,12 +464,14 @@ func (n *Node) askSynced(ctx context.Context) {
 		if to == n.cfg.ID || !n.alive(to) {
 			continue
 		}
-		go func() {
+		n.background(func(context.Context) {
+			ctx, cancel := n.bound(ctx)
+			defer cancel()
 			var r epochSynced
 			if err := n.send(ctx, to, mGetSynced, struct{}{}, &r); err == nil {
 				n.advanceSynced(r.Epoch)
 			}
-		}()
+		})
 	}
 }
 

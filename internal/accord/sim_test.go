@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
@@ -33,6 +34,16 @@ type simNet struct {
 	cut     map[[2]NodeID]bool
 	drop    float64
 	maxWait time.Duration
+	// rng draws the network's delays and losses, and the tests' faults
+	// (under mu), from the test's seed.
+	rng *rand.Rand
+}
+
+// up is the failure detector's view: a node crashed is seen down.
+func (nt *simNet) up(id NodeID) bool {
+	nt.mu.Lock()
+	defer nt.mu.Unlock()
+	return !nt.down[id]
 }
 
 type simTransport struct {
@@ -44,8 +55,8 @@ func (t *simTransport) Request(ctx context.Context, to NodeID, payload []byte) (
 	nt := t.net
 	nt.mu.Lock()
 	n := nt.nodes[to]
-	fail := nt.down[to] || nt.down[t.from] || nt.cut[[2]NodeID{t.from, to}] || nt.cut[[2]NodeID{to, t.from}] || rand.Float64() < nt.drop
-	wait := time.Duration(rand.Int64N(int64(nt.maxWait) + 1))
+	fail := nt.down[to] || nt.down[t.from] || nt.cut[[2]NodeID{t.from, to}] || nt.cut[[2]NodeID{to, t.from}] || nt.rng.Float64() < nt.drop
+	wait := time.Duration(nt.rng.Int64N(int64(nt.maxWait) + 1))
 	nt.mu.Unlock()
 	if fail || n == nil {
 		select {
@@ -60,7 +71,7 @@ func (t *simTransport) Request(ctx context.Context, to NodeID, payload []byte) (
 		return nil, err
 	}
 	nt.mu.Lock()
-	lost := nt.down[to] || rand.Float64() < nt.drop
+	lost := nt.down[to] || nt.rng.Float64() < nt.drop
 	nt.mu.Unlock()
 	if lost {
 		return nil, errors.New("sim: reply lost")
@@ -152,11 +163,14 @@ type simCluster struct {
 	keys    []Key
 	rf      int
 	cfgBase Config
+	// crashes are the times each node was crashed (under net.mu).
+	crashes map[NodeID][]time.Time
 }
 
 func newSimCluster(t *testing.T, nodes, rf, keys int) *simCluster {
-	c := &simCluster{t: t, net: &simNet{nodes: map[NodeID]*Node{}, down: map[NodeID]bool{}, cut: map[[2]NodeID]bool{}, maxWait: time.Millisecond},
-		stores: map[NodeID]*listStore{}, jours: map[NodeID]*MemJournal{}, rf: rf}
+	c := &simCluster{t: t, net: &simNet{nodes: map[NodeID]*Node{}, down: map[NodeID]bool{}, cut: map[[2]NodeID]bool{}, maxWait: time.Millisecond,
+		rng: rand.New(rand.NewPCG(simSeed, 1))},
+		stores: map[NodeID]*listStore{}, jours: map[NodeID]*MemJournal{}, rf: rf, crashes: map[NodeID][]time.Time{}}
 	for i := 0; i < nodes; i++ {
 		id := fmt.Sprintf("n%d", i)
 		c.ids = append(c.ids, id)
@@ -195,7 +209,7 @@ func (c *simCluster) start(i int) {
 	}
 	n, err := NewNode(Config{ID: id, Transport: &simTransport{net: c.net, from: id}, Data: c.stores[id], Agent: listAgent{},
 		Journal: c.jours[id], ProgressInterval: 20 * time.Millisecond, RecoverAfter: 500 * time.Millisecond,
-		RequestTimeout: time.Second, RetainApplied: time.Hour})
+		RequestTimeout: time.Second, RetainApplied: time.Hour, Alive: c.net.up})
 	require.NoError(c.t, err)
 	n.SetTopology(&Topology{Epoch: 1, Replicas: c.replicas, Nodes: c.ids})
 	n.Start()
@@ -212,6 +226,9 @@ func (c *simCluster) crash(i int) {
 	n := c.net.nodes[id]
 	c.net.down[id] = true
 	delete(c.net.nodes, id)
+	if n != nil {
+		c.crashes[id] = append(c.crashes[id], time.Now())
+	}
 	c.net.mu.Unlock()
 	if n != nil {
 		n.Stop()
@@ -220,6 +237,7 @@ func (c *simCluster) crash(i int) {
 
 type opRecord struct {
 	start, end time.Time
+	coord      NodeID
 	appends    map[string]int
 	keys       int
 	res        *listResult
@@ -284,7 +302,7 @@ func (c *simCluster) run(clients, ops int, chaos func(step int)) []*opRecord {
 				}
 				c.net.mu.Unlock()
 				coord := live[r.IntN(len(live))]
-				rec := &opRecord{start: time.Now(), appends: u.Appends, keys: len(keys)}
+				rec := &opRecord{start: time.Now(), coord: coord.ID(), appends: u.Appends, keys: len(keys)}
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				out, err := coord.Coordinate(ctx, &Txn{Kind: kind, Keys: keys, Update: b})
 				cancel()
@@ -319,12 +337,18 @@ func (c *simCluster) settle() {
 			c.start(i)
 		}
 	}
+	// Every command applied or invalidated, and every applied transaction
+	// durable (applied at all its replicas).
 	stuck := func(log bool) bool {
 		found := false
 		for id, n := range c.net.nodes {
 			n.s.mu.Lock()
 			for _, cmd := range n.s.cmds {
-				if cmd.Status != Applied && cmd.Status != Invalidated && cmd.Status != Truncated && (cmd.Status != NotDefined || len(cmd.Keys) > 0) {
+				pending := cmd.Status != Applied && cmd.Status != Invalidated && cmd.Status != Truncated && (cmd.Status != NotDefined || len(cmd.Keys) > 0)
+				// Applied here, but not yet known applied at every replica
+				// (one may not have heard of it).
+				undurable := cmd.Status == Applied && !cmd.Durable && cmd.ID.Kind != SyncPoint
+				if pending || undurable {
 					found = true
 					if !log {
 						break
@@ -460,11 +484,51 @@ func (c *simCluster) check(records []*opRecord) {
 			}
 		}
 	}
-	t.Logf("%d acknowledged, %d failed", acked, failed)
-	require.Greater(t, acked, len(records)/5)
+	// Liveness: transactions whose coordinator crashed while they ran
+	// end unknown to their client (whether they took effect is checked
+	// above); of the others, most must be acknowledged. How many
+	// coordinators the crashes catch mid-transaction depends on goroutine
+	// scheduling, which the fake clock does not fix, so the share of all
+	// transactions acknowledged varies (from about a quarter to two
+	// thirds in the crash test); this one does not.
+	survived, survivedOK := 0, 0
+	errs := map[string]int{}
+	for _, r := range records {
+		crashed := false
+		for _, at := range c.crashes[r.coord] {
+			crashed = crashed || !at.Before(r.start) && !at.After(r.end)
+		}
+		if crashed {
+			continue
+		}
+		survived++
+		if r.err == nil {
+			survivedOK++
+		} else {
+			errs[r.err.Error()]++
+		}
+	}
+	t.Logf("%d acknowledged, %d failed; coordinator up throughout: %d, of which %d acknowledged (failed: %v)",
+		acked, failed, survived, survivedOK, errs)
+	require.Greater(t, survived, len(records)/5, "too many transactions lost their coordinator")
+	require.GreaterOrEqual(t, 2*survivedOK, survived, "fewer than half the transactions whose coordinator stayed up were acknowledged")
 }
 
-func TestSimNoFaults(t *testing.T) {
+// simSeed seeds the simulation's network and faults (and its
+// transactions are seeded by their number).
+const simSeed = 1
+
+// simTest runs a simulation in a synctest bubble: on a fake clock that
+// advances only when every goroutine of the cluster is blocked, so the
+// delays, timeouts and fault schedule play out the same on a loaded
+// machine (or under the race detector) as on an idle one, and waiting
+// costs no real time. Every goroutine the nodes start must end by the
+// time the test does (Node.Stop waits for them).
+func simTest(t *testing.T, f func(*testing.T)) { synctest.Test(t, f) }
+
+func TestSimNoFaults(t *testing.T) { simTest(t, testSimNoFaults) }
+
+func testSimNoFaults(t *testing.T) {
 	c := newSimCluster(t, 5, 3, 8)
 	records := c.run(8, 400, nil)
 	c.settle()
@@ -480,7 +544,9 @@ func TestSimNoFaults(t *testing.T) {
 	require.Less(t, failed, len(records)/10)
 }
 
-func TestSimDrops(t *testing.T) {
+func TestSimDrops(t *testing.T) { simTest(t, testSimDrops) }
+
+func testSimDrops(t *testing.T) {
 	c := newSimCluster(t, 5, 3, 6)
 	c.net.drop = 0.05
 	records := c.run(8, 300, nil)
@@ -488,7 +554,9 @@ func TestSimDrops(t *testing.T) {
 	c.check(records)
 }
 
-func TestSimCrashes(t *testing.T) {
+func TestSimCrashes(t *testing.T) { simTest(t, testSimCrashes) }
+
+func testSimCrashes(t *testing.T) {
 	c := newSimCluster(t, 5, 3, 6)
 	c.net.drop = 0.02
 	records := c.run(8, 300, func(step int) {
@@ -504,7 +572,9 @@ func TestSimCrashes(t *testing.T) {
 	c.check(records)
 }
 
-func TestSimPartitions(t *testing.T) {
+func TestSimPartitions(t *testing.T) { simTest(t, testSimPartitions) }
+
+func testSimPartitions(t *testing.T) {
 	c := newSimCluster(t, 5, 3, 6)
 	records := c.run(8, 300, func(step int) {
 		c.net.mu.Lock()
@@ -513,7 +583,7 @@ func TestSimPartitions(t *testing.T) {
 		if step%3 == 2 {
 			return
 		}
-		a, b := c.ids[rand.IntN(len(c.ids))], c.ids[rand.IntN(len(c.ids))]
+		a, b := c.ids[c.net.rng.IntN(len(c.ids))], c.ids[c.net.rng.IntN(len(c.ids))]
 		c.net.cut[[2]NodeID{a, b}] = true
 	})
 	c.settle()

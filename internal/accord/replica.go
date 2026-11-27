@@ -731,7 +731,8 @@ func (s *store) maybeExecuteLocked(c *command) {
 		return
 	}
 	c.executing = true
-	go s.applyWrites(c.ID, c.Txn, c.writeAt(), c.owned, c.Writes)
+	id, txn, at, owned, writes := c.ID, c.Txn, c.writeAt(), c.owned, c.Writes
+	s.n.background(func(context.Context) { s.applyWrites(id, txn, at, owned, writes) })
 }
 
 // knowsEpochsLocked reports whether this node knows the epochs a command
@@ -919,7 +920,9 @@ func (s *store) informDurable(id TxnID) error {
 
 func (s *store) informDurableLocked2(id TxnID) error {
 	c := s.cmds[id]
-	if c == nil || c.Durable || c.Status != Applied {
+	// Kept once the outcome is known here (PreApplied: the writes may
+	// still wait for a dependency); truncation still waits for Applied.
+	if c == nil || c.Durable || c.Status < PreApplied || c.Status == Invalidated || c.Status == Truncated {
 		return nil
 	}
 	c.Durable = true
@@ -1127,20 +1130,20 @@ func (s *store) ephemeralRead(ctx context.Context, r *ephemeralReq) (*ephemeralR
 		if wait == nil {
 			break
 		}
-		if !fetched[wait.ID] && s.n.cfg.Now().Sub(start) > s.n.cfg.RecoverAfter {
+		if !fetched[wait.ID] && s.n.cfg.Now().Sub(start) > s.n.stallAfter(wait.ID, s.n.cfg.RecoverAfter) {
 			fetched[wait.ID] = true
 			id, keys := wait.ID, slices.Clone(wait.Keys)
-			go func() {
+			s.n.background(func(ctx context.Context) {
 				if _, busy := s.n.recovering.LoadOrStore(id, true); busy {
 					return
 				}
 				defer s.n.recovering.Delete(id)
-				fctx, cancel := context.WithTimeout(context.Background(), s.n.recoveryTimeout())
+				fctx, cancel := context.WithTimeout(ctx, s.n.recoveryTimeout())
 				defer cancel()
 				if !s.n.fetch(fctx, id, keys) {
 					_ = s.n.recover(fctx, id, nil, keys)
 				}
-			}()
+			})
 		}
 		ch := wait.changed
 		s.mu.Unlock()
@@ -1262,7 +1265,8 @@ func (s *store) missingLocked(ids []TxnID, keys []Key) bool {
 		if d != nil && len(d.Keys) > 0 {
 			keys = d.Keys
 		}
-		go s.n.fetchOnce(id, slices.Clone(keys))
+		keys := slices.Clone(keys)
+		s.n.background(func(ctx context.Context) { s.n.fetchOnce(ctx, id, keys) })
 	}
 	return missing
 }

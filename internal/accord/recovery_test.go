@@ -3,7 +3,9 @@ package accord
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
@@ -131,4 +133,47 @@ func TestAcceptReachesNewEpoch(t *testing.T) {
 		return s == Applied
 	}, 5*time.Second, 10*time.Millisecond, "the epoch 2 replica took part")
 	require.Len(t, c.stores["n3"].data[keyString(k)], 1)
+}
+
+// TestUndurableRepersisted: a transaction applied at a quorum whose
+// coordinator stopped before its Apply reached the last replica (which
+// never heard of it) is still applied there: the home shard's progress
+// log sends the outcome to every replica, then marks it durable.
+func TestUndurableRepersisted(t *testing.T) {
+	simTest(t, func(t *testing.T) {
+		c := newSimCluster(t, 3, 3, 1)
+		k := c.keys[0]
+		n1 := c.node(1)
+		id := TxnID{Timestamp: Timestamp{Epoch: 1, HLC: n1.clock.Next(0), Node: "n1"}, Kind: Write}
+		txn := appendTxn(t, k, 7)
+		w, err := json.Marshal(7)
+		require.NoError(t, err)
+		req := &applyReq{ID: id, ExecuteAt: id.Timestamp, Deps: Deps{}, Txn: txn, Writes: Writes{keyString(k): w}}
+		for _, i := range []int{0, 1} {
+			_, err := c.node(i).s.apply(context.Background(), req)
+			require.NoError(t, err)
+		}
+		// The coordinator stops (with whatever it had in flight) and
+		// comes back; n2 knows nothing of the transaction.
+		c.crash(1)
+		c.start(1)
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+		for _, r := range c.ids {
+			st := c.stores[r]
+			st.mu.Lock()
+			got := st.data[keyString(k)]
+			st.mu.Unlock()
+			require.Len(t, got, 1, "%s applied it", r)
+			s, _ := c.status(slices.Index(c.ids, r), id)
+			require.Equal(t, Applied, s, r)
+		}
+		for i := range c.ids {
+			n := c.node(i)
+			n.s.mu.Lock()
+			durable := n.s.cmds[id].Durable
+			n.s.mu.Unlock()
+			require.True(t, durable, "%s knows it durable", c.ids[i])
+		}
+	})
 }
