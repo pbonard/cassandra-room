@@ -2,9 +2,11 @@
 
 The execution layer sits between the CQL native protocol server
 (`internal/server`) and the storage engine (`internal/storage/lsm`). It is
-a single-node port of Cassandra's `cql3` statements, `schema` and the
-read/write paths of `db`, with the Java classes as the reference for
-behaviour and error messages.
+a port of Cassandra's `cql3` statements, `schema` and the read/write paths
+of `db`, with the Java classes as the reference for behaviour and error
+messages. This document covers a node's own execution; replication,
+consistency levels and cluster operations are in `docs/cluster.md`, and
+transactions in `docs/accord.md`.
 
 ```
 internal/cql     lexer + recursive-descent parser -> raw statements (Parser.g, CQLStatement.Raw)
@@ -35,13 +37,13 @@ Unprepared QUERY messages go through the same path and the same cache.
 | CQL | Java reference | Notes |
 |---|---|---|
 | USE | `UseStatement` | |
-| CREATE/ALTER/DROP KEYSPACE | `CreateKeyspaceStatement`, ... | SimpleStrategy and NetworkTopologyStrategy accepted; replication is not applied (one node) |
+| CREATE/ALTER/DROP KEYSPACE | `CreateKeyspaceStatement`, ... | SimpleStrategy and NetworkTopologyStrategy (rack-aware) place replicas in a cluster (`docs/cluster.md`) |
 | CREATE TABLE | `CreateTableStatement.builder` | same validation and messages; regular columns ordered by name |
 | ALTER TABLE ADD/DROP/RENAME/WITH | `AlterTableStatement` | a dropped column's cells are ignored; re-adding gives a new column |
 | DROP TABLE, TRUNCATE | `DropTableStatement`, `TruncateStatement` | TRUNCATE switches the table to new, empty storage |
 | INSERT, UPDATE, DELETE | `ModificationStatement` | USING TTL/TIMESTAMP, default_time_to_live, IN on keys, static columns, row/range/partition deletions |
-| BATCH (CQL and protocol) | `BatchStatement` | applied atomically in one engine batch with one timestamp |
-| IF NOT EXISTS / IF EXISTS / IF conditions | `CQL3CasRequest`, `StorageProxy.cas` | single partition; linearizable among conditional statements on one node (striped lock) |
+| BATCH (CQL and protocol) | `BatchStatement` | one timestamp; on a node, one engine batch. In a cluster, LOGGED batches over several partitions are one Accord transaction (atomic, no batchlog); UNLOGGED, COUNTER and single-partition ones are plain writes (`docs/accord.md`) |
+| IF NOT EXISTS / IF EXISTS / IF conditions | `CQL3CasRequest`, `StorageProxy.cas` | single partition; Accord transactions in a cluster (Paxos was removed), a striped lock on a single node |
 | SELECT | `SelectStatement` | see below |
 | DESCRIBE | `DescribeStatement` | KEYSPACES, TABLES, KEYSPACE, TABLE, SCHEMA, CLUSTER (cqlsh 6 uses it) |
 
@@ -67,8 +69,7 @@ row, not the partition):
   max-heap), in chunks sized to what the query still needs;
 - in a cluster, replicas answer `READ_RANGE_REVERSE` with a page from the
   end down, and the coordinator merges them in reverse (the page cutoff and
-  read repair mirrored). A replica of an older version refuses the verb,
-  and the query then reads forward, as before;
+  read repair mirrored);
 - paging resumes below the last row returned. Paging uses an
 opaque state holding the last row's storage key and the remaining LIMIT and
 PER PARTITION LIMIT counts.
@@ -109,11 +110,11 @@ table with clustering columns:     header    = P | 0x10      static row and part
   cells are deleted.
 - Row deletions are row-level deletions, purged by the engine's normal
   rules. Partition and range deletions shadow rows under other keys, so they
-  are stored as live cells (timestamp, local deletion time as value) that
-  the engine never purges: purging them by gc_grace_seconds could resurrect
-  older rows in sstables not part of the compaction. They cost space until
-  the partition is rewritten; compaction-aware purging of them is future
-  work.
+  are stored as live cells (timestamp, local deletion time as value), which
+  the engine's row-by-row purging leaves alone: purging them by
+  gc_grace_seconds alone could resurrect older rows in sstables not part of
+  the compaction. A compaction filter purges them instead (see "Purging
+  deletions" below).
 
 ## Schema and system tables
 
@@ -128,8 +129,10 @@ crash at any point leaves a consistent state. The schema version (in
 (keyspaces, tables, columns, and empty dropped_columns, triggers, views,
 types, functions, aggregates, indexes) are virtual tables generated on each
 read and served through the same SELECT path, so drivers' metadata queries
-work unchanged. The node reports release version 5.0.4 and owns the whole
-ring.
+work unchanged. The node reports release version 5.0.4. A single node owns
+the whole ring; in a cluster `system.local` and `system.peers` list each
+node's tokens, data center and rack, as drivers expect for token-aware
+routing.
 
 Clients that `REGISTER` for `SCHEMA_CHANGE` events are pushed one (on
 stream -1) for each keyspace, table and user type created, altered or
@@ -158,9 +161,20 @@ events of their own.
 
 ## Configuration
 
-`cmd/cassandra-room`: `-addr`, `-data-dir`, `-commitlog-sync` (`periodic`,
-the default, fsyncs every `-commitlog-sync-period`, 10 s; `batch` fsyncs
-before acknowledging each write), `-memtable-space`, `-cluster-name`.
+`cmd/cassandra-room` (`-h` lists every flag):
+
+- storage: `-data-dir`, `-commitlog-sync` (`periodic`, the default, fsyncs
+  every `-commitlog-sync-period`, 10 s; `batch` fsyncs before acknowledging
+  each write), `-commitlog-archive-dir`, `-memtable-space`;
+- native port: `-addr`, `-max-concurrent-requests`, `-max-inflight-bytes`,
+  `-max-frame-size` (admission control), `-write-timeout`,
+  `-shutdown-timeout` (draining in-flight requests);
+- `-cluster-name`, and `-authenticator` (`AllowAllAuthenticator` or
+  `PasswordAuthenticator`, default superuser `cassandra`/`cassandra`) and
+  `-authorizer` (`AllowAllAuthorizer` or `CassandraAuthorizer`);
+- clusters (`docs/cluster.md`): `-listen-address`, `-seeds`, `-dc`,
+  `-rack`, `-num-tokens`, `-replace-address`, broadcast addresses,
+  internode and client TLS, `-admin-address`, `-flags-file`.
 
 Table compaction options map to the engine: UnifiedCompactionStrategy
 options one to one (scaling_parameters, base_shard_count,
@@ -175,7 +189,7 @@ applies to the sstables written from then on.
 
 ## Also supported
 
-- **Multi-cell columns** (row format v2): non-frozen `list`, `set`, `map`
+- **Multi-cell columns** (cells with paths in the row format): non-frozen `list`, `set`, `map`
   and user types store one cell per element, keyed by a path (the
   byte-comparable element or key, a time-ordered id for lists, the field
   index for UDTs). Overwriting a collection writes a complex deletion at

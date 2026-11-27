@@ -9,12 +9,19 @@ names, not its class structure.
 
 ## Protocol
 
-- **Timestamps** (`primitives.go`): epoch, hybrid logical clock, node.
-  Each node's clock is strictly increasing and carries a per-node tag in
-  its low 10 bits: the node's ordinal, a number unique among the cluster's
-  nodes that the cluster metadata assigns when the node registers. Clock
-  values from different nodes therefore never collide, so an execution timestamp's hlc can be the write timestamp of
-  the transaction's updates (`Timestamp.uniqueHlc`).
+- **Timestamps** (`primitives.go`): epoch, hybrid logical clock, node,
+  ordered in that order. Each node's clock ticks in microseconds: a new
+  value is the wall clock's, unless the clock is already ahead (then one
+  above its last value), and above any timestamp it was asked to follow;
+  it observes every timestamp it receives. Two nodes can produce the same
+  HLC: the node breaks the tie between timestamps. Cells, though, carry
+  the HLC alone, so a transaction's writes take a separate write HLC,
+  strictly above every conflicting write applied before it and decided
+  once for all replicas (`UniqueHLC`, see "HLC order" below). An earlier
+  clock gave every value a 10-bit per-node tag so that clocks never
+  collided; rounding up to the tag spaced a node's transactions about
+  1 ms apart, which under load ran the clock ahead of the wall clock and
+  let a transaction's cells beat ordinary writes made just after it.
 - **PreAccept** (`replica.go`, `Commands.preaccept`): a replica proposes
   executing at the TxnID if nothing conflicting on its keys has a later
   timestamp and the TxnID's epoch is current. Otherwise it proposes a new,
@@ -41,13 +48,22 @@ names, not its class structure.
   with coordinator-optimised quorums is not correctly implemented).
 - **Reads** go to the coordinator itself, then to the nearest replicas
   (same rack, then same data center), as upstream picks read candidates.
+  If none of a shard's read replicas could read (a dependency still
+  recovering, a replica unreachable), the coordinator asks again every
+  50 ms until its deadline: the decision is final, so giving up early only
+  loses the outcome.
 - **Slow path** (`Propose`): the coordinator proposes the latest timestamp
   to every replica in an Accept round. The Accept round also recomputes
   dependencies against that timestamp.
-- **Commit, then stable** (`Stabilise`, CASSANDRA-18365): the decision is
-  committed to a quorum of every shard before any replica is told it is
-  stable. Only stable commands execute, so any recovery finds the
-  decision first.
+- **Commit and stable** (`Stabilise`, CASSANDRA-18365): the decision is
+  committed to a quorum of every shard, and the read replicas are sent it
+  as stable, with the read (`StableThenRead`), in the same round: the
+  decision is already final (a fast quorum, or an Accept quorum, recorded
+  it), and a read replica only reads. The transaction writes nothing until
+  its write HLC is decided at a quorum (below), after the commit quorum;
+  the other replicas are told it is stable then. Any dependencies a
+  recovery adds to a stable decision execute after the transaction, so
+  they cannot change its reads.
 - **Execute** (`ExecuteTxn`, `StableThenRead`): a replica answers a read
   once every dependency that executes earlier has applied. The read
   happens under the store lock, so the command's own writes cannot slip in
@@ -60,10 +76,6 @@ names, not its class structure.
   job (the home shard's replicas first): it sends the outcome to every
   replica, which a replica that never heard of the transaction needs, then
   marks it durable everywhere.
-- **Reads** (`StableThenRead`): the coordinator asks each shard's read
-  replicas in turn, and asks again every 50 ms until its deadline if none
-  could read (a dependency still recovering, a replica unreachable): the
-  decision is final, so giving up early only loses the outcome.
 - **Recovery** (`Recover`, `BeginRecovery`): any replica's progress log
   recovers a transaction that has stalled: after `RecoverAfter`, or a
   tenth of it once its coordinator is known to be down (`Config.Alive`).
@@ -122,9 +134,10 @@ names, not its class structure.
   - **Newer epochs:** an Accept therefore also reaches the replicas of a
     newer epoch and their dependencies (CASSANDRA-18365). A replica that
     knows a newer epoch doesn't vote for the fast path of an older one.
-  - **Synchronisation:** every node polls the others for the oldest epoch
-    they still have transactions of in progress. Older epochs leave the
-    quorums only once no node has any.
+  - **Synchronisation:** older epochs leave the quorums only once no
+    transaction of theirs can still be in progress: a leader runs sync
+    points over the ranges that changed, then tells every node the epoch is
+    synchronised (see "Epoch synchronisation" below).
   - **Stale epochs:** a replica refuses a new transaction from an epoch
     before that (`StaleTopology`). The coordinator then recovers it (so it
     never executes) and retries in the newer epoch.
@@ -481,7 +494,12 @@ names, not its class structure.
     and same-HLC ties, a recovery adopting the decided write HLC, a
     preempted executor's HLC refused, `propose` keeping input
     dependencies, universal durability sync points waiting for pending
-    replicas, and a bootstrap's sync point not waiting for them;
+    replicas, and a bootstrap's sync point not waiting for them; a quorum
+    sync point returning without waiting for a silent replica, a bootstrap
+    point lingering only for live replicas, a node waiting for an epoch to
+    be synchronised asking the others (`GetSyncedEpoch`), and the decided
+    write HLC floored at the execution timestamp and waiting for the
+    execution epoch;
   - majority durability with a replica down, and its catching up.
 - `internal/accord/review_test.go`: recovery across epochs, a `Truncated`
   outcome, and ephemeral reads retried at a newer epoch.
