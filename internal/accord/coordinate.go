@@ -690,6 +690,13 @@ func (n *Node) recover(ctx context.Context, id TxnID, txn *Txn, keys []Key) erro
 	if !tr.done() {
 		return ErrTimeout
 	}
+	if req.Txn == nil && txn != nil && !sameKeys(keys, txn.Keys) {
+		// Started without the definition, on keys that are not exactly the
+		// transaction's: decide only from its own shards' votes. A shard it
+		// does not touch has no votes for it, which would read as "no fast
+		// path" and could invalidate a transaction decided on the fast path.
+		return n.recover(ctx, id, txn, txn.Keys)
+	}
 	// The most advanced state found (by phase, then ballot).
 	var best *recoverReply
 	for _, r := range oks {
@@ -937,12 +944,18 @@ func (n *Node) progressLog() {
 			case c.blockedOn != nil && now.Sub(c.blockedSince) > n.stallAfter(*c.blockedOn, after):
 				dep := n.s.cmds[*c.blockedOn]
 				var txn *Txn
-				keys := c.owned
+				// The keys the dependency is on (never others: a recovery
+				// asking shards the transaction does not touch finds no
+				// votes there and may wrongly invalidate it).
+				keys := depKeys(c.Deps, *c.blockedOn)
 				if dep != nil {
 					txn = dep.Txn
-					if len(dep.Keys) > 0 {
+					if len(keys) == 0 && len(dep.Keys) > 0 {
 						keys = dep.Keys
 					}
+				}
+				if len(keys) == 0 {
+					keys = c.owned
 				}
 				todo = append(todo, stalled{*c.blockedOn, txn, keys})
 				c.blockedSince = now

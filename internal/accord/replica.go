@@ -507,7 +507,7 @@ func (s *store) commit(ctx context.Context, r *commitReq) (*commitReply, error) 
 		}
 		s.mu.Lock()
 	}
-	if s.missingLocked(skipped, readKeys) {
+	if s.missingLocked(skipped, readKeys, c.Deps) {
 		return &commitReply{Outcome: notReady}, s.unlock()
 	}
 	// Every earlier dependency on readKeys applied here: the transaction's
@@ -1116,7 +1116,7 @@ func (s *store) ephemeralRead(ctx context.Context, r *ephemeralReq) (*ephemeralR
 				}
 				if c.Status < PreAccepted && id.Timestamp.Less(boundFor(s.bootstrapped, k)) {
 					// From before this node joined: another replica reads.
-					s.missingLocked([]TxnID{id}, []Key{k})
+					s.missingLocked([]TxnID{id}, []Key{k}, nil)
 					s.mu.Unlock()
 					return &ephemeralReply{Outcome: notReady}, nil
 				}
@@ -1254,7 +1254,10 @@ func (s *store) forgetLocked() {
 
 // missingLocked reports whether some of ids are not applied here yet, and
 // fetches them in the background.
-func (s *store) missingLocked(ids []TxnID, keys []Key) bool {
+// deps, if not nil, are the dependencies ids come from: each is fetched on
+// the keys it is a dependency on, which it touches (a recovery on other
+// keys could wrongly invalidate it), else on keys.
+func (s *store) missingLocked(ids []TxnID, keys []Key, deps Deps) bool {
 	missing := false
 	for _, id := range ids {
 		d := s.cmds[id]
@@ -1262,13 +1265,38 @@ func (s *store) missingLocked(ids []TxnID, keys []Key) bool {
 			continue
 		}
 		missing = true
-		if d != nil && len(d.Keys) > 0 {
-			keys = d.Keys
+		on := depKeys(deps, id)
+		if len(on) == 0 && d != nil && len(d.Keys) > 0 {
+			on = slices.Clone(d.Keys)
 		}
-		keys := slices.Clone(keys)
-		s.n.background(func(ctx context.Context) { s.n.fetchOnce(ctx, id, keys) })
+		if len(on) == 0 {
+			on = slices.Clone(keys)
+		}
+		s.n.background(func(ctx context.Context) { s.n.fetchOnce(ctx, id, on) })
 	}
 	return missing
+}
+
+// depKeys returns the keys deps holds id on: keys the transaction touches.
+func depKeys(deps Deps, id TxnID) []Key {
+	var out []Key
+	for ks, ids := range deps {
+		if slices.Contains(ids, id) {
+			if k, ok := parseKeyString(ks); ok {
+				out = append(out, k)
+			}
+		}
+	}
+	slices.SortFunc(out, Key.Compare)
+	return out
+}
+
+// sameKeys reports whether a and b hold the same keys.
+func sameKeys(a, b []Key) bool {
+	a, b = slices.Clone(a), slices.Clone(b)
+	slices.SortFunc(a, Key.Compare)
+	slices.SortFunc(b, Key.Compare)
+	return slices.EqualFunc(a, b, func(x, y Key) bool { return x.Compare(y) == 0 })
 }
 
 // parseKeyString inverts keyString.
