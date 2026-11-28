@@ -10,34 +10,35 @@ names, not its class structure.
 ## Protocol
 
 - **Timestamps** (`primitives.go`): epoch, hybrid logical clock, node,
-  ordered in that order. Each node's clock ticks in microseconds: a new
-  value is the wall clock's, unless the clock is already ahead (then one
-  above its last value), and above any timestamp it was asked to follow;
-  it observes every timestamp it receives. Two nodes can produce the same
-  HLC: the node breaks the tie between timestamps. Cells, though, carry
-  the HLC alone, so a transaction's writes take a separate write HLC,
-  strictly above every conflicting write applied before it and decided
-  once for all replicas (`UniqueHLC`, see "HLC order" below). An earlier
-  clock gave every value a 10-bit per-node tag so that clocks never
-  collided; rounding up to the tag spaced a node's transactions about
-  1 ms apart, which under load ran the clock ahead of the wall clock and
-  let a transaction's cells beat ordinary writes made just after it.
+  ordered in that order. Each node's clock ticks in microseconds: every
+  new timestamp is the maximum of the current wall clock, `last + 1`, and
+  `after + 1` (for any timestamp it must follow). Whenever a node receives
+  a remote timestamp, it advances `last` to at least that value. Two nodes
+  can produce the same HLC: the node breaks the tie between timestamps.
+  Cells, though, carry the HLC alone, so a transaction's writes take a
+  separate write HLC, strictly above every conflicting write applied
+  before it and decided once for all replicas (`UniqueHLC`, see "HLC
+  order" below). An earlier clock gave every value a 10-bit per-node tag
+  so that clocks never collided; rounding up to the tag spaced a node's
+  transactions about 1 ms apart, which under load ran the clock ahead of
+  the wall clock and let a transaction's cells beat ordinary writes made
+  just after it.
 - **PreAccept** (`replica.go`, `Commands.preaccept`): If the transaction's TxnID is in the current epoch and newer than every conflicting transaction the replica has seen on those keys, the replica votes to execute it at TxnID. Otherwise, it proposes a later timestamp. It returns the conflicting transactions with lower ids
   (its dependencies).
 - **Fast path** (`coordinate.go`, `CoordinateTransaction`): if a fast
   quorum of every shard voted for the TxnID, the transaction executes there
   with the merged dependencies of the fast votes. Fast quorums follow
   `Shard.simpleFastQuorumSize`: all 3 of 3 replicas, 4 of 5.
-- **Privileged coordinator** (`PrivilegedCoordinatorWithoutDeps`): when the
-  transaction has a single key and the coordinator replicates it, it votes
-  first,
-  locally, and its vote counts, so a shard's fast quorum is
-  `privilegedWithoutDepsFastQuorumSize`: 2 of 3 replicas. It decides the
-  fast path locally, and only if no recovery has promised a ballot there.
-  A recovery that reaches the undecided coordinator therefore knows the
-  fast path was not taken. A recovery that doesn't reach it assumes it
-  voted. As in cassandra-accord `fc4a769`, multi-key transactions don't use
-  it.
+- **Privileged coordinator** (`PrivilegedCoordinatorWithoutDeps`): for a
+  single-key transaction whose coordinator is also one of the key's
+  replicas, the coordinator votes locally first, lowering the fast quorum
+  to 2 of 3 replicas (`privilegedWithoutDepsFastQuorumSize`). To take the
+  fast path, the coordinator must commit locally before promising any
+  recovery ballot. As a result, if a recovery reaches that coordinator and
+  sees the transaction is still undecided, recovery knows the fast path
+  was never taken; if recovery cannot reach it, recovery assumes it may
+  have voted. As in cassandra-accord `fc4a769`, multi-key transactions
+  don't use it.
 - **Medium path**: if a slow quorum of every shard (but not a fast quorum)
   voted for the TxnID, one Accept round of that proposal commits it, with
   the votes' dependencies. The replicas don't compute new ones. It is off
@@ -52,15 +53,15 @@ names, not its class structure.
 - **Slow path** (`Propose`): the coordinator proposes the latest timestamp
   to every replica in an Accept round. The Accept round also recomputes
   dependencies against that timestamp.
-- **Commit and stable** (`Stabilise`, CASSANDRA-18365): the decision is
-  committed to a quorum of every shard, and the read replicas are sent it
-  as stable, with the read (`StableThenRead`), in the same round: the
-  decision is already final (a fast quorum, or an Accept quorum, recorded
-  it), and a read replica only reads. The transaction writes nothing until
-  its write HLC is decided at a quorum (below), after the commit quorum;
-  the other replicas are told it is stable then. Any dependencies a
-  recovery adds to a stable decision execute after the transaction, so
-  they cannot change its reads.
+- **Commit and stable** (`Stabilise`, CASSANDRA-18365): in one round, the
+  coordinator commits the decision to a quorum of every shard while also
+  sending `Stable` + `Read` (`StableThenRead`) to the read replicas.
+  Because the decision is already final (recorded by a fast quorum or an
+  Accept quorum) and read replicas only read (nothing is written until
+  both the commit quorum and `DecideUniqueHlc` finish), this saves a round
+  trip. The remaining replicas are marked `Stable` right after the commit
+  quorum succeeds. Any dependencies a recovery adds to a stable decision
+  execute after the transaction, so they cannot change its reads.
 - **Execute** (`ExecuteTxn`, `StableThenRead`): a replica answers a read
   once every dependency that executes earlier has applied. The read
   happens under the store lock, so the command's own writes cannot slip in
@@ -76,12 +77,13 @@ names, not its class structure.
 - **Recovery** (`Recover`, `BeginRecovery`): any replica's progress log
   recovers a transaction that has stalled: after `RecoverAfter`, or a
   tenth of it once its coordinator is known to be down (`Config.Alive`).
-  A dependency the replica does not know is recovered on the keys it is a
-  dependency on, which it touches: a shard it does not touch has no fast
-  votes for it, which must not count as "no fast path". A recovery that
-  learns the definition from a reply while running on other keys starts
-  again on the transaction's own. The recovery coordinator takes a ballot
-  and gathers a quorum of every shard, then acts on what it finds:
+  When a replica recovers an unknown dependency `D`, it only contacts the
+  keys where `D` was recorded as a dependency — never unrelated shards.
+  Shards that `D` does not touch have no fast-path votes for `D`, and
+  counting those missing votes would wrongly invalidate a fast-path
+  transaction. If a reply reveals `D`'s full key list, recovery restarts
+  using `D`'s actual keys. The recovery coordinator takes a ballot and
+  gathers a quorum of every shard, then acts on what it finds:
 
   | What the quorum reports | What recovery does |
   | --- | --- |
@@ -95,11 +97,13 @@ names, not its class structure.
   transaction, in either of these cases:
 
   - too many replicas in the quorum did not vote for the fast path; or
-  - a transaction that executes later has decided, or proposed with a later
-    TxnID, dependencies that omit this one (`supersedingRejects`).
+  - a transaction `O` that executes after `T` either already decided
+    without `T` in its dependencies, or has `O.TxnID > T.TxnID` and
+    proposed (`Accepted`) without `T` (`supersedingRejects`).
 
-  Earlier transactions that may execute later but are only Accepted are
-  awaited first (`simpleWait`). Otherwise recovery proposes the TxnID.
+  If an earlier transaction (`O.TxnID < T.TxnID`) is only `Accepted` and
+  may execute after `T`, recovery waits for `O` to decide first
+  (`simpleWait`). Otherwise recovery proposes the TxnID.
 - **Waiting for another coordinator** (`awaitOutcome`): a coordinator
   preempted by a recovery, or whose attempt went stale, asks the replicas
   for the outcome. Once one has it (PreApplied or Applied), it applies it
@@ -143,10 +147,11 @@ names, not its class structure.
     it, and asks the sender for the metadata (`FetchEpoch`); a coordinator
     waits likewise before it proposes, executes or applies at an epoch a
     replica proposed. A replica never executes a transaction before it
-    knows both epochs. Ownership is decided by the epochs a transaction
-    spans: with an older epoch in their place, a node behind the one that
-    made it a pending replica of a key applied the transaction without
-    that key, and the write was lost there once it learnt the epoch.
+    knows both epochs. Which keys a replica owns for a transaction depends
+    on the epochs the transaction spans. Previously, if a replica fell
+    back to an older epoch it already knew, it didn't yet realize it was a
+    pending replica for a moving key—so it applied the transaction without
+    that key and permanently lost that key's write once it caught up.
   - **HLC order:** transactions execute in timestamp order (epoch
     first, then HLC, then node), while their writes are cells timestamped
     with an HLC alone. Two mechanisms keep the written cells in execution
@@ -164,18 +169,18 @@ names, not its class structure.
        slow-path transactions across shards proposing the same microsecond
        HLC on different nodes.
     3. That HLC is decided before any replica applies the transaction
-       (`DecideUniqueHlc`): it depends on what the executor's read
-       replica applied, so two executors (its coordinator and a
-       recovery) reading different replicas can compute different ones,
-       and each replica kept the first it was sent; a later transaction
-       written just above one replica's then lost to another's. The
-       executor has a quorum of every shard accept its HLC at its ballot
-       (a replica that promised a higher ballot refuses: the executor
-       was preempted; one that already applied the transaction answers
-       the HLC it applied, which is final). A recovery adopts the HLC
-       accepted at the highest ballot among its replies: a quorum that
-       accepted one intersects its own. The reads go out with the commit
-       round instead of after it, so that this costs no extra round trip.
+       (`DecideUniqueHlc`): because `UniqueHLC` depends on whichever
+       replica answered the read, the original coordinator and a recovery
+       coordinator could compute different write HLCs. If replicas simply
+       kept the first HLC they received, replicas would store the same
+       write at different timestamps—causing a later transaction to win on
+       one replica and lose on another. To prevent that, the executor first
+       has a quorum of every shard accept one `UniqueHLC` at its ballot (a
+       replica that promised a higher ballot refuses, preempting the
+       executor; one that already applied the transaction answers its final
+       HLC), and any later recovery adopts the HLC accepted at the highest
+       ballot. The reads go out with the commit round instead of after it,
+       so this costs no extra round trip.
   - **Late ownership** (`late_owned`): a transaction applied here that
     gains a key this node owned at the epoch it executed at is counted.
     Gaining keys of a later epoch is normal (a range the node starts
@@ -194,15 +199,14 @@ names, not its class structure.
     id on its ranges has applied or can never commit.
   - **Abandoned ones:** a sync point is never recovered. One its coordinator
     abandons only leaves barriers, and is invalidated locally after a while.
-- **Epoch synchronisation**: for each new epoch, in order, the leader (the
-  live normal node with the lowest address among those whose gossiped
-  metadata epoch is at least this node's: a node cut off from the metadata
-  log never synchronised the epochs it did not know, and no other node
-  did either) finds the ranges whose replicas
-  or pending replicas changed from the previous epoch (a range starting to
-  move to a node changes only its pending replicas: earlier-epoch
-  transactions, which do not reach that node, must be done before data is
-  streamed to it).
+- **Epoch synchronisation**: for each new epoch, in order, the epoch-sync
+  leader finds every range whose replicas or pending replicas changed from
+  the previous epoch. (The leader is the live normal node with the lowest
+  address that is at least up to date on the metadata epoch—this prevents
+  a partitioned node with the lowest address from blocking epoch sync. A
+  range starting to move to a node changes only its pending replicas:
+  earlier-epoch transactions, which do not reach that node, must finish
+  before data is streamed to it.)
   1. It runs one sync point over all of them, with quorums in both
      epochs. The barrier refuses any earlier-epoch transaction the sync
      point doesn't follow. A sync point needing quorums returns as soon as
@@ -246,17 +250,17 @@ names, not its class structure.
   - **Idle keys:** a key with no transactions left whose latest timestamp is
     below its bound is forgotten; the barrier refuses anything it would
     have ordered.
-- **Joining nodes** (`Bootstrap`): before streaming, a joining node takes
-  one sync point over all the ranges it will own in every table, applied
-  at a quorum of every shard, and kept once it is: it then waits half a
-  request timeout at most for the other replicas, and not at all for those
-  the failure detector believes down (`Config.Alive`). Those that did not
-  apply it (down, cut off, behind the epoch) are only left out of the
-  sources (below); it used to wait for every replica first, a whole 8 s
-  when one did not answer. If it fails the join fails (and can be retried), unless a
-  range has no live quorum (`ErrUnavailable`, a replica being replaced at
-  RF 2): no transaction commits there meanwhile, and the node goes without
-  the point.
+- **Joining nodes** (`Bootstrap`): before streaming data, a joining node
+  takes one sync point across all ranges it will own in every table. As
+  soon as a quorum of every shard applies it, the sync point succeeds; the
+  node lingers for at most half a request timeout to include any other
+  live replicas (skipping nodes marked down by `Config.Alive`). Replicas
+  that didn't apply the sync point (down, cut off, or behind the epoch)
+  are simply excluded as streaming sources (below). Previously, it waited
+  up to 8 s for every replica first. If the sync point fails, the join
+  fails (and can be retried), unless a range has no live quorum
+  (`ErrUnavailable`, a replica being replaced at RF 2): no transaction
+  commits there meanwhile, and the node goes without the point.
   - **One sync point, after the epoch is synchronised:** it first waits
     (briefly, best effort) until the epoch it learnt of the movement in is
     synchronised: until then, a transaction of an earlier epoch, whose
@@ -297,10 +301,10 @@ names, not its class structure.
     and an unknown dependency on them held up the read of the others until
     the request timed out.) The coordinator keeps a reply's reads only for
     the keys its replica reads for.
-- **Shards** group a transaction's keys by their replicas and their
-  pending replicas together: a node pending on one key (taking over its
-  range) is not an owner of keys that merely share its replicas, whose
-  transactions never reach it.
+- **Shards** group a transaction's keys by the pair `(read replicas,
+  pending replicas)`—not by read replicas alone. Otherwise, a node that is
+  only a pending replica for key A would mistakenly appear to own key B
+  just because A and B share the same read replicas.
 - **Journal** (`Journal`, `AccordJournal`): every state change is made
   durable before the replica answers, and replayed at startup.
   - **Group commit** (`BatchJournal`): handlers encode their records under
